@@ -237,6 +237,9 @@ When a teacher selects a question, VedaAI identifies the corresponding answer an
 
 ---
 
+
+
+
 ## 📁 Repository Structure
 
 ```text
@@ -263,3 +266,35 @@ VedaAI/
     ├── public/
     └── package.json
 ```
+
+
+
+
+---
+
+
+
+# 🛠️ Technology Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Frontend | Next.js | Examiner-facing web application |
+| Language | TypeScript | Type-safe frontend development |
+| Styling | Tailwind CSS | UI implementation and responsive design |
+| Animation | Framer Motion | Processing states and subtle UI transitions |
+| Backend | FastAPI | REST API and processing orchestration |
+| Language | Python | Document processing and AI pipeline |
+| PDF Processing | `pypdf` | Extract text from digital PDFs |
+| PDF Rendering | `pdf2image` | Render scanned PDF pages |
+| OCR | Tesseract + `pytesseract` | Extract text and bounding boxes |
+| Semantic Matching | TF-IDF + Cosine Similarity | Match questions with answers |
+| ML Utilities | scikit-learn | Text vectorization and similarity |
+| LLM Provider | Gemini | Primary ambiguous-case verification |
+| LLM Provider | Groq | Fallback LLM provider |
+| LLM Provider | OpenRouter | Additional LLM fallback |
+| AI Routing | Custom Provider Router | Reliability and provider fallback |
+| Storage | In-memory + temporary files | Assignment-scoped storage |
+| Database | None | Not required for current scope |
+| Vector Database | None | Not required for single-assessment workflow |
+| Deployment | Vercel + Python-compatible host | Production deployment |
+| Source Control | GitHub | Version control and submission |
