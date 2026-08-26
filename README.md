@@ -76,6 +76,35 @@ flowchart LR
 
 ---
 
+```mermaid
+flowchart TB
+    A[Document] --> B[Document Processing]
+
+    B --> C[OCR / Native Text Extraction]
+
+    C --> D[Normalized Document Blocks]
+
+    D --> E[Question Extraction]
+    D --> F[Answer Extraction]
+
+    E --> G[Question Objects]
+    F --> H[Answer Objects]
+
+    G --> I[Mapping Engine]
+    H --> I
+
+    I --> J{Confidence}
+
+    J -->|High| K[Automatic Mapping]
+    J -->|Ambiguous| L[LLM Verification]
+    J -->|Low| M[Human Review]
+
+    K --> N[Assessment Result]
+    L --> N
+    M --> N
+
+    N --> O[Interactive Workspace]
+```
 ## 🏗️ System Architecture
 
 ```mermaid
