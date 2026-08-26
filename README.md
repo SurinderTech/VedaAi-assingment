@@ -28,13 +28,17 @@ Handwritten content is difficult to locate
 Answers contain equations, diagrams, or mixed content
 
 
-
-
-
 **Teacher → Upload → Extract → Map → Review**
+---
 
 
 
+##  Core Engineering Approach
+
+VedaAI is intentionally **not** built as:
+
+
+PDF → LLM → Magic Answer
 ---
 
 
