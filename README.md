@@ -1,6 +1,35 @@
 # VedaAI — AI Assessment Extraction & Answer Mapping
 
 > Upload a question paper and a student's handwritten answer sheet. VedaAI extracts, maps, and visually connects every answer to its question.
+>
+## 🎯 What Problem Does VedaAI Solve?
+
+Evaluating handwritten answer sheets is often a manual search problem.
+
+A teacher has to repeatedly move between the question paper and answer sheet:
+
+```mermaid
+flowchart LR
+    A[Question Paper] --> B[Find Question]
+    B --> C[Search Answer Sheet]
+    C --> D[Find Answer]
+    D --> E[Read Answer]
+    E --> F[Move to Next Question]
+    F --> B
+```
+
+This becomes increasingly time-consuming when:
+
+Answers are written out of order
+Questions contain sub-parts such as 11(a) and 11(b)
+An answer continues across multiple pages
+Some questions are unanswered
+Handwritten content is difficult to locate
+Answers contain equations, diagrams, or mixed content
+
+
+
+
 
 **Teacher → Upload → Extract → Map → Review**
 
