@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f5f6f9;
+  --foreground: #0f172a;
+  --panel: #ffffff;
+  --sidebar: #111318;
+  --sidebar-light: #1b1e25;
+  --accent: #ff5a1f;
+  --accent-hover: #e04810;
+  --accent-light: #ff7e4d;
+  --accent-soft: #fff0e8;
+  --accent-glow: rgba(255, 90, 31, 0.25);
+  --line: #e2e8f0;
+  --muted: #64748b;
+
+  --status-matched: #10b981;
+  --status-matched-bg: #ecfdf5;
+  --status-review: #f59e0b;
+  --status-review-bg: #fffbe6;
+  --status-unmatched: #ef4444;
+  --status-unmatched-bg: #fef2f2;
+  --status-unanswered: #94a3b8;
+  --status-unanswered-bg: #f1f5f9;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+.scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+.gradient-text-orange {
+  background: linear-gradient(135deg, #ff5a1f 0%, #ff8c42 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.orange-glow {
+  box-shadow: 0 0 25px rgba(255, 90, 31, 0.35);
+}
+
+.card-hover {
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.08);
+}
+
