@@ -33,7 +33,21 @@ Answers contain equations, diagrams, or mixed content
 
 **Teacher → Upload → Extract → Map → Review**
 
+```
+flowchart LR
+    A[📄 Question Paper] --> C[🧠 VedaAI]
+    B[✍️ Answer Sheet] --> C
+
+    C --> D[Questions Extracted]
+    C --> E[Answers Extracted]
+    C --> F[Answers Mapped]
+
+    F --> G[📍 Exact Answer Region]
+    G --> H[👩‍🏫 Examiner Workspace]
+```
+
 ---
+
 
 ## 🔄 End-to-End Workflow
 
