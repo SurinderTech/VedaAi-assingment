@@ -34,6 +34,65 @@ flowchart LR
     L --> N[Final Mapping]
     J --> N
     K --> N
+---
+
+That immediately communicates what the entire system does.
+
+---
+
+### 3. Architecture
+
+```markdown
+## 🏗️ System Architecture
+
+```mermaid
+flowchart TB
+
+    subgraph Frontend["Frontend — Next.js"]
+        UI[Teacher Workspace]
+        Upload[Upload Interface]
+        Viewer[Answer Sheet Viewer]
+        UI --> Upload
+        UI --> Viewer
+    end
+
+    subgraph Backend["Backend — FastAPI"]
+
+        API[Assessment API]
+
+        DP[Document Processor]
+        QE[Question Extractor]
+        AE[Answer Extractor]
+        ME[Mapping Engine]
+
+        SIM[TF-IDF + Cosine Similarity]
+        LLM[LLM Provider Router]
+
+        API --> DP
+        DP --> QE
+        DP --> AE
+
+        QE --> ME
+        AE --> ME
+
+        ME --> SIM
+        ME --> LLM
+    end
+
+    subgraph Providers["External AI Providers"]
+        Gemini[Gemini]
+        Groq[Groq]
+        OpenRouter[OpenRouter]
+    end
+
+    Upload --> API
+    API --> UI
+
+    LLM --> Gemini
+    LLM --> Groq
+    LLM --> OpenRouter
+
+    ME --> Viewer
 
     N --> O[📊 Assessment Workspace]
     O --> P[📍 Highlighted Answer Region]
