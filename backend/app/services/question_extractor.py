@@ -1,109 +1,139 @@
 """
-Question extraction engine (plan sections 11-12).
+Question extraction engine.
 
-Handles question markers whether on the same line or standalone line,
-including subquestions like 11(a), 11(b), Q1, Question 1, etc.
-Preserves original numbering and order.
+Handles:
+- Main question headers (e.g., "Q1. Answer the following...", "Q2. Operating Systems (10 Marks)")
+- Subquestions (e.g., "a) Define an operating system...", "b) What is a thread...")
+- OR branch handling (e.g., "OR", "a) Explain deadlock conditions...") -> 2(a) OR
+- Noise block filtering (e.g. ASCII diagram lines like "-", "---", "| |")
+
+Ensures ONLY actual subquestions / evaluatable questions are returned.
 """
 from __future__ import annotations
 import re
-from typing import List
+from typing import List, Optional
 from app.models.schemas import Block, Question
 
-# Matches question markers with or without text on the same line
-# Examples: "11(a) Explain...", "11(a)", "11 (a).", "Q1.", "Question 1:", "1."
-QUESTION_MARKER_RE = re.compile(
-    r"""^\s*
-    (?:Q(?:uestion)?\.?\s*)?                   # Optional "Q", "Q.", "Question" prefix
-    (\d{1,3})                                   # Main number (e.g. 1, 11)
-    \s*
-    (\([a-zA-Z]\)|[a-zA-Z](?=[\s.):]|$))?      # Subpart (e.g. (a), a, (b), b)
-    \s*
-    [\.\):]?                                    # Trailing punctuation
-    (?:\s+(.*)|\s*$)                           # Question text on same line (or empty)
-    """,
-    re.VERBOSE | re.IGNORECASE,
+MAIN_Q_RE = re.compile(
+    r"^\s*Q(?:uestion)?\.?\s*(\d{1,3})\s*[\.\):]?\s*(.*)$", re.IGNORECASE
+)
+MAIN_NUM_ONLY_RE = re.compile(
+    r"^\s*(\d{1,3})\s*[\.\)]\s*(.*)$"
 )
 
-# Standalone subpart marker if question number was separate (e.g. Q11 on line 1, (a) on line 2)
-STANDALONE_SUBPART_RE = re.compile(
-    r"^\s*(?:\(([a-zA-Z])\)|([a-zA-Z])[\.\):])\s*(.*)$"
+SUBPART_RE = re.compile(
+    r"^\s*(?:\(([a-zA-Z1-9])\)|([a-zA-Z])[\.\):])\s*(.*)$"
 )
 
+NOISE_RE = re.compile(
+    r"^[\s\-_=\|\\\/\+\*\.]{1,30}$"
+)
 
-def _normalize_number(main: str, sub: str | None) -> str:
-    if not sub:
-        return main
-    clean_sub = sub.strip("() ").lower()
-    return f"{main}({clean_sub})"
+OR_RE = re.compile(r"^\s*OR\s*$", re.IGNORECASE)
+
+
+def is_noise(text: str) -> bool:
+    t = text.strip()
+    if not t or (len(t) < 2 and not t.isalnum()):
+        return True
+    if NOISE_RE.match(t):
+        return True
+    return False
 
 
 def extract_questions(blocks: List[Block]) -> List[Question]:
-    # Sort page by page, top to bottom
     ordered = sorted(blocks, key=lambda b: (b.page, b.bbox.y))
-
     questions: List[Question] = []
-    current: Question | None = None
-    order_index = 0
+
+    current_main_num: Optional[str] = None
+    current_main_header: str = ""
+    in_or_branch: bool = False
+    subpart_seen: set[str] = set()
+
+    current_question: Optional[Question] = None
+    order_idx = 0
 
     for b in ordered:
         text = b.text.strip()
-        if not text:
+        if not text or is_noise(text):
             continue
 
-        m = QUESTION_MARKER_RE.match(text)
-        if m:
-            main, sub, rest = m.group(1), m.group(2), m.group(3)
-            number = _normalize_number(main, sub)
-            initial_text = (rest or "").strip()
+        # Check for OR branch marker
+        if OR_RE.match(text):
+            in_or_branch = True
+            continue
 
-            current = Question(
-                id=number,
-                number=number,
-                text=initial_text,
+        # Check for Main Question Header: "Q1. Answer the following...", "Q2. Operating Systems..."
+        main_m = MAIN_Q_RE.match(text)
+        if not main_m:
+            num_m = MAIN_NUM_ONLY_RE.match(text)
+            if num_m and int(num_m.group(1)) <= 30 and not current_question:
+                main_m = num_m
+
+        if main_m:
+            current_main_num = main_m.group(1)
+            current_main_header = main_m.group(2).strip()
+            in_or_branch = False
+            subpart_seen = set()
+
+            rest = current_main_header
+            sub_m = SUBPART_RE.match(rest)
+            if sub_m:
+                sub_char = (sub_m.group(1) or sub_m.group(2)).lower()
+                q_num = f"{current_main_num}({sub_char})"
+                q_text = sub_m.group(3).strip()
+                current_question = Question(
+                    id=q_num, number=q_num, text=q_text, page=b.page, bbox=b.bbox, order_index=order_idx
+                )
+                order_idx += 1
+                questions.append(current_question)
+                subpart_seen.add(sub_char)
+            else:
+                is_header_only = any(
+                    k in rest.lower() for k in ["answer the following", "marks", "consider", "section", "part"]
+                ) or len(rest) < 12
+
+                if not is_header_only and rest:
+                    current_question = Question(
+                        id=current_main_num, number=current_main_num, text=rest, page=b.page, bbox=b.bbox, order_index=order_idx
+                    )
+                    order_idx += 1
+                    questions.append(current_question)
+                else:
+                    current_question = None
+            continue
+
+        # Check for subpart line e.g. "a) Define an operating system..."
+        sub_m = SUBPART_RE.match(text)
+        if sub_m and current_main_num is not None:
+            sub_char = (sub_m.group(1) or sub_m.group(2)).lower()
+            rest_text = sub_m.group(3).strip()
+
+            q_num = f"{current_main_num}({sub_char})"
+            if in_or_branch or sub_char in subpart_seen:
+                q_num = f"{current_main_num}({sub_char}) OR"
+
+            current_question = Question(
+                id=q_num,
+                number=q_num,
+                text=rest_text,
                 page=b.page,
                 bbox=b.bbox,
-                order_index=order_index,
+                order_index=order_idx,
             )
-            order_index += 1
-            questions.append(current)
+            order_idx += 1
+            questions.append(current_question)
+            subpart_seen.add(sub_char)
             continue
 
-        # Check for standalone subpart if current question exists and has main number
-        sub_match = STANDALONE_SUBPART_RE.match(text)
-        if sub_match and current is not None:
-            sub_char = sub_match.group(1) or sub_match.group(2)
-            rest_text = (sub_match.group(3) or "").strip()
-            # Extract main number from current question
-            main_num = re.split(r"\(|\.", current.number)[0]
-            number = f"{main_num}({sub_char.lower()})"
-
-            # If current question had no text, transform it into this subquestion
-            if not current.text:
-                current.id = number
-                current.number = number
-                current.text = rest_text
+        # Continuation line of current question
+        if current_question is not None:
+            if current_question.text:
+                current_question.text = f"{current_question.text} {text}".strip()
             else:
-                current = Question(
-                    id=number,
-                    number=number,
-                    text=rest_text,
-                    page=b.page,
-                    bbox=b.bbox,
-                    order_index=order_index,
-                )
-                order_index += 1
-                questions.append(current)
-            continue
+                current_question.text = text
 
-        # Continuation text of the current question
-        if current is not None:
-            if current.text:
-                current.text = f"{current.text} {text}".strip()
-            else:
-                current.text = text
-
-    # Deduplicate questions by ID defensively while preserving order
+    # Deduplicate questions while preserving order
     seen = set()
     unique: List[Question] = []
     for q in questions:
@@ -113,3 +143,4 @@ def extract_questions(blocks: List[Block]) -> List[Question]:
         unique.append(q)
 
     return unique
+

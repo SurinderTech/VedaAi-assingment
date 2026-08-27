@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 import {
   LayoutGrid,
   Users,
@@ -22,20 +22,19 @@ interface SidebarProps {
 
 export default function Sidebar({ isMobileOpen = false, onMobileClose }: SidebarProps) {
   const router = useRouter();
-  const [activeNav, setActiveNav] = useState("Exams");
+  const pathname = usePathname();
   const [showToolkitModal, setShowToolkitModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
   const NAV = [
     { icon: LayoutGrid, label: "Home", path: "/" },
-    { icon: Users, label: "My Classroom", path: "/" },
-    { icon: FileText, label: "Assignments", path: "/" },
+    { icon: Users, label: "My Classroom", path: "/classroom" },
+    { icon: FileText, label: "Assignments", path: "/assignments" },
     { icon: FileCheck, label: "Exams", path: "/" },
-    { icon: Bookmark, label: "My Library", path: "/" },
+    { icon: Bookmark, label: "My Library", path: "/library" },
   ];
 
-  const handleNavClick = (label: string, path: string) => {
-    setActiveNav(label);
+  const handleNavClick = (path: string) => {
     if (onMobileClose) onMobileClose();
     router.push(path);
   };
@@ -45,7 +44,7 @@ export default function Sidebar({ isMobileOpen = false, onMobileClose }: Sidebar
       <div>
         {/* Header Logo + Sidebar Collapse Button */}
         <div className="flex items-center justify-between mb-7">
-          <div className="cursor-pointer" onClick={() => handleNavClick("Exams", "/")}>
+          <div className="cursor-pointer" onClick={() => handleNavClick("/")}>
             <VedaLogo size="md" />
           </div>
           {onMobileClose ? (
@@ -77,14 +76,14 @@ export default function Sidebar({ isMobileOpen = false, onMobileClose }: Sidebar
         {/* Navigation Items */}
         <nav className="space-y-1.5">
           {NAV.map(({ icon: Icon, label, path }) => {
-            const isActive = activeNav === label;
+            const isActive = pathname === path || (path === "/" && (pathname === "/exams" || pathname === "/"));
             return (
               <button
                 key={label}
-                onClick={() => handleNavClick(label, path)}
+                onClick={() => handleNavClick(path)}
                 className={`w-full flex items-center gap-3.5 px-4 py-3 rounded-xl text-xs sm:text-sm font-semibold cursor-pointer transition-all ${
                   isActive
-                    ? "bg-[#efefef] text-[#1a1a1a] shadow-2xs"
+                    ? "bg-[#efefef] text-[#1a1a1a] shadow-2xs font-extrabold"
                     : "text-slate-400 hover:bg-slate-50 hover:text-slate-700"
                 }`}
               >
@@ -147,21 +146,25 @@ export default function Sidebar({ isMobileOpen = false, onMobileClose }: Sidebar
           <div className="bg-white rounded-3xl p-6 max-w-sm w-full border border-slate-200 shadow-2xl space-y-4">
             <h3 className="text-base font-bold text-slate-900">Workspace Settings</h3>
             <div className="space-y-2 text-xs text-slate-600">
-              <div className="flex justify-between py-1 border-b border-slate-100">
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
                 <span className="font-medium">Primary LLM Provider</span>
                 <span className="font-bold text-[#ff5a1f]">Gemini 2.0 Flash</span>
               </div>
-              <div className="flex justify-between py-1 border-b border-slate-100">
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
                 <span className="font-medium">Fallback Providers</span>
                 <span>Groq, OpenRouter</span>
               </div>
-              <div className="flex justify-between py-1 border-b border-slate-100">
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
                 <span className="font-medium">OCR Engine</span>
                 <span className="font-bold text-emerald-600">PaddleOCR</span>
               </div>
-              <div className="flex justify-between py-1">
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
                 <span className="font-medium">Embeddings</span>
                 <span className="font-bold text-purple-600">all-MiniLM-L6-v2</span>
+              </div>
+              <div className="flex justify-between py-1.5">
+                <span className="font-medium">Exact BBox Highlighting</span>
+                <span className="font-bold text-emerald-600">Active</span>
               </div>
             </div>
             <button

@@ -12,6 +12,7 @@ pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/b
 interface Props {
   fileUrl: string;
   isPdf: boolean;
+  questionNumber?: string;
   regions: Region[]; // regions to highlight for the selected question
   pageSizes: number[][]; // original [width, height] per page, matching bbox coordinate space
   activePage: number;
@@ -22,6 +23,7 @@ interface Props {
 export default function AnswerSheetViewer({
   fileUrl,
   isPdf,
+  questionNumber = "",
   regions,
   pageSizes,
   activePage,
@@ -52,12 +54,12 @@ export default function AnswerSheetViewer({
       {/* Control Bar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-slate-200 shadow-xs z-10 text-xs font-semibold text-slate-700">
         <div className="flex items-center gap-2">
-          <div className="h-6 w-6 rounded-lg bg-[#fff0e8] text-[#ff5a1f] flex items-center justify-center">
+          <div className="h-6 w-6 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
             <Eye size={14} />
           </div>
           <span>Student Answer Sheet</span>
           {regionsOnPage.length > 0 && (
-            <span className="px-2 py-0.5 rounded-full bg-[#ff5a1f]/10 text-[#ff5a1f] text-[11px] font-bold">
+            <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[11px] font-bold">
               {regionsOnPage.length} region{regionsOnPage.length > 1 ? "s" : ""} mapped
             </span>
           )}
@@ -102,7 +104,7 @@ export default function AnswerSheetViewer({
               <ChevronLeft size={14} />
             </button>
             <span className="px-1 text-[11px] font-semibold text-slate-600">
-              {activePage} / {totalPages}
+              Page {activePage} of {totalPages}
             </span>
             <button
               disabled={activePage >= totalPages}
@@ -123,7 +125,7 @@ export default function AnswerSheetViewer({
               file={fileUrl}
               loading={
                 <div className="p-16 text-center text-xs font-medium text-slate-400 flex flex-col items-center gap-2">
-                  <div className="h-6 w-6 border-2 border-[#ff5a1f] border-t-transparent rounded-full animate-spin" />
+                  <div className="h-6 w-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
                   Loading document page...
                 </div>
               }
@@ -147,12 +149,12 @@ export default function AnswerSheetViewer({
             />
           )}
 
-          {/* Region Bounding Box Highlights */}
+          {/* Region Bounding Box Highlights — Matching Figma Green Highlighter */}
           {renderedSize &&
             regionsOnPage.map((r, i) => (
               <div
                 key={i}
-                className="absolute border-2 border-[#ff5a1f] bg-[#ff5a1f]/20 rounded-md transition-all duration-300 shadow-[0_0_12px_rgba(255,90,31,0.5)] animate-pulse"
+                className="absolute border-2 border-emerald-500 bg-emerald-500/15 rounded-md transition-all duration-300 shadow-[0_0_15px_rgba(16,185,129,0.4)] pointer-events-none"
                 style={{
                   left: r.bbox.x * scaleX,
                   top: r.bbox.y * scaleY,
@@ -160,9 +162,11 @@ export default function AnswerSheetViewer({
                   height: r.bbox.height * scaleY,
                 }}
               >
-                <div className="absolute -top-6 left-0 bg-[#ff5a1f] text-white text-[10px] font-bold px-2 py-0.5 rounded shadow-sm flex items-center gap-1">
-                  <span>Answer Region</span>
-                </div>
+                {i === 0 && (
+                  <div className="absolute -top-6 left-0 bg-emerald-600 text-white text-[11px] font-bold px-2 py-0.5 rounded-md shadow-lg flex items-center gap-1 z-20 whitespace-nowrap">
+                    <span>Q{questionNumber || "Matched"}</span>
+                  </div>
+                )}
               </div>
             ))}
         </div>

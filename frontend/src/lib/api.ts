@@ -29,6 +29,44 @@ export async function getResult(assessmentId: string): Promise<AssessmentResult>
   return res.json();
 }
 
+export async function listAssessments(): Promise<any[]> {
+  try {
+    const res = await fetch(`${API_URL}/api/assessment/list`);
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
+export interface AssistantResponse {
+  reply: string;
+  attention_questions: string[];
+  unanswered_questions: string[];
+  review_questions: string[];
+}
+
+export async function askAssistant(
+  assessmentId: string | null,
+  message: string,
+  questionId?: string
+): Promise<AssistantResponse> {
+  const endpoint = assessmentId
+    ? `${API_URL}/api/assessment/${assessmentId}/assistant`
+    : `${API_URL}/api/assessment/assistant`;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, question_id: questionId }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Assistant request failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export function fileUrl(assessmentId: string, role: "question_paper" | "answer_sheet"): string {
   return `${API_URL}/api/assessment/${assessmentId}/file/${role}`;
 }

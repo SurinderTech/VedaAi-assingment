@@ -10,6 +10,7 @@ Guarantees 1-to-1 mapping: once an answer candidate is assigned to a question,
 it cannot be assigned to another question.
 """
 from __future__ import annotations
+import asyncio
 from typing import List, Optional, Tuple
 from app.core.config import settings
 from app.models.schemas import Question, AnswerCandidate, MappedAnswer, Region, UnmatchedAnswer
@@ -149,7 +150,8 @@ async def _llm_verify(question_text: str, answer_text: str) -> Optional[float]:
         "question? Reply with ONLY a decimal number, nothing else."
     )
     try:
-        raw = await llm_complete(prompt)
+        raw = await asyncio.wait_for(llm_complete(prompt), timeout=2.0)
         return max(0.0, min(1.0, float(raw.strip().split()[0])))
-    except (LLMError, ValueError, IndexError):
+    except Exception:
         return None
+

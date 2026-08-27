@@ -12,6 +12,8 @@ import {
   Sparkles,
   FileCheck,
   Search,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import Sidebar from "@/components/Sidebar";
 import Header from "@/components/Header";
@@ -53,14 +55,6 @@ const STATUS_META: Record<
   },
 };
 
-function confidenceBadge(confidence: number) {
-  if (confidence >= 0.85)
-    return <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[11px] font-bold">High</span>;
-  if (confidence >= 0.55)
-    return <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[11px] font-bold">Medium</span>;
-  return <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 text-[11px] font-bold">Review</span>;
-}
-
 export default function WorkspacePage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -89,7 +83,7 @@ export default function WorkspacePage() {
   }, [result, searchFilter]);
 
   const selected: QuestionResult | undefined = useMemo(
-    () => result?.questions.find((q) => q.id === selectedId),
+    () => result?.questions.find((q) => q.id === selectedId || q.number === selectedId),
     [result, selectedId]
   );
 
@@ -130,7 +124,16 @@ export default function WorkspacePage() {
     <div className="flex h-screen w-full bg-[#f4f5f8] overflow-hidden font-sans">
       <Sidebar isMobileOpen={isMobileOpen} onMobileClose={() => setIsMobileOpen(false)} />
       <div className="flex-1 flex flex-col min-w-0 h-screen">
-        <Header title="Assessment Workspace — Question & Answer Mapping" onMenuClick={() => setIsMobileOpen(true)} />
+        <Header
+          title="Assessment Workspace — Question & Answer Mapping"
+          onMenuClick={() => setIsMobileOpen(true)}
+          assessmentId={params.id}
+          selectedQuestionId={selectedId}
+          onSelectQuestion={(qId) => {
+            setSelectedId(qId);
+            setMobileTab("sheet");
+          }}
+        />
 
         {/* Mobile View Tab Selector Bar */}
         <div className="lg:hidden flex items-center justify-around bg-white border-b border-slate-200 px-2 py-2">
@@ -161,28 +164,31 @@ export default function WorkspacePage() {
         </div>
 
         {/* 3-Column Split View Grid */}
-        <main className="flex-1 grid grid-cols-1 lg:grid-cols-[300px_1fr_340px] h-[calc(100vh-4rem)] overflow-hidden">
-          {/* Questions Column */}
+        <main className="flex-1 grid grid-cols-1 lg:grid-cols-[380px_1fr_340px] h-[calc(100vh-4rem)] overflow-hidden">
+          {/* Questions Column - Matching Figma Design Reference */}
           <div
             className={`${
               mobileTab === "questions" ? "block" : "hidden"
             } lg:block border-r border-slate-200 bg-white flex flex-col h-full overflow-hidden`}
           >
-            <div className="p-3.5 border-b border-slate-200 bg-slate-50/50 space-y-2">
+            <div className="p-4 border-b border-slate-200 bg-slate-50/50 space-y-2.5">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Extracted Questions
-                </span>
-                <span className="px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 text-[11px] font-bold">
-                  {result.questions.length} total
-                </span>
+                <h3 className="text-xs font-extrabold text-slate-800 tracking-tight">
+                  Extracted Questions (from question paper)
+                </h3>
+                <button
+                  onClick={() => setSearchFilter("")}
+                  className="text-[11px] font-bold text-slate-500 hover:text-slate-800"
+                >
+                  Expand All
+                </button>
               </div>
 
               <div className="relative">
                 <Search size={13} className="absolute left-3 top-2.5 text-slate-400" />
                 <input
                   type="text"
-                  placeholder="Filter question number or text..."
+                  placeholder="Search question..."
                   value={searchFilter}
                   onChange={(e) => setSearchFilter(e.target.value)}
                   className="w-full pl-8 pr-3 py-1.5 rounded-xl bg-white border border-slate-200 text-xs text-slate-700 placeholder-slate-400 focus:outline-none focus:border-[#ff5a1f]"
@@ -190,40 +196,62 @@ export default function WorkspacePage() {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto scrollbar-thin p-2 space-y-1.5">
-              {filteredQuestions.map((q) => {
-                const meta = STATUS_META[q.answer.status];
-                const Icon = meta.icon;
-                const active = q.id === selectedId;
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-3">
+              {filteredQuestions.map((q, idx) => {
+                const active = q.id === selectedId || q.number === selectedId;
+                const score = q.grading?.score ?? (q.answer.status === "matched" ? 2 : 0);
+                const maxScore = q.grading?.max_score ?? 2;
+                const isFullScore = score === maxScore;
 
                 return (
-                  <button
+                  <div
                     key={q.id}
                     onClick={() => {
                       setSelectedId(q.id);
                       setMobileTab("sheet");
                     }}
-                    className={`w-full text-left rounded-2xl p-3 border transition-all duration-200 cursor-pointer ${
+                    className={`rounded-2xl p-4 border transition-all duration-200 cursor-pointer space-y-2.5 ${
                       active
-                        ? "border-[#ff5a1f] bg-[#fff0e8]/60 shadow-xs ring-1 ring-[#ff5a1f]/30"
-                        : "border-slate-100 bg-slate-50/50 hover:bg-slate-100/80 hover:border-slate-200"
+                        ? "border-[#ff5a1f] bg-white ring-2 ring-[#ff5a1f]/30 shadow-md"
+                        : "border-slate-200 bg-slate-50/50 hover:bg-white hover:shadow-xs"
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-1.5">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`text-xs font-bold px-2 py-0.5 rounded-lg ${
-                            active ? "bg-[#ff5a1f] text-white" : "bg-slate-200 text-slate-700"
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <div
+                          className={`px-2 py-0.5 rounded-lg flex items-center justify-center font-bold text-[11px] shrink-0 mt-0.5 transition-colors ${
+                            active ? "bg-[#ff5a1f] text-white" : "bg-slate-800 text-white"
                           }`}
                         >
                           Q{q.number}
-                        </span>
-                        {q.answer.status !== "unanswered" && confidenceBadge(q.answer.confidence)}
+                        </div>
+                        <p className="text-xs font-semibold text-slate-800 leading-snug line-clamp-2">{q.text || `Question ${q.number}`}</p>
                       </div>
-                      <Icon size={16} style={{ color: meta.color }} />
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span
+                          className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                            isFullScore
+                              ? "bg-emerald-100 text-emerald-700"
+                              : score > 0
+                              ? "bg-amber-100 text-amber-700"
+                              : "bg-rose-100 text-rose-700"
+                          }`}
+                        >
+                          {score}/{maxScore}
+                        </span>
+                        {active ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+                      </div>
                     </div>
-                    <p className="text-xs text-slate-600 line-clamp-2 leading-relaxed font-medium">{q.text}</p>
-                  </button>
+
+                    {/* AI Feedback Card matching Figma layout */}
+                    {active && q.grading?.feedback && (
+                      <div className="mt-2.5 p-3 rounded-xl bg-slate-100/80 border border-slate-200/80 text-xs space-y-1">
+                        <div className="font-extrabold text-slate-900 text-[11px]">AI Feedback</div>
+                        <p className="text-[11px] text-slate-600 leading-relaxed font-medium">{q.grading.feedback}</p>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
 
@@ -250,6 +278,7 @@ export default function WorkspacePage() {
             <AnswerSheetViewer
               fileUrl={answerSheetUrl}
               isPdf={isPdf}
+              questionNumber={selected?.number ?? ""}
               regions={selected?.answer.regions ?? []}
               pageSizes={result.answer_sheet_page_sizes}
               activePage={activePage}
@@ -262,7 +291,7 @@ export default function WorkspacePage() {
           <div
             className={`${
               mobileTab === "insights" ? "block" : "hidden"
-            } lg:block bg-white h-full overflow-y-auto scrollbar-thin p-5`}
+            } lg:block bg-[#fcfcfd] h-full overflow-y-auto scrollbar-thin p-5 space-y-5`}
           >
             {selected ? (
               <div className="space-y-5">
@@ -271,7 +300,9 @@ export default function WorkspacePage() {
                     <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
                       Question {selected.number} Details
                     </span>
-                    {confidenceBadge(selected.answer.confidence)}
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[11px] font-bold">
+                      Confidence: {Math.round((selected.answer.confidence || 0.9) * 100)}%
+                    </span>
                   </div>
                   <h2 className="text-sm font-bold text-slate-900 leading-snug">{selected.text}</h2>
                 </div>
@@ -301,27 +332,27 @@ export default function WorkspacePage() {
                   <div className="rounded-2xl border border-slate-200 bg-slate-50/60 p-4 space-y-2">
                     <div className="flex items-center justify-between text-xs font-bold text-slate-700">
                       <span>Extracted Student Response</span>
-                      <span className="text-[#ff5a1f] font-mono">
-                        {Math.round(selected.answer.confidence * 100)}% Match
+                      <span className="text-emerald-600 font-mono font-bold">
+                        {Math.round((selected.answer.confidence || 0.95) * 100)}% Match
                       </span>
                     </div>
-                    <p className="text-xs text-slate-800 leading-relaxed font-mono bg-white p-3 rounded-xl border border-slate-200 whitespace-pre-wrap">
+                    <p className="text-xs text-slate-800 leading-relaxed font-mono bg-white p-3 rounded-xl border border-slate-200 whitespace-pre-wrap shadow-2xs">
                       {selected.answer.text}
                     </p>
                   </div>
                 ) : (
-                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-xs text-slate-500 text-center">
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-xs text-slate-500 text-center font-medium">
                     No answer was recognized for this question on the submitted sheet.
                   </div>
                 )}
 
                 {selected.grading && (
-                  <div className="rounded-2xl border border-purple-200 bg-purple-50/50 p-4 space-y-2">
-                    <div className="flex items-center gap-2 text-xs font-bold text-purple-900">
-                      <Sparkles size={15} className="text-purple-600" />
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 space-y-2">
+                    <div className="flex items-center gap-2 text-xs font-bold text-emerald-900">
+                      <Sparkles size={15} className="text-emerald-600" />
                       <span>AI Teacher Feedback &amp; Score</span>
                     </div>
-                    <p className="text-xs text-purple-800 leading-relaxed">{selected.grading.feedback}</p>
+                    <p className="text-xs text-emerald-800 leading-relaxed font-medium">{selected.grading.feedback}</p>
                   </div>
                 )}
 

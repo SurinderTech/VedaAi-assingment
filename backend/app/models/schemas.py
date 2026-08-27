@@ -105,10 +105,19 @@ class AssessmentResult(BaseModel):
     unmatched_answers: List[UnmatchedAnswer] = []
     question_paper_pages: int = 0
     answer_sheet_pages: int = 0
-    # (width, height) in pixels of the coordinate space that answer bboxes
-    # were computed in, per page (1-indexed page N = sizes[N-1]). The
-    # frontend scales bbox -> screen coords against these, per plan §26.
     answer_sheet_page_sizes: List[List[int]] = []
     answer_sheet_is_pdf: bool = False
     question_paper_url: Optional[str] = None
     answer_sheet_url: Optional[str] = None
+
+
+class AssistantRequest(BaseModel):
+    message: str
+    question_id: Optional[str] = None
+
+
+class AssistantResponse(BaseModel):
+    reply: str
+    attention_questions: List[str] = []
+    unanswered_questions: List[str] = []
+    review_questions: List[str] = []

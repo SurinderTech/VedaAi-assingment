@@ -2,19 +2,23 @@ from __future__ import annotations
 import os
 import uuid
 import tempfile
+from typing import Optional
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 
 from app.core import store
-from app.models.schemas import AssessmentStatus, AssessmentResult
+from app.models.schemas import AssessmentStatus, AssessmentResult, AssistantRequest, AssistantResponse
 from app.services.document_processor import validate_file, UnsupportedFileError
 from app.services.pipeline import run_pipeline
+from app.services.assistant_service import process_assistant_message
 
 router = APIRouter(prefix="/api/assessment")
 
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "vedaai_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
+# --- Static Routes First ---
 
 @router.post("/upload")
 async def upload(
@@ -47,6 +51,18 @@ async def upload(
 
     return {"assessment_id": assessment_id}
 
+
+@router.get("/list")
+async def list_all():
+    return store.list_assessments()
+
+
+@router.post("/assistant", response_model=AssistantResponse)
+async def global_assistant(req: AssistantRequest):
+    return await process_assistant_message(None, req.message, req.question_id)
+
+
+# --- Dynamic Assessment ID Parameterized Routes ---
 
 @router.post("/{assessment_id}/process")
 async def process(assessment_id: str, background_tasks: BackgroundTasks):
@@ -84,3 +100,8 @@ async def get_file(assessment_id: str, role: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File missing")
     return FileResponse(path)
+
+
+@router.post("/{assessment_id}/assistant", response_model=AssistantResponse)
+async def assistant(assessment_id: str, req: AssistantRequest):
+    return await process_assistant_message(assessment_id, req.message, req.question_id)
