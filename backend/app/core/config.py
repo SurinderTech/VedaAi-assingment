@@ -24,5 +24,9 @@ class Settings:
     HIGH_CONFIDENCE: float = 0.85
     MEDIUM_CONFIDENCE: float = 0.55
 
+    # Question extraction confidence thresholds (configurable via env / settings)
+    QP_HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv("QP_HIGH_CONFIDENCE_THRESHOLD", "0.85"))
+    QP_LOW_CONFIDENCE_THRESHOLD: float = float(os.getenv("QP_LOW_CONFIDENCE_THRESHOLD", "0.20"))
+
 
 settings = Settings()

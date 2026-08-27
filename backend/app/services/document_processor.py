@@ -73,11 +73,27 @@ def _extract_native_pdf_blocks(path: str) -> Tuple[List[Block], int]:
     blocks: List[Block] = []
     num_pages = len(reader.pages)
     for page_idx, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
+        raw_text = page.extract_text() or ""
         media = page.mediabox
         page_w = float(media.width)
         page_h = float(media.height)
-        lines = [l for l in text.split("\n") if l.strip()]
+        lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+
+        # Fix word-fragmented lines from PDFs with single-word line breaks
+        if lines and len(lines) > 20 and sum(len(l) for l in lines) / len(lines) < 15:
+            import re
+            rejoined = []
+            curr = []
+            for l in lines:
+                if curr and (re.match(r"^(?:\d{1,3}[\.\)]|Q\d+|\([a-z0-9]{1,2}\)|[a-z]\))", l, re.IGNORECASE)):
+                    rejoined.append(" ".join(curr))
+                    curr = [l]
+                else:
+                    curr.append(l)
+            if curr:
+                rejoined.append(" ".join(curr))
+            lines = rejoined
+
         if not lines:
             continue
         line_h = page_h / max(len(lines), 1)
@@ -94,6 +110,7 @@ def _extract_native_pdf_blocks(path: str) -> Tuple[List[Block], int]:
                 )
             )
     return blocks, num_pages
+
 
 
 def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
