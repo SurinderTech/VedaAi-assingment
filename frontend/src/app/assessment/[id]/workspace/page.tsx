@@ -65,15 +65,25 @@ export default function WorkspacePage() {
   const [searchFilter, setSearchFilter] = useState("");
   const [mobileTab, setMobileTab] = useState<"questions" | "sheet" | "insights">("sheet");
   const [isMobileOpen, setIsMobileOpen] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     getResult(params.id)
       .then((r) => {
         setResult(r);
-        if (r.questions.length > 0) setSelectedId(r.questions[0].id);
+        if (r.questions.length > 0) {
+          setSelectedId(r.questions[0].id);
+          setExpandedIds(new Set([r.questions[0].id]));
+        }
       })
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load result"));
   }, [params.id]);
+
+  useEffect(() => {
+    if (selectedId) {
+      setExpandedIds((prev) => new Set(prev).add(selectedId));
+    }
+  }, [selectedId]);
 
   const filteredQuestions = useMemo(() => {
     if (!result) return [];
@@ -86,6 +96,33 @@ export default function WorkspacePage() {
     () => result?.questions.find((q) => q.id === selectedId || q.number === selectedId),
     [result, selectedId]
   );
+
+  const isAllExpanded = useMemo(() => {
+    if (!result || result.questions.length === 0) return false;
+    return result.questions.every((q) => expandedIds.has(q.id));
+  }, [result, expandedIds]);
+
+  const handleToggleExpandAll = () => {
+    if (!result) return;
+    if (isAllExpanded) {
+      setExpandedIds(new Set(selectedId ? [selectedId] : []));
+    } else {
+      setExpandedIds(new Set(result.questions.map((q) => q.id)));
+    }
+  };
+
+  const handleToggleSingle = (qId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(qId)) {
+        next.delete(qId);
+      } else {
+        next.add(qId);
+      }
+      return next;
+    });
+  };
 
   const answerSheetUrl = fileUrl(params.id, "answer_sheet");
 
@@ -123,7 +160,7 @@ export default function WorkspacePage() {
   return (
     <div className="flex h-screen w-full bg-[#f4f5f8] overflow-hidden font-sans">
       <Sidebar isMobileOpen={isMobileOpen} onMobileClose={() => setIsMobileOpen(false)} />
-      <div className="flex-1 flex flex-col min-w-0 h-screen">
+      <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
         <Header
           title="Assessment Workspace — Question & Answer Mapping"
           onMenuClick={() => setIsMobileOpen(true)}
@@ -164,23 +201,23 @@ export default function WorkspacePage() {
         </div>
 
         {/* 3-Column Split View Grid */}
-        <main className="flex-1 grid grid-cols-1 lg:grid-cols-[380px_1fr_340px] h-[calc(100vh-4rem)] overflow-hidden">
+        <main className="flex-1 grid grid-cols-1 lg:grid-cols-[380px_1fr_340px] min-h-0 h-[calc(100vh-4rem)] overflow-hidden">
           {/* Questions Column - Matching Figma Design Reference */}
           <div
             className={`${
               mobileTab === "questions" ? "block" : "hidden"
-            } lg:block border-r border-slate-200 bg-white flex flex-col h-full overflow-hidden`}
+            } lg:flex border-r border-slate-200 bg-white flex-col min-h-0 h-full overflow-hidden`}
           >
-            <div className="p-4 border-b border-slate-200 bg-slate-50/50 space-y-2.5">
+            <div className="p-4 border-b border-slate-200 bg-slate-50/50 space-y-2.5 shrink-0">
               <div className="flex items-center justify-between">
                 <h3 className="text-xs font-extrabold text-slate-800 tracking-tight">
-                  Extracted Questions (from question paper)
+                  Extracted Questions ({result.questions.length})
                 </h3>
                 <button
-                  onClick={() => setSearchFilter("")}
-                  className="text-[11px] font-bold text-slate-500 hover:text-slate-800"
+                  onClick={handleToggleExpandAll}
+                  className="text-[11px] font-bold text-[#ff5a1f] hover:underline cursor-pointer"
                 >
-                  Expand All
+                  {isAllExpanded ? "Collapse All" : "Expand All"}
                 </button>
               </div>
 
@@ -196,9 +233,10 @@ export default function WorkspacePage() {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-3">
-              {filteredQuestions.map((q, idx) => {
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-2.5 min-h-0 max-h-full">
+              {filteredQuestions.map((q) => {
                 const active = q.id === selectedId || q.number === selectedId;
+                const isExpanded = expandedIds.has(q.id) || active;
                 const score = q.grading?.score ?? (q.answer.status === "matched" ? 2 : 0);
                 const maxScore = q.grading?.max_score ?? 2;
                 const isFullScore = score === maxScore;
@@ -210,14 +248,14 @@ export default function WorkspacePage() {
                       setSelectedId(q.id);
                       setMobileTab("sheet");
                     }}
-                    className={`rounded-2xl p-4 border transition-all duration-200 cursor-pointer space-y-2.5 ${
+                    className={`rounded-2xl p-3.5 border transition-all duration-200 cursor-pointer space-y-2 ${
                       active
                         ? "border-[#ff5a1f] bg-white ring-2 ring-[#ff5a1f]/30 shadow-md"
                         : "border-slate-200 bg-slate-50/50 hover:bg-white hover:shadow-xs"
                     }`}
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-start gap-2.5 min-w-0">
+                    <div className="flex items-start justify-between gap-2.5">
+                      <div className="flex items-start gap-2.5 min-w-0 flex-1">
                         <div
                           className={`px-2 py-0.5 rounded-lg flex items-center justify-center font-bold text-[11px] shrink-0 mt-0.5 transition-colors ${
                             active ? "bg-[#ff5a1f] text-white" : "bg-slate-800 text-white"
@@ -225,10 +263,12 @@ export default function WorkspacePage() {
                         >
                           Q{q.number}
                         </div>
-                        <p className="text-xs font-semibold text-slate-800 leading-snug line-clamp-2">{q.text || `Question ${q.number}`}</p>
+                        <p className={`text-xs font-semibold text-slate-800 leading-snug whitespace-pre-line ${isExpanded ? "" : "line-clamp-2"}`}>
+                          {q.text || `Question ${q.number}`}
+                        </p>
                       </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
+                      <div className="flex items-center gap-1.5 shrink-0">
                         <span
                           className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
                             isFullScore
@@ -240,17 +280,15 @@ export default function WorkspacePage() {
                         >
                           {score}/{maxScore}
                         </span>
-                        {active ? <ChevronUp size={16} className="text-slate-400" /> : <ChevronDown size={16} className="text-slate-400" />}
+                        <button
+                          onClick={(e) => handleToggleSingle(q.id, e)}
+                          className="p-1 hover:bg-slate-200/60 rounded-md transition-colors text-slate-400 hover:text-slate-700 cursor-pointer"
+                          title={isExpanded ? "Collapse Text" : "Expand Text"}
+                        >
+                          {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                        </button>
                       </div>
                     </div>
-
-                    {/* AI Feedback Card matching Figma layout */}
-                    {active && q.grading?.feedback && (
-                      <div className="mt-2.5 p-3 rounded-xl bg-slate-100/80 border border-slate-200/80 text-xs space-y-1">
-                        <div className="font-extrabold text-slate-900 text-[11px]">AI Feedback</div>
-                        <p className="text-[11px] text-slate-600 leading-relaxed font-medium">{q.grading.feedback}</p>
-                      </div>
-                    )}
                   </div>
                 );
               })}

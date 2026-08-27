@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { Region } from "@/types/assessment";
-import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, RotateCcw, Eye } from "lucide-react";
+import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, RotateCcw, Eye, CheckCircle2 } from "lucide-react";
 
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
@@ -46,14 +46,61 @@ export default function AnswerSheetViewer({
   const scaleY = original && renderedSize ? renderedSize.h / original[1] : 1;
   const regionsOnPage = regions.filter((r) => r.page === activePage);
 
+  // Compute unified outer merged bounding box covering the entire answer text
+  const mergedBounds = useMemo(() => {
+    if (!regionsOnPage || regionsOnPage.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const r of regionsOnPage) {
+      if (r.bbox.x < minX) minX = r.bbox.x;
+      if (r.bbox.y < minY) minY = r.bbox.y;
+      if (r.bbox.x + r.bbox.width > maxX) maxX = r.bbox.x + r.bbox.width;
+      if (r.bbox.y + r.bbox.height > maxY) maxY = r.bbox.y + r.bbox.height;
+    }
+    const padX = 6;
+    const padY = 4;
+    return {
+      x: Math.max(0, minX - padX),
+      y: Math.max(0, minY - padY),
+      width: (maxX - minX) + (padX * 2),
+      height: (maxY - minY) + (padY * 2),
+    };
+  }, [regionsOnPage]);
+
   const baseWidth = 640;
   const currentWidth = baseWidth * zoom;
+
+  const allSpannedPages = useMemo(() => {
+    return Array.from(new Set(regions.map((r) => r.page))).sort((a, b) => a - b);
+  }, [regions]);
+
+  const nextPageInSpanned = useMemo(() => {
+    return allSpannedPages.find((p) => p > activePage);
+  }, [allSpannedPages, activePage]);
+
+  const prevPageInSpanned = useMemo(() => {
+    const prevs = allSpannedPages.filter((p) => p < activePage);
+    return prevs.length > 0 ? prevs[prevs.length - 1] : undefined;
+  }, [allSpannedPages, activePage]);
+
+  // Scroll bounding box into view when activePage or mergedBounds changes
+  useEffect(() => {
+    if (mergedBounds && containerRef.current) {
+      const targetY = mergedBounds.y * scaleY;
+      const scrollParent = containerRef.current.parentElement;
+      if (scrollParent) {
+        scrollParent.scrollTo({
+          top: Math.max(0, targetY - 60),
+          behavior: "smooth",
+        });
+      }
+    }
+  }, [mergedBounds, scaleY, activePage]);
 
   return (
     <div className="flex flex-col h-full bg-[#eef0f4]">
       {/* Control Bar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-slate-200 shadow-xs z-10 text-xs font-semibold text-slate-700">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <div className="h-6 w-6 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
             <Eye size={14} />
           </div>
@@ -62,6 +109,25 @@ export default function AnswerSheetViewer({
             <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[11px] font-bold">
               {regionsOnPage.length} region{regionsOnPage.length > 1 ? "s" : ""} mapped
             </span>
+          )}
+          {allSpannedPages.length > 1 && (
+            <div className="flex items-center gap-1 bg-amber-50 border border-amber-200 rounded-full px-2.5 py-0.5 text-[11px] font-bold text-amber-800">
+              <span>Spans Pages:</span>
+              {allSpannedPages.map((p) => (
+                <button
+                  key={p}
+                  onClick={() => onPageChange(p)}
+                  className={`px-2 py-0.5 rounded-full cursor-pointer transition-all ${
+                    p === activePage
+                      ? "bg-amber-600 text-white shadow-xs scale-105"
+                      : "bg-amber-100 text-amber-900 hover:bg-amber-200"
+                  }`}
+                  title={`Jump to Page ${p}`}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
           )}
         </div>
 
@@ -118,8 +184,8 @@ export default function AnswerSheetViewer({
       </div>
 
       {/* Canvas / Image Display */}
-      <div className="flex-1 overflow-auto scrollbar-thin flex justify-center py-6 px-4">
-        <div ref={containerRef} className="relative inline-block shadow-2xl rounded-xl overflow-hidden bg-white border border-slate-300">
+      <div className="flex-1 overflow-auto scrollbar-thin flex justify-center py-6 px-12 relative">
+        <div ref={containerRef} className="relative inline-block shadow-2xl rounded-xl bg-white border border-slate-300">
           {isPdf ? (
             <Document
               file={fileUrl}
@@ -149,28 +215,75 @@ export default function AnswerSheetViewer({
             />
           )}
 
-          {/* Region Bounding Box Highlights — Matching Figma Green Highlighter */}
-          {renderedSize &&
-            regionsOnPage.map((r, i) => (
-              <div
-                key={i}
-                className="absolute border-2 border-emerald-500 bg-emerald-500/15 rounded-md transition-all duration-300 shadow-[0_0_15px_rgba(16,185,129,0.4)] pointer-events-none"
-                style={{
-                  left: r.bbox.x * scaleX,
-                  top: r.bbox.y * scaleY,
-                  width: r.bbox.width * scaleX,
-                  height: r.bbox.height * scaleY,
-                }}
-              >
-                {i === 0 && (
-                  <div className="absolute -top-6 left-0 bg-emerald-600 text-white text-[11px] font-bold px-2 py-0.5 rounded-md shadow-lg flex items-center gap-1 z-20 whitespace-nowrap">
-                    <span>Q{questionNumber || "Matched"}</span>
-                  </div>
-                )}
-              </div>
-            ))}
+          {/* Single Unified Vivid Rectangle Bounding Box Highlight */}
+          {renderedSize && mergedBounds && (
+            <div
+              className="absolute border-3 border-emerald-500 bg-emerald-400/20 rounded-2xl transition-all duration-300 shadow-[0_0_30px_rgba(16,185,129,0.45)] ring-4 ring-emerald-400/30 pointer-events-none z-20"
+              style={{
+                left: mergedBounds.x * scaleX,
+                top: mergedBounds.y * scaleY,
+                width: mergedBounds.width * scaleX,
+                height: mergedBounds.height * scaleY,
+              }}
+            >
+              {/* Corner Accent Indicators for total visual clarity */}
+              <div className="absolute -top-1.5 -left-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
+              <div className="absolute -top-1.5 -right-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
+              <div className="absolute -bottom-1.5 -left-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
+              <div className="absolute -bottom-1.5 -right-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
+            </div>
+          )}
+
+          {/* Question Anchor Badge placed cleanly outside to the left of the answer text */}
+          {renderedSize && mergedBounds && (
+            <div
+              className="absolute z-30 bg-emerald-600 text-white text-xs font-bold px-2.5 py-1 rounded-lg shadow-xl flex items-center gap-1.5 whitespace-nowrap pointer-events-none transition-all duration-300 -translate-x-full border border-emerald-400/40"
+              style={{
+                left: Math.max(4, (mergedBounds.x * scaleX) - 8),
+                top: Math.max(4, mergedBounds.y * scaleY),
+              }}
+            >
+              <CheckCircle2 size={13} className="text-emerald-200" />
+              <span>Q{questionNumber || "Matched"}</span>
+            </div>
+          )}
+
+          {/* Floating Next Page Jump Banner when answer continues on next page */}
+          {renderedSize && mergedBounds && nextPageInSpanned && (
+            <div
+              className="absolute z-40 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold px-3.5 py-2 rounded-xl shadow-2xl flex items-center gap-2.5 cursor-pointer transition-all border border-emerald-400/50 animate-bounce -translate-x-1/2 left-1/2"
+              style={{
+                top: Math.min(renderedSize.h - 48, (mergedBounds.y + mergedBounds.height) * scaleY + 12),
+              }}
+              onClick={() => onPageChange(nextPageInSpanned)}
+              title={`Jump directly to Page ${nextPageInSpanned}`}
+            >
+              <span>Q{questionNumber || "Answer"} continues on Page {nextPageInSpanned}</span>
+              <span className="bg-white/25 px-2.5 py-1 rounded-lg text-[11px] font-mono flex items-center gap-1">
+                Jump to Page {nextPageInSpanned} <ChevronRight size={13} />
+              </span>
+            </div>
+          )}
+
+          {/* Floating Previous Page Back Banner when viewing continuation page */}
+          {renderedSize && mergedBounds && prevPageInSpanned && (
+            <div
+              className="absolute z-40 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold px-3.5 py-2 rounded-xl shadow-2xl flex items-center gap-2.5 cursor-pointer transition-all border border-emerald-400/50 -translate-x-1/2 left-1/2"
+              style={{
+                top: Math.max(8, (mergedBounds.y * scaleY) - 44),
+              }}
+              onClick={() => onPageChange(prevPageInSpanned)}
+              title={`Return to Page ${prevPageInSpanned}`}
+            >
+              <span className="bg-white/25 px-2.5 py-1 rounded-lg text-[11px] font-mono flex items-center gap-1">
+                <ChevronLeft size={13} /> Back to Page {prevPageInSpanned}
+              </span>
+              <span>Q{questionNumber || "Answer"} continued from Page {prevPageInSpanned}</span>
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
+

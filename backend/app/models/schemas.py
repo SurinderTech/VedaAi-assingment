@@ -33,6 +33,8 @@ class Question(BaseModel):
     page: int
     bbox: Optional[BBox] = None
     order_index: int
+    section: Optional[str] = None
+    options: List[str] = []
 
 
 class AnswerCandidate(BaseModel):
@@ -70,6 +72,8 @@ class QuestionResult(BaseModel):
     page: int
     answer: MappedAnswer
     grading: Optional[Grading] = None
+    section: Optional[str] = None
+    options: List[str] = []
 
 
 class UnmatchedAnswer(BaseModel):

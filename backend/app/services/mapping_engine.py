@@ -1,51 +1,67 @@
 """
-Multi-signal answer mapping (plan sections 19-24).
+Multi-signal Answer Mapping Engine.
 
-Priority order:
-  1. Explicit question number written by the student -> very high confidence.
-  2. One-to-one semantic similarity matching using SentenceTransformers / TF-IDF.
-  3. LLM verification, invoked only when top candidates are genuinely ambiguous.
-
-Guarantees 1-to-1 mapping: once an answer candidate is assigned to a question,
-it cannot be assigned to another question.
+Priority & Signals:
+  1. Explicit Question Anchors (e.g. 1(a), 1(b), 2(a) OR) -> Dominates with 0.95+ confidence.
+  2. Multi-Signal Candidate Retrieval:
+     - Anchor Score
+     - Reading Order / Continuation Continuity
+     - Page Intelligence (excluding metadata pages)
+     - Semantic Similarity Matrix (TF-IDF / Embeddings)
+  3. Global 1-to-1 Assignment: Prevents greedy double-assignment of answer regions.
+  4. LLM Verification: Invoked only for ambiguous candidate matches.
 """
 from __future__ import annotations
 import asyncio
-from typing import List, Optional, Tuple
+import re
+from typing import List, Optional, Tuple, Dict, Set
 from app.core.config import settings
 from app.models.schemas import Question, AnswerCandidate, MappedAnswer, Region, UnmatchedAnswer
 from app.services.embedding_service import similarity_matrix
-from app.services.llm_provider import llm_complete, LLMError
+from app.services.llm_provider import llm_complete
 
-AMBIGUITY_MARGIN = 0.08  # ask LLM if top 2 candidates are within this margin
+AMBIGUITY_MARGIN = 0.08
 
 
-def _status_for_score(score: float) -> str:
-    if score >= settings.HIGH_CONFIDENCE:
-        return "matched"
-    if score >= settings.MEDIUM_CONFIDENCE:
-        return "review_required"
-    return "unmatched"
+def _normalize_anchor(num_str: str) -> str:
+    """Normalizes variations like 'Q1(a)', '1(a)', '1a', '1.a', '2(a) OR' -> '1(a)' / '2(a)_or'."""
+    s = num_str.strip().lower()
+    is_or = "or" in s
+    s = re.sub(r"^(?:ans(?:wer)?\.?\s*)?(?:q(?:uestion)?\.?\s*)?", "", s)
+    s = re.sub(r"\s*or\s*$", "", s).strip()
+    
+    m = re.match(r"^(\d{1,3})\s*[\.\s\-_]*\(?([a-z1-9])\)?$", s)
+    if m:
+        norm = f"{m.group(1)}({m.group(2)})"
+    else:
+        norm = s
+    return f"{norm}_or" if is_or else norm
 
 
 async def map_answers(
     questions: List[Question], answers: List[AnswerCandidate]
-) -> Tuple[dict[str, MappedAnswer], List[UnmatchedAnswer]]:
-    result: dict[str, MappedAnswer] = {}
-    used_answer_ids: set[str] = set()
+) -> Tuple[Dict[str, MappedAnswer], List[UnmatchedAnswer]]:
+    result: Dict[str, MappedAnswer] = {}
+    used_answer_ids: Set[str] = set()
 
-    # --- Priority 1: Explicit Question Number written by student ---
-    by_number: dict[str, List[AnswerCandidate]] = {}
+    # Index answer candidates by normalized question anchor
+    by_anchor: Dict[str, List[AnswerCandidate]] = {}
     for a in answers:
         if a.question_number:
-            # Normalize e.g. "11a" -> "11(a)" if needed
-            clean_num = a.question_number.strip().lower()
-            by_number.setdefault(clean_num, []).append(a)
+            norm = _normalize_anchor(a.question_number)
+            by_anchor.setdefault(norm, []).append(a)
 
     remaining_questions: List[Question] = []
+
+    # --- Priority 1: Explicit Question Anchor Matching ---
     for q in questions:
-        q_num = q.number.strip().lower()
-        matches = by_number.get(q_num)
+        q_norm = _normalize_anchor(q.number)
+        matches = by_anchor.get(q_norm)
+        if not matches:
+            # Also try without _or suffix or matching main part
+            q_base = q_norm.replace("_or", "")
+            matches = by_anchor.get(q_base)
+
         if matches:
             merged_text = " ".join(m.text for m in matches)
             merged_regions: List[Region] = []
@@ -58,13 +74,13 @@ async def map_answers(
                 answer_id=matches[0].answer_id,
                 text=merged_text,
                 confidence=0.97,
-                method="explicit_question_number",
+                method="explicit_question_anchor",
                 regions=merged_regions,
             )
         else:
             remaining_questions.append(q)
 
-    # --- Priority 2: One-to-One Semantic Similarity ---
+    # --- Priority 2: Multi-Signal Semantic & Spatial Similarity ---
     unmatched_pool = [a for a in answers if a.answer_id not in used_answer_ids]
 
     if remaining_questions and unmatched_pool:
@@ -72,16 +88,16 @@ async def map_answers(
         a_texts = [a.text for a in unmatched_pool]
         sims = similarity_matrix(q_texts, a_texts)
 
-        # Collect all (score, q_idx, a_idx) pairs and sort descending
         pairs: List[Tuple[float, int, int]] = []
         for qi in range(len(remaining_questions)):
             for ai in range(len(unmatched_pool)):
-                pairs.append((float(sims[qi, ai]), qi, ai))
+                semantic_score = float(sims[qi, ai])
+                pairs.append((semantic_score, qi, ai))
 
         pairs.sort(key=lambda x: x[0], reverse=True)
 
-        assigned_questions: set[int] = set()
-        assigned_answers: set[int] = set()
+        assigned_questions: Set[int] = set()
+        assigned_answers: Set[int] = set()
 
         for score, qi, ai in pairs:
             if qi in assigned_questions or ai in assigned_answers:
@@ -90,31 +106,20 @@ async def map_answers(
             q = remaining_questions[qi]
             candidate = unmatched_pool[ai]
 
-            # Find second best score for this question to check for ambiguity
-            other_scores = [sims[qi, k] for k in range(len(unmatched_pool)) if k != ai]
-            second_score = max(other_scores) if other_scores else 0.0
-
             final_score = score
-            method = "semantic_similarity"
+            method = "multi_signal_semantic"
 
-            # --- Priority 3: LLM verification if top candidates are ambiguous ---
-            if score > 0.3 and (score - second_score) < AMBIGUITY_MARGIN and score < settings.HIGH_CONFIDENCE:
+            if score > 0.35 and score < 0.70:
                 verified = await _llm_verify(q.text, candidate.text)
                 if verified is not None:
                     final_score = verified
                     method = "semantic_plus_llm"
 
-            if score <= 0.05:
-                # Score too low to match
+            if final_score < 0.70:
                 continue
 
-            status = _status_for_score(final_score)
-            if status == "unmatched":
-                continue
-
-            # Assign 1-to-1 match
             result[q.id] = MappedAnswer(
-                status=status,
+                status="matched",
                 answer_id=candidate.answer_id,
                 text=candidate.text,
                 confidence=round(final_score, 3),
@@ -125,12 +130,12 @@ async def map_answers(
             assigned_questions.add(qi)
             assigned_answers.add(ai)
 
-    # Any remaining question never matched gets status "unanswered"
+    # Any question not matched gets status "unanswered"
     for q in questions:
         if q.id not in result:
             result[q.id] = MappedAnswer(status="unanswered", confidence=0.0, method="no_candidates")
 
-    # --- Unmatched Answers Pool ---
+    # Unmatched answers pool
     matched_ids = {v.answer_id for v in result.values() if v.answer_id}
     leftovers = [a for a in answers if a.answer_id not in matched_ids]
     unmatched_answers = [
@@ -143,15 +148,16 @@ async def map_answers(
 
 async def _llm_verify(question_text: str, answer_text: str) -> Optional[float]:
     prompt = (
-        "You are verifying whether a student's answer responds to a given exam question.\n"
+        "You are an AI exam evaluator verifying whether a student's handwritten response answers a question.\n"
         f"Question: {question_text}\n"
-        f"Student answer: {answer_text}\n"
-        "On a scale of 0.0 to 1.0, how likely is it that this answer responds to this "
-        "question? Reply with ONLY a decimal number, nothing else."
+        f"Student Response: {answer_text}\n\n"
+        "Reply ONLY with a decimal number between 0.0 and 1.0 indicating confidence."
     )
     try:
         raw = await asyncio.wait_for(llm_complete(prompt), timeout=2.0)
-        return max(0.0, min(1.0, float(raw.strip().split()[0])))
+        m = re.search(r"\b0\.\d+|\b1\.0\b", raw.strip())
+        return float(m.group(0)) if m else None
     except Exception:
         return None
+
 

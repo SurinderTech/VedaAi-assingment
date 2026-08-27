@@ -5,6 +5,7 @@ from app.models.schemas import (
     AssessmentResult, AssessmentStatus, QuestionResult,
 )
 from app.services.document_processor import process_document
+from app.services.page_intelligence import analyze_pages
 from app.services.question_extractor import extract_questions
 from app.services.answer_extractor import extract_answers
 from app.services.mapping_engine import map_answers
@@ -25,7 +26,7 @@ async def run_pipeline(assessment_id: str) -> None:
         qp_blocks, qp_pages, _ = await asyncio.to_thread(
             process_document, files["question_paper"], files["question_paper_ext"], False
         )
-        questions = await asyncio.to_thread(extract_questions, qp_blocks)
+        questions = await extract_questions(qp_blocks)
 
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_answers",
@@ -34,7 +35,8 @@ async def run_pipeline(assessment_id: str) -> None:
         as_blocks, as_pages, as_sizes = await asyncio.to_thread(
             process_document, files["answer_sheet"], files["answer_sheet_ext"], True
         )
-        answers = await asyncio.to_thread(extract_answers, as_blocks)
+        page_types, metadata_pages = analyze_pages(as_blocks, as_pages)
+        answers = await asyncio.to_thread(extract_answers, as_blocks, metadata_pages)
 
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="mapping",
@@ -51,7 +53,7 @@ async def run_pipeline(assessment_id: str) -> None:
         question_results = [
             QuestionResult(
                 id=q.id, number=q.number, text=q.text, page=q.page,
-                answer=mapped[q.id], grading=g,
+                answer=mapped[q.id], grading=g, section=q.section, options=q.options
             )
             for q, g in zip(questions, gradings)
         ]
