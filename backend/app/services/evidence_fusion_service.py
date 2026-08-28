@@ -172,10 +172,11 @@ class EvidenceFusionService:
 
         normalized_scores: Dict[DocumentRegionType, float] = {}
         for t_type, total_score in type_scores.items():
-            normalized_scores[t_type] = total_score / max(1.0, type_weight_sums[t_type])
+            normalized_scores[t_type] = total_score / max(0.01, type_weight_sums[t_type])
 
         sorted_types = sorted(normalized_scores.items(), key=lambda x: x[1], reverse=True)
         top_type, top_score = sorted_types[0]
+
 
         # Determine if strong multi-source agreement or conflict exists
         distinct_types = len(sorted_types)
@@ -186,26 +187,33 @@ class EvidenceFusionService:
             # Significant disagreement between two high-scoring sources
             if top_score >= 0.70 and second_score >= 0.70:
                 has_conflict = True
-                return ("CONFLICTED", top_type, top_score * 0.85, True)
+                fused_conf = round(min(1.0, 0.40 * reg.confidence + 0.60 * top_score * 0.85), 4)
+                return ("CONFLICTED", top_type, fused_conf, True)
+
+        # Dynamic, traceable confidence calculation: combine base OCR confidence with structural signal scores
+        base_ocr_conf = reg.confidence
+        fused_conf = round(min(1.0, 0.40 * base_ocr_conf + 0.60 * top_score), 4)
 
         # Determine verification state
         if vlm_hyp_provided:
             vlm_h = next((h for h in hypotheses if h.source == "vlm"), None)
             if vlm_h and vlm_h.hypothesized_type == top_type and top_score >= 0.75:
-                return ("VERIFIED", top_type, max(top_score, vlm_h.confidence), has_conflict)
+                verified_conf = round(min(1.0, max(fused_conf, vlm_h.confidence) + 0.05), 4)
+                return ("VERIFIED", top_type, verified_conf, has_conflict)
             elif top_score >= 0.80 and not has_conflict:
-                return ("VERIFIED", top_type, top_score, False)
+                return ("VERIFIED", top_type, fused_conf, False)
             elif has_conflict:
-                return ("CONFLICTED", top_type, top_score, True)
+                return ("CONFLICTED", top_type, fused_conf, True)
             else:
-                return ("UNCERTAIN", top_type, top_score, False)
+                return ("UNCERTAIN", top_type, fused_conf, False)
 
         # When VLM was not provided/called (e.g. skipped high confidence or unconfigured)
         if top_score >= 0.85 and not has_conflict:
-            return ("VERIFIED", top_type, top_score, False)
+            return ("VERIFIED", top_type, fused_conf, False)
         elif has_conflict:
-            return ("CONFLICTED", top_type, top_score, True)
+            return ("CONFLICTED", top_type, fused_conf, True)
         elif top_score < 0.60:
-            return ("UNCERTAIN", top_type, top_score, False)
+            return ("UNCERTAIN", top_type, fused_conf, False)
 
-        return ("UNVERIFIED", top_type, top_score, has_conflict)
+        return ("UNVERIFIED", top_type, fused_conf, has_conflict)
+

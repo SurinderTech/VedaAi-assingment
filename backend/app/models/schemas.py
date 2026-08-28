@@ -633,7 +633,61 @@ RelationshipType = Literal[
     "adjacent_to",
     "visually_grouped_with",
     "uncertain_relation",
+    "option_of",
+    "subquestion_of",
+    "section_member",
+    "associated_visual",
 ]
+
+DocumentPurpose = Literal[
+    "QUESTION_PAPER",
+    "INSTRUCTIONS",
+    "COVER",
+    "ANSWER_KEY",
+    "REFERENCE",
+    "UNKNOWN",
+]
+
+
+class RegionManifestItem(BaseModel):
+    region_id: str
+    page: int
+    bbox: BBox
+    ocr_text: str
+    initial_hypothesis: str = "UNKNOWN"
+    neighbors: List[str] = []
+
+
+class RegionManifest(BaseModel):
+    page_number: int
+    page_width: float
+    page_height: float
+    regions: List[RegionManifestItem] = []
+
+
+class GraphEdge(BaseModel):
+    source_id: str
+    target_id: str
+    relationship: RelationshipType
+    confidence: float = 1.0
+    evidence_sources: List[str] = []
+
+
+class GraphNode(BaseModel):
+    region_id: str
+    role: DocumentRegionType
+    text: str
+    page: int
+    bbox: BBox
+    confidence: float = 1.0
+
+
+class DocumentStructureGraph(BaseModel):
+    nodes: Dict[str, GraphNode] = {}
+    edges: List[GraphEdge] = []
+    document_purpose: DocumentPurpose = "UNKNOWN"
+    page_roles: Dict[int, str] = {}
+
 
 SignalType = Literal[
     "numbering_pattern",
@@ -805,6 +859,7 @@ class ExtractionAudit(BaseModel):
     multi_page_question_count: int = 0
     conflicts: List[str] = []
     rejection_reasons: List[RejectionRecord] = []
+    invariant_violations: List[str] = []
 
 
 ExtractedQuestion = Question
@@ -816,7 +871,10 @@ class DocumentQuestionExtractionResult(BaseModel):
     sections: List[ExtractedSection] = []
     uncertain_candidates: List[ExtractedQuestion] = []
     audit: ExtractionAudit = ExtractionAudit()
+    structure_graph: Optional[DocumentStructureGraph] = None
     fallback_used: bool = False
+    invariant_violations: List[str] = []
+
 
 
 DocumentEvidence.model_rebuild()

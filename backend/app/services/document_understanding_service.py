@@ -161,10 +161,12 @@ class DocumentUnderstandingService:
                 result=res_initial,
                 page_images=page_images,
                 target_region_ids=target_ids_to_verify,
+                force_vlm_verification=force_vlm_verification,
             )
             res_initial.vlm_status = vlm_response.status
             if vlm_response.cost_accounting:
                 res_initial.cost_accounting = vlm_response.cost_accounting
+
 
         # 5. PROVIDER-AGNOSTIC EVIDENCE FUSION
         final_result = self.fusion_service.fuse_document_evidence(res_initial, vlm_response)
@@ -489,12 +491,13 @@ class DocumentUnderstandingService:
     def _extract_intra_page_relationships(
         self, regions: List[DocumentRegion]
     ) -> List[RegionRelationship]:
-        """Extracts spatial, hierarchical, and reading order relationships on a page."""
+        """Extracts spatial, hierarchical, section membership, and reading order relationships on a page."""
         rels: List[RegionRelationship] = []
         if not regions:
             return rels
 
         sorted_regs = sorted(regions, key=lambda r: (r.bbox.y, r.bbox.x))
+        current_section_id: Optional[str] = None
         current_question_id: Optional[str] = None
 
         for idx, reg in enumerate(sorted_regs):
@@ -517,77 +520,61 @@ class DocumentUnderstandingService:
                     )
                 )
 
-            if reg.region_type == "QUESTION":
-                current_question_id = reg.region_id
-            elif reg.region_type in ("OPTION", "SUBQUESTION", "TABLE", "DIAGRAM", "TABLE_CELL"):
-                if current_question_id:
-                    rels.append(
-                        RegionRelationship(
-                            source_region_id=current_question_id,
-                            target_region_id=reg.region_id,
-                            relationship_type="contains",
-                            confidence=0.90,
-                            evidence=[
-                                DocumentEvidence(
-                                    signal_type="surrounding_regions",
-                                    description=f"Question '{current_question_id}' spatially contains {reg.region_type.lower()} region '{reg.region_id}'",
-                                    weight=0.4,
-                                    score=0.90,
-                                )
-                            ],
-                        )
+            # Section Header Tracking
+            if reg.region_type == "SECTION_HEADER" or re.search(r"^\s*(?:SECTION|PART|GROUP)\s+[A-Z0-9]", reg.text, re.IGNORECASE):
+                current_section_id = reg.region_id
+            elif current_section_id and reg.region_id != current_section_id:
+                rels.append(
+                    RegionRelationship(
+                        source_region_id=current_section_id,
+                        target_region_id=reg.region_id,
+                        relationship_type="section_member",
+                        confidence=0.95,
                     )
+                )
+
+            if reg.region_type == "QUESTION":
+                # Check if this question is actually a continuation of the preceding question
+                if current_question_id and not re.search(r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?\d{1,3}\s*[\.\):\-]", reg.text, re.IGNORECASE) and not re.search(r"^\s*\(\s*[a-z0-9]+\s*\)", reg.text, re.IGNORECASE):
                     rels.append(
                         RegionRelationship(
                             source_region_id=reg.region_id,
                             target_region_id=current_question_id,
-                            relationship_type="belongs_to",
-                            confidence=0.90,
-                            evidence=[
-                                DocumentEvidence(
-                                    signal_type="surrounding_regions",
-                                    description=f"Region '{reg.region_id}' belongs to parent question '{current_question_id}'",
-                                    weight=0.4,
-                                    score=0.90,
-                                )
-                            ],
+                            relationship_type="continuation_of",
+                            confidence=0.85,
                         )
                     )
-
-                    reg.parent_region_id = current_question_id
-                    parent_reg = next((r for r in regions if r.region_id == current_question_id), None)
-                    if parent_reg and reg.region_id not in parent_reg.child_region_ids:
-                        parent_reg.child_region_ids.append(reg.region_id)
-
-        for reg in regions:
-            if reg.region_type == "OPTION" and reg.parent_region_id:
-                peer_options = [
-                    r for r in regions if r.region_type == "OPTION" and r.parent_region_id == reg.parent_region_id and r.region_id != reg.region_id
-                ]
-                for peer in peer_options:
+                else:
+                    current_question_id = reg.region_id
+            elif reg.region_type in ("UNKNOWN", "INSTRUCTION") and current_question_id and not re.search(r"^\s*(?:SECTION|PART|GROUP|Table|Figure)\b", reg.text, re.IGNORECASE):
+                # Continuation text block
+                rels.append(
+                    RegionRelationship(
+                        source_region_id=reg.region_id,
+                        target_region_id=current_question_id,
+                        relationship_type="continuation_of",
+                        confidence=0.80,
+                    )
+                )
+            elif reg.region_type in ("OPTION", "SUBQUESTION", "TABLE", "DIAGRAM", "TABLE_CELL"):
+                rel_t = "option_of" if reg.region_type == "OPTION" else ("subquestion_of" if reg.region_type == "SUBQUESTION" else "belongs_to")
+                if current_question_id:
                     rels.append(
                         RegionRelationship(
                             source_region_id=reg.region_id,
-                            target_region_id=peer.region_id,
-                            relationship_type="same_structure_as",
-                            confidence=0.85,
-                            evidence=[
-                                DocumentEvidence(
-                                    signal_type="repeated_layout_pattern",
-                                    description=f"Peer option under common question '{reg.parent_region_id}'",
-                                    weight=0.3,
-                                    score=0.85,
-                                )
-                            ],
+                            target_region_id=current_question_id,
+                            relationship_type=rel_t,
+                            confidence=0.90,
                         )
                     )
+                    reg.parent_region_id = current_question_id
 
         return rels
 
     def _extract_cross_page_relationships(
         self, pages: List[DocumentPage]
     ) -> List[RegionRelationship]:
-        """Extracts relationships across pages (e.g., continuation_of)."""
+        """Extracts relationships across pages (e.g., continuation_of across pages)."""
         cross_rels: List[RegionRelationship] = []
         if len(pages) < 2:
             return cross_rels
@@ -599,29 +586,64 @@ class DocumentUnderstandingService:
             if not curr_page.regions or not next_page.regions:
                 continue
 
-            last_reg = curr_page.regions[-1]
+            # Find last question on page i and first text region on page i+1
+            last_q = next((r for r in reversed(curr_page.regions) if r.region_type == "QUESTION"), curr_page.regions[-1])
             first_reg = next_page.regions[0]
 
-            last_text = last_reg.text.strip()
-            if last_text and not last_text[-1] in (".", "?", "!", ":", ";"):
+            last_text = last_q.text.strip()
+            first_text = first_reg.text.strip()
+
+            # Cross-page continuation check: unpunctuated text or non-numbered start
+            if last_text and (not last_text[-1] in (".", "?", "!", ":", ";") or not re.search(r"^\s*(?:SECTION|PART|Q\d+|\d+\.)", first_text, re.IGNORECASE)):
                 cross_rels.append(
                     RegionRelationship(
                         source_region_id=first_reg.region_id,
-                        target_region_id=last_reg.region_id,
+                        target_region_id=last_q.region_id,
                         relationship_type="continuation_of",
-                        confidence=0.75,
+                        confidence=0.85,
                         evidence=[
                             DocumentEvidence(
                                 signal_type="continuation_relationship",
-                                description=f"Region '{first_reg.region_id}' on page {next_page.page_number} continues region '{last_reg.region_id}' from page {curr_page.page_number}",
+                                description=f"Region '{first_reg.region_id}' on page {next_page.page_number} continues region '{last_q.region_id}' from page {curr_page.page_number}",
                                 weight=0.4,
-                                score=0.75,
+                                score=0.85,
                             )
                         ],
                     )
                 )
 
         return cross_rels
+
+    def build_structure_graph(self, doc_result: DocumentUnderstandingResult) -> DocumentStructureGraph:
+        """Constructs a complete DocumentStructureGraph with GraphNode and GraphEdge instances."""
+        from app.models.schemas import DocumentStructureGraph, GraphNode, GraphEdge
+        nodes: Dict[str, GraphNode] = {}
+        for r in doc_result.regions:
+            nodes[r.region_id] = GraphNode(
+                region_id=r.region_id,
+                role=r.region_type,
+                text=r.text,
+                page=r.page,
+                bbox=r.bbox,
+                confidence=r.confidence,
+            )
+        edges: List[GraphEdge] = []
+        for rel in doc_result.relationships:
+            edges.append(
+                GraphEdge(
+                    source_id=rel.source_region_id,
+                    target_id=rel.target_region_id,
+                    relationship=rel.relationship_type,
+                    confidence=rel.confidence,
+                )
+            )
+        return DocumentStructureGraph(
+            nodes=nodes,
+            edges=edges,
+            document_purpose="QUESTION_PAPER",
+            page_roles={p.page_number: "QUESTION_PAPER" for p in doc_result.pages},
+        )
+
 
     def _attach_embeddings(self, regions: List[DocumentRegion]) -> None:
         """Attaches dense embeddings to regions using Step 8 embedding service."""

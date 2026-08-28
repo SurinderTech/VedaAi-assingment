@@ -116,11 +116,20 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
         super().__init__(api_key=api_key, model_name=model_name)
         self.mock_response = mock_response
 
+    def is_configured(self, force_vlm: bool = False) -> bool:
+        """Returns True if VLM enabled (or forced) and API key configured."""
+        enabled = getattr(settings, "DOCUMENT_VLM_ENABLED", False) or force_vlm or (self.mock_response is not None)
+        gemini_key = getattr(settings, "GEMINI_API_KEY", "")
+        or_key = getattr(settings, "OPENROUTER_API_KEY", "")
+        has_key = bool((self.api_key and len(self.api_key) > 5) or (gemini_key and len(gemini_key) > 5) or (or_key and len(or_key) > 5))
+        return (enabled and has_key) or (self.mock_response is not None)
+
     def verify_structure(
         self,
         result: DocumentUnderstandingResult,
         page_images: Optional[Dict[int, bytes]] = None,
         target_region_ids: Optional[List[str]] = None,
+        force_vlm_verification: bool = False,
         **kwargs: Any,
     ) -> VisualVerificationResponse:
         """
@@ -130,7 +139,7 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
         if self.mock_response is not None:
             return self.mock_response
 
-        if not self.is_configured():
+        if not self.is_configured(force_vlm=force_vlm_verification):
             return VisualVerificationResponse(
                 status="NOT_CONFIGURED",
                 is_available=False,
@@ -183,8 +192,14 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
             if page_images and target_regions:
                 p_num = target_regions[0].page
                 if p_num in page_images:
-                    import base64
-                    page_b64 = base64.b64encode(page_images[p_num]).decode("utf-8")
+                    img_obj = page_images[p_num]
+                    import base64, io
+                    if isinstance(img_obj, bytes):
+                        page_b64 = base64.b64encode(img_obj).decode("utf-8")
+                    elif hasattr(img_obj, "save"):
+                        buf = io.BytesIO()
+                        img_obj.save(buf, format="PNG")
+                        page_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
             import asyncio
             response_text = ""
@@ -254,27 +269,34 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
     def _build_verification_prompt(
         self, target_regions: List[DocumentRegion], result: DocumentUnderstandingResult
     ) -> str:
-        """Builds structured JSON prompt for VLM verification."""
-        region_specs = []
-        for r in target_regions:
-            region_specs.append(
+        """Builds structured visual grounding JSON prompt for VLM verification."""
+        manifest_items = []
+        for r in result.regions:
+            manifest_items.append(
                 {
                     "region_id": r.region_id,
                     "page": r.page,
-                    "bbox": {"x": r.bbox.x, "y": r.bbox.y, "w": r.bbox.width, "h": r.bbox.height},
-                    "current_hypotheses": [h.hypothesized_type for h in r.conflicting_hypotheses],
+                    "bbox": [r.bbox.x, r.bbox.y, r.bbox.width, r.bbox.height],
                     "ocr_text": r.text,
+                    "initial_hypothesis": r.region_type,
                 }
             )
 
-        return f"""You are an expert Document Layout & Visual Structure Verifier.
-Analyze the following document regions and verify their structural classification and relationships.
+        return f"""You are an expert Document Layout & Structural Intelligence Verifier.
+Analyze the provided document page image alongside the supplied REGION MANIFEST.
 
-Target Regions:
-{json.dumps(region_specs, indent=2)}
+CRITICAL INSTRUCTIONS:
+1. Document-Level Semantic Decision: Determine the role and purpose of content using page/document context. Distinguish meaningful assessment content from administrative/irrelevant text based on visual layout, hierarchy, and surrounding context.
+2. NO SINGLE SIGNAL AUTHORITY: No single keyword, numbering pattern, page position, or confidence score independently promotes a region to a question.
+3. VISUAL REGION GROUNDING: You MUST ONLY reference region_ids that exist in the supplied manifest. NEVER invent region IDs.
 
-Return ONLY valid JSON matching this schema:
+REGION MANIFEST:
+{json.dumps(manifest_items, indent=2)}
+
+Return ONLY valid JSON matching this exact schema:
 {{
+  "document_purpose": "QUESTION_PAPER" | "INSTRUCTIONS" | "COVER" | "ANSWER_KEY" | "UNKNOWN",
+  "page_roles": {{"1": "COVER", "2": "QUESTION_PAPER"}},
   "verifications": [
     {{
       "region_id": "string",
@@ -283,6 +305,14 @@ Return ONLY valid JSON matching this schema:
       "reasoning": "string explanation",
       "uncertainty": float (0.0 to 1.0)
     }}
+  ],
+  "relationships": [
+    {{
+      "source_region_id": "string",
+      "target_region_id": "string",
+      "relationship_type": "option_of" | "belongs_to" | "continuation_of" | "subquestion_of" | "section_member" | "associated_visual",
+      "confidence": float (0.0 to 1.0)
+    }}
   ]
 }}
 """
@@ -290,11 +320,12 @@ Return ONLY valid JSON matching this schema:
     def _parse_and_validate_response(
         self, response_text: str, target_regions: List[DocumentRegion]
     ) -> Tuple[List[VLMHypothesis], List[RegionRelationship]]:
-        """Parses and schema-validates VLM JSON output."""
+        """Parses and strictly schema-validates VLM JSON output against known region manifest."""
         hypotheses: List[VLMHypothesis] = []
         relationships: List[RegionRelationship] = []
 
         try:
+            valid_region_map = {r.region_id: r for r in target_regions}
             # Extract JSON block
             json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
             if not json_match:
@@ -302,6 +333,7 @@ Return ONLY valid JSON matching this schema:
 
             data = json.loads(json_match.group(0))
             verifications = data.get("verifications", [])
+            raw_relationships = data.get("relationships", [])
 
             valid_types = {
                 "HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER",
@@ -309,8 +341,19 @@ Return ONLY valid JSON matching this schema:
                 "DIAGRAM", "FIGURE", "ANSWER_SPACE", "UNKNOWN",
             }
 
+            valid_rel_types = {
+                "follows", "contains", "belongs_to", "continuation_of",
+                "same_structure_as", "adjacent_to", "visually_grouped_with",
+                "uncertain_relation", "option_of", "subquestion_of",
+                "section_member", "associated_visual",
+            }
+
             for item in verifications:
                 reg_id = item.get("region_id")
+                if not reg_id or reg_id not in valid_region_map:
+                    # REJECT UNKNOWN REGION IDs
+                    continue
+
                 prop_type = item.get("proposed_type", "UNKNOWN")
                 if prop_type not in valid_types:
                     prop_type = "UNKNOWN"
@@ -329,7 +372,33 @@ Return ONLY valid JSON matching this schema:
                     )
                 )
 
+            for rel in raw_relationships:
+                src_id = rel.get("source_region_id")
+                tgt_id = rel.get("target_region_id")
+                rel_type = rel.get("relationship_type", "belongs_to")
+
+                # STRICT VALIDATION: reject unknown region IDs, self-links, or invalid relationship types
+                if not src_id or not tgt_id:
+                    continue
+                if src_id not in valid_region_map or tgt_id not in valid_region_map:
+                    continue
+                if src_id == tgt_id:
+                    continue
+                if rel_type not in valid_rel_types:
+                    rel_type = "belongs_to"
+
+                conf = float(rel.get("confidence", 0.9))
+                relationships.append(
+                    RegionRelationship(
+                        source_region_id=src_id,
+                        target_region_id=tgt_id,
+                        relationship_type=rel_type,
+                        confidence=conf,
+                    )
+                )
+
         except Exception as e:
             print(f"[DocumentVisionProvider] JSON validation warning: {e}")
 
         return hypotheses, relationships
+

@@ -139,11 +139,28 @@ def validate_document(doc_name: str, blocks: list[Block], page_sizes: dict = Non
     if mcq_valid:
         print("  [PASS] MCQ options are properly attached as children of parent questions and NOT emitted as standalone questions.")
 
-    # 6. Reading-Order Validation
-    print("\n--- 6. READING-ORDER VALIDATION ---")
-    print(f"  Extracted Question Order: {[q.number for q in res.questions]}")
+    # 6. Reading-Order & Section Hierarchy Validation
+    print("\n--- 6. GRAPH-DRIVEN SECTION HIERARCHY TREE VALIDATION ---")
+    if res.sections:
+        for sec in res.sections:
+            print(f"+-- {sec.title} [ID: {sec.section_id}] (Page {sec.page})")
+            sec_questions = [q for q in res.questions if q.section_id == sec.section_id or q.section_title == sec.title]
+            for q in sec_questions:
+                is_cont = " (Multi-Region Continuation)" if len(q.source_region_ids) > 1 else ""
+                print(f"|   +-- Q{q.number} [ID: {q.id}] ({q.question_type}{is_cont}) (Conf: {q.extraction_confidence:.4f})")
+                if q.extracted_options:
+                    for opt in q.extracted_options:
+                        print(f"|   |   +-- Option [{opt.label}]: {opt.text[:35]} [Reg: {opt.source_region_ids}]")
+    else:
+        print("Root (Unsectioned)")
+        for q in res.questions:
+            is_cont = " (Multi-Region Continuation)" if len(q.source_region_ids) > 1 else ""
+            print(f"+-- Q{q.number} [ID: {q.id}] ({q.question_type}{is_cont}) (Conf: {q.extraction_confidence:.4f})")
+            if q.extracted_options:
+                for opt in q.extracted_options:
+                    print(f"    +-- Option [{opt.label}]: {opt.text[:35]} [Reg: {opt.source_region_ids}]")
 
-    # 7. False-Positive Validation
+    # 7. False-Positive Protection Validation
     print("\n--- 7. FALSE-POSITIVE PROTECTION VALIDATION ---")
     non_q_promoted = False
     for q in res.questions:
@@ -154,7 +171,18 @@ def validate_document(doc_name: str, blocks: list[Block], page_sizes: dict = Non
     if not non_q_promoted:
         print("  [PASS] Administrative metadata, instructions, headers, and footers strictly excluded from question set.")
 
+    # 8. Invariants & Consistency Validation
+    print("\n--- 8. DIAGNOSTIC INVARIANTS & CONSISTENCY CHECK ---")
+    if res.invariant_violations:
+        print("  [FAIL] Invariant violations detected:")
+        for viol in res.invariant_violations:
+            print(f"    - {viol}")
+        raise ValueError(f"Diagnostic invariant check failed for {doc_name}: {res.invariant_violations}")
+    else:
+        print("  [PASS] All diagnostic invariants, graph edges, and ID bounds internally consistent.")
+
     return res
+
 
 
 def run_all_adversarial_validations():
@@ -167,7 +195,8 @@ def run_all_adversarial_validations():
     # -------------------------------------------------------------------------
     img1_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "qp.png"))
     if os.path.exists(img1_path):
-        b1, np1, sz1 = process_document(img1_path, ".png")
+        res1 = process_document(img1_path, ".png")
+        b1, np1, sz1 = res1[0], res1[1], res1[2]
         p_sz1 = {1: [float(sz1[0][0]), float(sz1[0][1])]}
         validate_document("qp.png", b1, page_sizes=p_sz1)
 
@@ -176,9 +205,11 @@ def run_all_adversarial_validations():
     # -------------------------------------------------------------------------
     img2_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "qp8.png"))
     if os.path.exists(img2_path):
-        b2, np2, sz2 = process_document(img2_path, ".png")
+        res2 = process_document(img2_path, ".png")
+        b2, np2, sz2 = res2[0], res2[1], res2[2]
         p_sz2 = {1: [float(sz2[0][0]), float(sz2[0][1])]}
         validate_document("qp8.png", b2, page_sizes=p_sz2)
+
 
     # -------------------------------------------------------------------------
     # DOCUMENT 3: Complex Multi-Structure Adversarial Question Paper

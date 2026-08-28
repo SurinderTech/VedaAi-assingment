@@ -68,49 +68,66 @@ def _pdf_has_native_text(path: str) -> bool:
         return False
 
 
-def _extract_native_pdf_blocks(path: str) -> Tuple[List[Block], int]:
-    reader = pypdf.PdfReader(path)
+def _extract_native_pdf_blocks(path: str, images: List[Image.Image]) -> Tuple[List[Block], int]:
+    """
+    Extracts layout-aware native PDF text blocks matching exact pixel dimensions of rendered page images.
+    NO SYNTHETIC FULL-PAGE LINE BBOXES (y = i * line_h).
+    If native text extraction yields 0 text rects for a page, falls back to RapidOCR for that page.
+    """
     blocks: List[Block] = []
-    num_pages = len(reader.pages)
-    for page_idx, page in enumerate(reader.pages):
-        raw_text = page.extract_text() or ""
-        media = page.mediabox
-        page_w = float(media.width)
-        page_h = float(media.height)
-        lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+    num_pages = len(images)
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(path)
+        for page_idx, (page, img) in enumerate(zip(pdf, images)):
+            page_num = page_idx + 1
+            textpage = page.get_textpage()
+            rect_count = textpage.count_rects()
+            pdf_w, pdf_h = page.get_size()
+            img_w, img_h = img.size
+            scale_x = img_w / max(pdf_w, 1.0)
+            scale_y = img_h / max(pdf_h, 1.0)
 
-        # Fix word-fragmented lines from PDFs with single-word line breaks
-        if lines and len(lines) > 20 and sum(len(l) for l in lines) / len(lines) < 15:
-            import re
-            rejoined = []
-            curr = []
-            for l in lines:
-                if curr and (re.match(r"^(?:\d{1,3}[\.\)]|Q\d+|\([a-z0-9]{1,2}\)|[a-z]\))", l, re.IGNORECASE)):
-                    rejoined.append(" ".join(curr))
-                    curr = [l]
-                else:
-                    curr.append(l)
-            if curr:
-                rejoined.append(" ".join(curr))
-            lines = rejoined
+            page_blocks: List[Block] = []
+            if rect_count > 0:
+                for i in range(rect_count):
+                    rect = textpage.get_rect(i)
+                    text = textpage.get_text_bounded(*rect).strip()
+                    if not text:
+                        continue
+                    x_min = rect[0] * scale_x
+                    y_min = (pdf_h - rect[3]) * scale_y
+                    x_max = rect[2] * scale_x
+                    y_max = (pdf_h - rect[1]) * scale_y
 
-        if not lines:
-            continue
-        line_h = page_h / max(len(lines), 1)
-        for i, line in enumerate(lines):
-            blocks.append(
-                Block(
-                    id=str(uuid.uuid4())[:8],
-                    text=line.strip(),
-                    confidence=0.99,
-                    bbox=BBox(x=0.0, y=round(i * line_h, 1), width=round(page_w, 1), height=round(line_h, 1)),
-                    page=page_idx + 1,
-                    type="line",
-                    source="native_pdf",
-                )
-            )
-    return blocks, num_pages
+                    page_blocks.append(
+                        Block(
+                            id=str(uuid.uuid4())[:8],
+                            text=text,
+                            confidence=0.99,
+                            bbox=BBox(
+                                x=round(float(min(x_min, x_max)), 1),
+                                y=round(float(min(y_min, y_max)), 1),
+                                width=round(float(abs(x_max - x_min)), 1),
+                                height=round(float(abs(y_max - y_min)), 1),
+                            ),
+                            page=page_num,
+                            type="line",
+                            source="native_pdf",
+                        )
+                    )
 
+            if page_blocks:
+                blocks.extend(page_blocks)
+            else:
+                blocks.extend(_ocr_image(img, page_num))
+        return blocks, num_pages
+    except Exception as e:
+        print(f"[DocumentProcessor] Native pypdfium2 text extraction failed ({e}), using OCR fallback.")
+        blocks = []
+        for idx, img in enumerate(images):
+            blocks.extend(_ocr_image(img, idx + 1))
+        return blocks, len(images)
 
 
 def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
@@ -121,7 +138,6 @@ def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
 
     img_np = np.array(img.convert("RGB"))
     try:
-        # RapidOCR returns (results, elapse_time) where results is a list of [box, text, confidence]
         res = engine(img_np)
         results = res[0] if isinstance(res, tuple) else res
         blocks: List[Block] = []
@@ -129,7 +145,6 @@ def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
         if results:
             for line in results:
                 if not line or len(line) < 3:
-                    # Check PaddleOCR fallback format [box, (text, conf)]
                     if isinstance(line, (list, tuple)) and len(line) == 2 and isinstance(line[1], (list, tuple)):
                         box, (text, conf) = line[0], line[1]
                     else:
@@ -192,27 +207,30 @@ def _render_pdf_pages(path: str) -> List[Image.Image]:
         raise RuntimeError("PDF rendering failed: Could not render PDF pages to images.")
 
 
-def process_document(path: str, ext: str, force_ocr: bool = False) -> Tuple[List[Block], int, List[Tuple[int, int]]]:
+def process_document(path: str, ext: str, force_ocr: bool = False) -> Tuple[List[Block], int, List[Tuple[int, int]], Dict[int, Image.Image]]:
     """
-    Returns (blocks, num_pages, page_pixel_sizes[(w,h) per page]).
-    If force_ocr=True (e.g. for answer sheets), always renders pages to images and runs OCR
-    so bounding boxes are exact image pixel coordinates.
+    Returns (blocks, num_pages, page_pixel_sizes[(w,h) per page], page_images_dict{page_num: Image}).
     """
+    page_images_dict: Dict[int, Image.Image] = {}
     if ext == ".pdf":
+        images = _render_pdf_pages(path)
+        for idx, img in enumerate(images):
+            page_images_dict[idx + 1] = img
+
         if not force_ocr and _pdf_has_native_text(path):
-            blocks, num_pages = _extract_native_pdf_blocks(path)
-            reader = pypdf.PdfReader(path)
-            sizes = [(int(p.mediabox.width), int(p.mediabox.height)) for p in reader.pages]
-            return blocks, num_pages, sizes
+            blocks, num_pages = _extract_native_pdf_blocks(path, images)
+            sizes = [img.size for img in images]
+            return blocks, num_pages, sizes, page_images_dict
         else:
-            images = _render_pdf_pages(path)
             blocks: List[Block] = []
             sizes = []
             for idx, img in enumerate(images):
                 blocks.extend(_ocr_image(img, idx + 1))
                 sizes.append(img.size)
-            return blocks, len(images), sizes
+            return blocks, len(images), sizes, page_images_dict
     else:
         img = Image.open(path).convert("RGB")
+        page_images_dict[1] = img
         blocks = _ocr_image(img, 1)
-        return blocks, 1, [img.size]
+        return blocks, 1, [img.size], page_images_dict
+

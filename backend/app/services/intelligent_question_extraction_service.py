@@ -305,11 +305,10 @@ class IntelligentQuestionExtractionService:
                 sub_let = sub_m.group(2).lower()
                 q_text = sub_m.group(3).strip() or txt
 
-                q_id = f"Q{main_num}({sub_let})"
+                q_id = f"{document_id}:{reg.region_id}"
                 disp_num = f"{main_num}({sub_let})"
-                parent_id = f"Q{main_num}"
+                parent_id = current_main_parent_id or f"{document_id}:parent_{main_num}"
 
-                # ZERO-HALLUCINATION: Build text strictly from OCR source regions
                 q_obj = Question(
                     id=q_id,
                     number=disp_num,
@@ -337,7 +336,6 @@ class IntelligentQuestionExtractionService:
                     sections_by_id[curr_section_id].question_ids.append(q_id)
 
                 curr_question = q_obj
-                current_main_parent_id = parent_id
                 order_counter += 1
                 continue
 
@@ -345,10 +343,9 @@ class IntelligentQuestionExtractionService:
             if main_m:
                 q_num = main_m.group(1)
                 q_text = main_m.group(2).strip() or txt
-                q_id = f"Q{q_num}"
+                q_id = f"{document_id}:{reg.region_id}"
                 disp_num = q_num
 
-                # Determine question type heuristic
                 q_type = "SHORT_ANSWER"
                 if len(q_text) > 120 or "explain" in q_text.lower() or "discuss" in q_text.lower():
                     q_type = "LONG_ANSWER"
@@ -383,6 +380,7 @@ class IntelligentQuestionExtractionService:
                 current_main_parent_id = q_id
                 order_counter += 1
                 continue
+
 
             # --- Continuation Region (Multi-line or Multi-page continuation) ---
             if curr_question is not None:
@@ -454,9 +452,41 @@ class IntelligentQuestionExtractionService:
                 target_q.options.append(f"{label}. {text_val}")  # Backward compatible display array
                 target_q.question_type = "MCQ"
 
-        # Update final audit stats
+        # Update final audit stats & multi-region / multi-page counts from extracted questions
         audit.accepted_question_count = len(extracted_questions)
         audit.rejection_reasons = rejection_records
+
+        multi_p_count = 0
+        multi_r_count = 0
+        for q in extracted_questions:
+            q_pages = {r.page for r in q.source_regions}
+            if len(q_pages) > 1:
+                multi_p_count += 1
+            if len(q.source_region_ids) > 1:
+                multi_r_count += 1
+
+        audit.multi_page_question_count = multi_p_count
+        audit.multi_region_question_count = multi_r_count
+
+        # Build DocumentStructureGraph
+        struct_graph = self.doc_understanding_service.build_structure_graph(doc_understanding_result)
+
+        # Invariant Verification: Check for internal graph/audit contradictions
+        cross_page_rels = [
+            rel for rel in doc_understanding_result.relationships if rel.relationship_type == "continuation_of"
+        ]
+        has_cross_page_edges = any(
+            next((r.page for r in doc_understanding_result.regions if r.region_id == rel.source_region_id), None) !=
+            next((r.page for r in doc_understanding_result.regions if r.region_id == rel.target_region_id), None)
+            for rel in cross_page_rels
+        )
+
+        if has_cross_page_edges and audit.multi_page_question_count == 0:
+            audit.invariant_violations.append("INVARIANT_VIOLATION: Cross-page continuations exist in graph but multi_page_question_count is 0")
+
+        duplicate_ids = len(extracted_questions) - len({q.id for q in extracted_questions})
+        if duplicate_ids > 0:
+            audit.invariant_violations.append(f"INVARIANT_VIOLATION: {duplicate_ids} duplicate internal question IDs detected")
 
         return DocumentQuestionExtractionResult(
             document_id=document_id,
@@ -464,5 +494,8 @@ class IntelligentQuestionExtractionService:
             sections=classified_sections,
             uncertain_candidates=uncertain_question_candidates,
             audit=audit,
+            structure_graph=struct_graph,
             fallback_used=False,
+            invariant_violations=audit.invariant_violations,
         )
+
