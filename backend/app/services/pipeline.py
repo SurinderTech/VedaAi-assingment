@@ -23,10 +23,19 @@ async def run_pipeline(assessment_id: str) -> None:
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_questions",
             message="Reading question paper", progress=0.15))
-        qp_blocks, qp_pages, _ = await asyncio.to_thread(
+        qp_blocks, qp_pages, qp_sizes = await asyncio.to_thread(
             process_document, files["question_paper"], files["question_paper_ext"], False
         )
-        questions = await extract_questions(qp_blocks)
+        page_sizes_dict = {i + 1: [float(w), float(h)] for i, (w, h) in enumerate(qp_sizes)} if qp_sizes else None
+
+        from app.services.document_understanding_service import DocumentUnderstandingService
+        doc_understanding_res = await asyncio.to_thread(
+            DocumentUnderstandingService().process_document,
+            qp_blocks,
+            f"doc_{assessment_id}",
+            page_sizes_dict,
+        )
+        questions = await extract_questions(qp_blocks, doc_understanding_result=doc_understanding_res, page_sizes=page_sizes_dict)
 
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_answers",

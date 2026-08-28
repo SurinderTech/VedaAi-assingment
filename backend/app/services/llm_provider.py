@@ -97,7 +97,7 @@ async def _call_groq(prompt: str) -> str:
         return r.json()["choices"][0]["message"]["content"]
 
 
-async def _call_openrouter(prompt: str) -> str:
+async def _call_openrouter(prompt: str, image_b64: Optional[str] = None, mime_type: str = "image/png") -> str:
     key = settings.OPENROUTER_API_KEY.strip()
     if not key or len(key) < 10:
         raise LLMError("OpenRouter API key missing")
@@ -108,6 +108,13 @@ async def _call_openrouter(prompt: str) -> str:
         "HTTP-Referer": "https://vedaai.app",
         "X-Title": "VedaAI Examiner Assistant",
     }
+
+    content_payload: Any = prompt
+    if image_b64:
+        content_payload = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+        ]
 
     models_to_try = []
 
@@ -138,7 +145,7 @@ async def _call_openrouter(prompt: str) -> str:
         try:
             body = {
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": content_payload}],
                 "max_tokens": 1500,
             }
             async with httpx.AsyncClient(timeout=20.0) as client:

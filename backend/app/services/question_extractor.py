@@ -454,41 +454,64 @@ async def extract_questions(
     blocks: List[Block],
     high_threshold: Optional[float] = None,
     low_threshold: Optional[float] = None,
+    doc_understanding_result: Optional[Any] = None,
+    page_sizes: Optional[Dict[int, List[float]]] = None,
 ) -> List[Question]:
     """
-    Main Entry Point: Layered Question Paper Extraction Pipeline.
+    Main Entry Point: Question Paper Extraction Pipeline.
     
-    Configurable Thresholds:
-    - high_threshold: Default from settings.QP_HIGH_CONFIDENCE_THRESHOLD (0.85). Candidates >= high_threshold accepted directly.
-    - low_threshold: Default from settings.QP_LOW_CONFIDENCE_THRESHOLD (0.20). Candidates <= low_threshold discarded directly.
-    - Ambiguous candidates between low_threshold and high_threshold trigger targeted LLM verification.
+    Checks settings.INTELLIGENT_EXTRACTION_ENABLED (Step 11C feature flag).
+    When enabled, delegates to IntelligentQuestionExtractionService.
+    If an exception occurs or an empty question set is returned, gracefully falls back
+    to the legacy deterministic extraction path without failing the pipeline.
     """
     if not blocks:
         return []
 
+    # Check Step 11C Feature Flag
+    if getattr(settings, "INTELLIGENT_EXTRACTION_ENABLED", True):
+        try:
+            from app.services.intelligent_question_extraction_service import IntelligentQuestionExtractionService
+            service = IntelligentQuestionExtractionService()
+            extraction_res = service.extract_validated_questions(
+                blocks=blocks,
+                document_id="qp_doc",
+                doc_understanding_result=doc_understanding_result,
+                page_sizes=page_sizes,
+            )
+            if extraction_res.questions and len(extraction_res.questions) > 0:
+                return extraction_res.questions
+            print("[QuestionExtractor] Step 11C returned zero questions, invoking safe legacy fallback.")
+        except Exception as e:
+            print(f"[QuestionExtractor] Step 11C exception ({e}), invoking safe legacy fallback.")
+
+    return await _legacy_extract_questions(blocks, high_threshold, low_threshold)
+
+
+async def _legacy_extract_questions(
+    blocks: List[Block],
+    high_threshold: Optional[float] = None,
+    low_threshold: Optional[float] = None,
+) -> List[Question]:
+    """Legacy Extraction Pass."""
     high_thresh = high_threshold if high_threshold is not None else settings.QP_HIGH_CONFIDENCE_THRESHOLD
     low_thresh = low_threshold if low_threshold is not None else settings.QP_LOW_CONFIDENCE_THRESHOLD
 
-    # 1. Structural Local Pass with Multi-Signal Scoring
     candidates = _extract_candidates_from_blocks(blocks)
-
     questions: List[Question] = []
     seen_ids: Set[str] = set()
     order_idx = 0
 
-    # Identify main parent numbers that have subquestions (e.g., Q2 has Q2(a), Q2(b))
     parent_ids_with_subparts: Set[str] = set()
     for cand in candidates:
         if "(" in cand.q_num and cand.q_num.endswith(")"):
             main_parent_id = cand.q_num.split("(")[0]
             parent_ids_with_subparts.add(main_parent_id)
 
-    # 2. Configurable Threshold Pass & Targeted LLM Fallback
     for cand in candidates:
         if cand.q_num in seen_ids:
             continue
 
-        # Suppress duplicate main group parent if subparts exist and parent text is just a group header
         if cand.q_num in parent_ids_with_subparts:
             has_q_intent = bool(SUPPORTING_INTENT_VERBS.search(cand.text)) or cand.text.endswith("?")
             if not has_q_intent:
@@ -497,13 +520,10 @@ async def extract_questions(
         final_text = cand.text
         is_valid = True
 
-        # Configurable High Confidence Threshold: Accept directly without LLM
         if cand.confidence >= high_thresh:
             is_valid = True
-        # Configurable Low Confidence Threshold: Ignore directly without LLM
         elif cand.confidence <= low_thresh:
             is_valid = False
-        # Ambiguous Zone: Targeted LLM verification
         else:
             is_valid, final_text = await _verify_ambiguous_candidate_with_llm(cand)
 

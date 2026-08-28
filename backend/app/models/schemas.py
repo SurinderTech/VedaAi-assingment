@@ -48,15 +48,46 @@ class Block(BaseModel):
     role: BlockRole = "unknown"
 
 
+QuestionType = Literal[
+    "SHORT_ANSWER",
+    "LONG_ANSWER",
+    "MCQ",
+    "SUBQUESTION",
+    "NUMERICAL",
+    "UNKNOWN",
+]
+
+
+class ExtractedOption(BaseModel):
+    option_id: str
+    question_id: str
+    label: str
+    text: str
+    source_region_ids: List[str] = []
+    source_regions: List[Region] = []
+    extraction_confidence: float = 1.0
+    verification_state: str = "UNVERIFIED"
+
+
 class Question(BaseModel):
     id: str
     number: str
     text: str
     page: int
     bbox: Optional[BBox] = None
-    order_index: int
+    order_index: int = 0
     section: Optional[str] = None
     options: List[str] = []
+    source_region_ids: List[str] = []
+    source_regions: List[Region] = []
+    section_id: Optional[str] = None
+    section_title: Optional[str] = None
+    parent_question_id: Optional[str] = None
+    question_type: QuestionType = "UNKNOWN"
+    extracted_options: List[ExtractedOption] = []
+    extraction_confidence: float = 1.0
+    verification_state: str = "UNVERIFIED"
+    evidence_refs: List[str] = []
 
 
 PageClassification = Literal[
@@ -570,5 +601,241 @@ StudentAssessmentReport.model_rebuild()
 AssessmentInsight.model_rebuild()
 QuestionInsight.model_rebuild()
 AssessmentInsights.model_rebuild()
+
+
+# ============================================================
+# STEP 11A — Universal Document Understanding Foundation Schemas
+# ============================================================
+
+DocumentRegionType = Literal[
+    "HEADER",
+    "FOOTER",
+    "METADATA",
+    "INSTRUCTION",
+    "SECTION_HEADER",
+    "QUESTION",
+    "SUBQUESTION",
+    "OPTION",
+    "TABLE",
+    "TABLE_CELL",
+    "DIAGRAM",
+    "FIGURE",
+    "ANSWER_SPACE",
+    "UNKNOWN",
+]
+
+RelationshipType = Literal[
+    "follows",
+    "contains",
+    "belongs_to",
+    "continuation_of",
+    "same_structure_as",
+    "adjacent_to",
+    "visually_grouped_with",
+    "uncertain_relation",
+]
+
+SignalType = Literal[
+    "numbering_pattern",
+    "question_interrogative",
+    "spatial_position",
+    "surrounding_regions",
+    "semantic_signal",
+    "indentation",
+    "vertical_horizontal_proximity",
+    "repeated_layout_pattern",
+    "text_density",
+    "punctuation",
+    "option_formatting",
+    "section_formatting",
+    "heading_formatting",
+    "table_geometry",
+    "page_position",
+    "continuation_relationship",
+]
+
+
+class DocumentEvidence(BaseModel):
+    signal_type: str
+    description: str
+    weight: float = 1.0
+    score: float = 1.0
+    metadata: Dict[str, Any] = {}
+
+
+class StructureHypothesis(BaseModel):
+    region_id: str
+    hypothesized_type: DocumentRegionType
+    confidence: float
+    source: str = "parser"
+    evidence: List[DocumentEvidence] = []
+
+
+class RegionRelationship(BaseModel):
+    source_region_id: str
+    target_region_id: str
+    relationship_type: RelationshipType
+    confidence: float = 1.0
+    evidence: List[DocumentEvidence] = []
+
+
+VerificationState = Literal["VERIFIED", "CONFLICTED", "UNCERTAIN", "UNVERIFIED"]
+
+
+class CostAccounting(BaseModel):
+    pages_considered: int = 0
+    pages_sent: int = 0
+    regions_considered: int = 0
+    regions_sent: int = 0
+    vlm_calls: int = 0
+    successful_calls: int = 0
+    failed_calls: int = 0
+    skipped_high_confidence_count: int = 0
+    cache_hits: int = 0
+
+
+class RegionVerificationSpec(BaseModel):
+    region_id: str
+    page: int
+    bbox: BBox
+    current_type: DocumentRegionType = "UNKNOWN"
+    neighbors: List[str] = []
+    ocr_text: str = ""
+    reason_for_verification: str = "ambiguity"
+
+
+class VLMHypothesis(BaseModel):
+    region_id: str
+    proposed_type: DocumentRegionType = "UNKNOWN"
+    confidence: float = 0.5
+    reasoning: str = ""
+    relationships: List[Dict[str, Any]] = []
+    uncertainty: float = 0.0
+    conflict_indicators: List[str] = []
+
+
+class VisualVerificationResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    status: str = "NOT_CONFIGURED"
+    is_available: bool = False
+    model_name: str = "vlm_default"
+    vlm_hypotheses: List[VLMHypothesis] = []
+    verified_relationships: List[RegionRelationship] = []
+    cost_accounting: CostAccounting = CostAccounting()
+    error_message: Optional[str] = None
+
+
+class DocumentRegion(BaseModel):
+    region_id: str
+    page: int
+    text: str
+    bbox: BBox
+    region_type: DocumentRegionType = "UNKNOWN"
+    source: str = "ocr"
+    confidence: float = 1.0
+    evidence: List[DocumentEvidence] = []
+    relationships: List[RegionRelationship] = []
+    uncertainty: float = 0.0
+    classification_conflict: bool = False
+    conflicting_hypotheses: List[StructureHypothesis] = []
+    embedding: Optional[List[float]] = None
+    parent_region_id: Optional[str] = None
+    child_region_ids: List[str] = []
+    verification_state: VerificationState = "UNVERIFIED"
+    vlm_hypothesis: Optional[StructureHypothesis] = None
+    metadata: Dict[str, Any] = {}
+
+
+class DocumentPage(BaseModel):
+    page_number: int
+    width: float = 0.0
+    height: float = 0.0
+    regions: List[DocumentRegion] = []
+    reading_order: List[str] = []
+
+
+class DocumentObservation(BaseModel):
+    doc_id: str
+    pages: List[DocumentPage] = []
+    raw_blocks: List[Block] = []
+
+
+class DocumentUnderstandingResult(BaseModel):
+    document_id: str
+    pages: List[DocumentPage] = []
+    regions: List[DocumentRegion] = []
+    relationships: List[RegionRelationship] = []
+    conflicts: List[Dict[str, Any]] = []
+    vlm_status: str = "NOT_CONFIGURED"
+    verification_summary: Dict[str, Any] = {}
+    cost_accounting: Optional[CostAccounting] = None
+    metadata: Dict[str, Any] = {}
+
+
+# ============================================================
+# STEP 11C — Intelligent Question Extraction Container & Audit Schemas
+# ============================================================
+
+class ExtractedSection(BaseModel):
+    section_id: str
+    title: str
+    page: int
+    bbox: Optional[BBox] = None
+    source_region_ids: List[str] = []
+    question_ids: List[str] = []
+
+
+class RejectionRecord(BaseModel):
+    region_id: str
+    ocr_text: str
+    classification: str
+    confidence: float
+    reason: str
+    evidence_refs: List[str] = []
+
+
+class ExtractionAudit(BaseModel):
+    candidate_count: int = 0
+    accepted_question_count: int = 0
+    rejected_count: int = 0
+    uncertain_count: int = 0
+    option_count: int = 0
+    section_count: int = 0
+    multi_region_question_count: int = 0
+    multi_page_question_count: int = 0
+    conflicts: List[str] = []
+    rejection_reasons: List[RejectionRecord] = []
+
+
+ExtractedQuestion = Question
+
+
+class DocumentQuestionExtractionResult(BaseModel):
+    document_id: str
+    questions: List[ExtractedQuestion] = []
+    sections: List[ExtractedSection] = []
+    uncertain_candidates: List[ExtractedQuestion] = []
+    audit: ExtractionAudit = ExtractionAudit()
+    fallback_used: bool = False
+
+
+DocumentEvidence.model_rebuild()
+StructureHypothesis.model_rebuild()
+RegionRelationship.model_rebuild()
+DocumentRegion.model_rebuild()
+DocumentPage.model_rebuild()
+DocumentObservation.model_rebuild()
+DocumentUnderstandingResult.model_rebuild()
+CostAccounting.model_rebuild()
+RegionVerificationSpec.model_rebuild()
+VLMHypothesis.model_rebuild()
+VisualVerificationResponse.model_rebuild()
+ExtractedOption.model_rebuild()
+ExtractedSection.model_rebuild()
+RejectionRecord.model_rebuild()
+ExtractionAudit.model_rebuild()
+DocumentQuestionExtractionResult.model_rebuild()
+
+
 
 

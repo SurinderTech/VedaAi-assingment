@@ -59,6 +59,16 @@ class Settings:
     EMBEDDING_CACHE_ENABLED: bool = os.getenv("EMBEDDING_CACHE_ENABLED", "true").lower() == "true"
     SEMANTIC_AMBIGUITY_MARGIN: float = float(os.getenv("SEMANTIC_AMBIGUITY_MARGIN", "0.05"))
 
+    # Step 11B Visual Document Verification Settings
+    DOCUMENT_VLM_ENABLED: bool = os.getenv("DOCUMENT_VLM_ENABLED", "false").lower() == "true"
+    DOCUMENT_VLM_PROVIDER: str = os.getenv("DOCUMENT_VLM_PROVIDER", "gemini")
+    DOCUMENT_VLM_MODEL: str = os.getenv("DOCUMENT_VLM_MODEL", "gemini-2.5-flash")
+    DOCUMENT_VLM_TIMEOUT: float = float(os.getenv("DOCUMENT_VLM_TIMEOUT", "30.0"))
+    DOCUMENT_VLM_MAX_PAGES_PER_REQUEST: int = int(os.getenv("DOCUMENT_VLM_MAX_PAGES_PER_REQUEST", "5"))
+    DOCUMENT_VLM_MAX_REGIONS_PER_REQUEST: int = int(os.getenv("DOCUMENT_VLM_MAX_REGIONS_PER_REQUEST", "20"))
+    # Step 11C Intelligent Extraction Settings
+    INTELLIGENT_EXTRACTION_ENABLED: bool = os.getenv("INTELLIGENT_EXTRACTION_ENABLED", "true").lower() == "true"
 
 
 settings = Settings()
+
