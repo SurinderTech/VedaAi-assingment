@@ -58,6 +58,9 @@ async def run_pipeline(assessment_id: str) -> None:
             for q, g in zip(questions, gradings)
         ]
 
+        from app.services.assessment_result_service import build_structured_assessment_result
+        structured_res = build_structured_assessment_result(assessment_id, question_results, unmatched)
+
         result = AssessmentResult(
             assessment_id=assessment_id,
             state="completed",
@@ -67,6 +70,8 @@ async def run_pipeline(assessment_id: str) -> None:
             answer_sheet_pages=as_pages,
             answer_sheet_page_sizes=[[int(w), int(h)] for (w, h) in as_sizes],
             answer_sheet_is_pdf=(files["answer_sheet_ext"] == ".pdf"),
+            structured_result=structured_res,
+            audit_trail=structured_res.audit_trail,
         )
         store.save_result(result)
         store.set_status(assessment_id, AssessmentStatus(

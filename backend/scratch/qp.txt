@@ -1,0 +1,2 @@
+Q1. What is ReLU activation function?
+Q2. Explain dropout regularization.

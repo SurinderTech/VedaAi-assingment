@@ -5,16 +5,20 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Dict, Optional, List
+import hashlib
+from typing import Dict, Optional, List, Tuple
 from app.models.schemas import AssessmentResult, AssessmentStatus
 
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "vedaai_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 STORE_FILE = os.path.join(UPLOAD_DIR, "store_metadata.json")
+SNAPSHOT_DIR = os.path.join(UPLOAD_DIR, "snapshots")
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 _assessments: Dict[str, AssessmentResult] = {}
 _statuses: Dict[str, AssessmentStatus] = {}
 _files: Dict[str, dict] = {}
+_snapshots: Dict[str, Dict[int, dict]] = {}
 
 
 def _save_to_disk() -> None:
@@ -23,6 +27,7 @@ def _save_to_disk() -> None:
             "files": _files,
             "statuses": {k: v.model_dump() for k, v in _statuses.items()},
             "assessments": {k: v.model_dump() for k, v in _assessments.items()},
+            "snapshots": _snapshots,
         }
         with open(STORE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, default=str)
@@ -41,11 +46,77 @@ def _load_from_disk() -> None:
                 _statuses[k] = AssessmentStatus(**v)
             for k, v in data.get("assessments", {}).items():
                 _assessments[k] = AssessmentResult(**v)
+            for aid, rev_dict in data.get("snapshots", {}).items():
+                _snapshots[aid] = {int(k): v for k, v in rev_dict.items()}
     except Exception as e:
         print(f"[Store] Load from disk error: {e}")
 
 
 _load_from_disk()
+
+
+def compute_snapshot_hash(snapshot_data: dict) -> str:
+    """Computes deterministic SHA-256 hash of snapshot content for tamper detection."""
+    payload = {k: v for k, v in snapshot_data.items() if k not in ("snapshot_hash", "integrity_verified")}
+    serialized = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def verify_snapshot_integrity(snapshot_data: dict) -> Tuple[bool, str]:
+    """Verifies that snapshot data hash matches its stored content hash."""
+    stored_hash = snapshot_data.get("snapshot_hash")
+    if not stored_hash:
+        return False, "No snapshot_hash present"
+    computed = compute_snapshot_hash(snapshot_data)
+    if computed == stored_hash:
+        return True, "Integrity verified: hash matches content"
+    return False, f"Integrity check failed: computed {computed[:12]}... != stored {stored_hash[:12]}..."
+
+
+def save_snapshot(assessment_id: str, revision_index: int, snapshot_data: dict) -> Tuple[str, str]:
+    """
+    Saves immutable snapshot file for exact assessment revision index.
+    Returns (snapshot_file_path, snapshot_hash).
+    """
+    snapshot_hash = compute_snapshot_hash(snapshot_data)
+    snapshot_data["snapshot_hash"] = snapshot_hash
+    
+    if assessment_id not in _snapshots:
+        _snapshots[assessment_id] = {}
+        
+    _snapshots[assessment_id][revision_index] = snapshot_data
+    
+    file_name = f"{assessment_id}_rev_{revision_index}.json"
+    file_path = os.path.join(SNAPSHOT_DIR, file_name)
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot_data, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[Store] Save snapshot error: {e}")
+        
+    _save_to_disk()
+    return file_path, snapshot_hash
+
+
+def get_snapshot(assessment_id: str, revision_index: int) -> Optional[dict]:
+    """Retrieves immutable revision snapshot for assessment."""
+    if assessment_id in _snapshots and revision_index in _snapshots[assessment_id]:
+        return _snapshots[assessment_id][revision_index]
+        
+    file_name = f"{assessment_id}_rev_{revision_index}.json"
+    file_path = os.path.join(SNAPSHOT_DIR, file_name)
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if assessment_id not in _snapshots:
+                    _snapshots[assessment_id] = {}
+                _snapshots[assessment_id][revision_index] = data
+                return data
+        except Exception as e:
+            print(f"[Store] Load snapshot file error: {e}")
+            
+    return None
 
 
 def save_files(assessment_id: str, question_paper: str, answer_sheet: str,

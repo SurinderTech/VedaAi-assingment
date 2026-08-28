@@ -1,0 +1,2 @@
+Q1. ReLU stands for Rectified Linear Unit, f(x)=max(0,x).
+Q2. Dropout randomly deactivates neurons during training.

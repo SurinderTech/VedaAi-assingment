@@ -28,5 +28,37 @@ class Settings:
     QP_HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv("QP_HIGH_CONFIDENCE_THRESHOLD", "0.85"))
     QP_LOW_CONFIDENCE_THRESHOLD: float = float(os.getenv("QP_LOW_CONFIDENCE_THRESHOLD", "0.20"))
 
+    # Step 3 Intelligent Mapping Engine Weights & Thresholds (Initial Defaults)
+    MAPPING_ANCHOR_WEIGHT: float = float(os.getenv("MAPPING_ANCHOR_WEIGHT", "0.40"))
+    MAPPING_SEMANTIC_WEIGHT: float = float(os.getenv("MAPPING_SEMANTIC_WEIGHT", "0.30"))
+    MAPPING_STRUCTURAL_WEIGHT: float = float(os.getenv("MAPPING_STRUCTURAL_WEIGHT", "0.15"))
+    MAPPING_SPATIAL_WEIGHT: float = float(os.getenv("MAPPING_SPATIAL_WEIGHT", "0.10"))
+    MAPPING_ORDER_WEIGHT: float = float(os.getenv("MAPPING_ORDER_WEIGHT", "0.05"))
+    MAPPING_HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv("MAPPING_HIGH_CONFIDENCE_THRESHOLD", "0.70"))
+    MAPPING_REVIEW_THRESHOLD: float = float(os.getenv("MAPPING_REVIEW_THRESHOLD", "0.35"))
+    MAPPING_AMBIGUITY_DELTA: float = float(os.getenv("MAPPING_AMBIGUITY_DELTA", "0.10"))
+    # Step 4 Answer Evaluation & Grading Thresholds
+    GRADING_HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv("GRADING_HIGH_CONFIDENCE_THRESHOLD", "0.85"))
+    GRADING_REVIEW_THRESHOLD: float = float(os.getenv("GRADING_REVIEW_THRESHOLD", "0.55"))
+    GRADING_CONTRADICTION_THRESHOLD: float = float(os.getenv("GRADING_CONTRADICTION_THRESHOLD", "0.70"))
+
+    # Configurable LLM Routing & Evaluation Settings
+    GRADING_LLM_ENABLED: bool = os.getenv("GRADING_LLM_ENABLED", "true").lower() == "true"
+    GRADING_LLM_AMBIGUITY_THRESHOLD: float = float(os.getenv("GRADING_LLM_AMBIGUITY_THRESHOLD", "0.65"))
+    GRADING_LLM_CONFIDENCE_THRESHOLD: float = float(os.getenv("GRADING_LLM_CONFIDENCE_THRESHOLD", "0.85"))
+    GRADING_LLM_MAX_TOKENS: int = int(os.getenv("GRADING_LLM_MAX_TOKENS", "500"))
+    GRADING_LLM_TIMEOUT_SECONDS: float = float(os.getenv("GRADING_LLM_TIMEOUT_SECONDS", "15.0"))
+    GRADING_LLM_MAX_CALLS_PER_DOCUMENT: int = int(os.getenv("GRADING_LLM_MAX_CALLS_PER_DOCUMENT", "20"))
+
+    # Step 8 Embedding & Semantic Intelligence Settings
+    EMBEDDING_ENGINE_ENABLED: bool = os.getenv("EMBEDDING_ENGINE_ENABLED", "true").lower() == "true"
+    EMBEDDING_MODEL_NAME: str = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+    EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+    EMBEDDING_NORMALIZE: bool = os.getenv("EMBEDDING_NORMALIZE", "true").lower() == "true"
+    EMBEDDING_TOP_K: int = int(os.getenv("EMBEDDING_TOP_K", "5"))
+    EMBEDDING_CACHE_ENABLED: bool = os.getenv("EMBEDDING_CACHE_ENABLED", "true").lower() == "true"
+    SEMANTIC_AMBIGUITY_MARGIN: float = float(os.getenv("SEMANTIC_AMBIGUITY_MARGIN", "0.05"))
+
+
 
 settings = Settings()

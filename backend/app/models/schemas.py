@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Set, Any
 from pydantic import BaseModel
 
 
@@ -15,6 +15,26 @@ class Region(BaseModel):
     bbox: BBox
 
 
+BlockModality = Literal[
+    "handwritten",
+    "printed",
+    "mixed",
+    "unknown",
+]
+
+BlockRole = Literal[
+    "question_reference",
+    "student_question_anchor",
+    "student_answer",
+    "page_metadata",
+    "instruction",
+    "header_footer",
+    "noise",
+    "visual_element",
+    "unknown",
+]
+
+
 class Block(BaseModel):
     """Normalized low-level unit produced by OCR / native PDF text extraction."""
     id: str
@@ -24,6 +44,8 @@ class Block(BaseModel):
     page: int
     type: Literal["text", "line"] = "text"
     source: Literal["native_pdf", "ocr"] = "ocr"
+    modality: BlockModality = "unknown"
+    role: BlockRole = "unknown"
 
 
 class Question(BaseModel):
@@ -37,6 +59,60 @@ class Question(BaseModel):
     options: List[str] = []
 
 
+PageClassification = Literal[
+    "METADATA",
+    "ANSWER_CONTENT",
+    "CONTINUATION",
+    "BLANK",
+    "MIXED",
+    "UNKNOWN",
+]
+
+
+class QuestionAnchor(BaseModel):
+    anchor: str
+    original_text: str
+    role: Literal["student_question_anchor", "question_reference"] = "student_question_anchor"
+    page: int
+    bbox: BBox
+    confidence: float = 0.9
+    reading_order: int = 0
+
+
+class PageAnalysis(BaseModel):
+    page: int
+    classification: PageClassification
+    confidence: float = 0.9
+    metadata_likelihood: float = 0.0
+    ocr_density: float = 0.0
+    anchors: List[QuestionAnchor] = []
+
+
+class AnswerRegion(BaseModel):
+    answer_id: str
+    question_anchor: Optional[str] = None
+    pages: List[int]
+    regions: List[Region]
+    text: str
+    blocks: List[Block] = []
+    reading_order: int = 0
+    is_continuation: bool = False
+    confidence: float = 0.9
+
+
+class StructuredAnswerSheet(BaseModel):
+    num_pages: int
+    page_sizes: List[List[int]] = []
+    page_analyses: Dict[int, PageAnalysis] = {}
+    question_anchors: List[QuestionAnchor] = []
+    question_references: List[QuestionAnchor] = []
+    answer_regions: List[AnswerRegion] = []
+    unanchored_regions: List[AnswerRegion] = []
+    metadata_blocks: List[Block] = []
+    printed_question_blocks: List[Block] = []
+    noise_blocks: List[Block] = []
+
+
 class AnswerCandidate(BaseModel):
     answer_id: str
     question_number: Optional[str] = None
@@ -45,7 +121,8 @@ class AnswerCandidate(BaseModel):
     order_index: int
 
 
-AnswerStatus = Literal["matched", "unanswered", "unmatched", "review_required"]
+
+AnswerStatus = Literal["matched", "unanswered", "unmatched", "review_required", "graded"]
 
 
 class MappedAnswer(BaseModel):
@@ -55,6 +132,161 @@ class MappedAnswer(BaseModel):
     confidence: float = 0.0
     method: Optional[str] = None
     regions: List[Region] = []
+    anchor_score: float = 0.0
+    semantic_score: float = 0.0
+    structural_score: float = 0.0
+    spatial_score: float = 0.0
+    order_score: float = 0.0
+    w_anchor: float = 0.40
+    w_semantic: float = 0.30
+    w_structural: float = 0.15
+    w_spatial: float = 0.10
+    w_order: float = 0.05
+    raw_final_score: float = 0.0
+    conflict_penalty: float = 1.00
+    final_score: float = 0.0
+    best_candidate_score: float = 0.0
+    second_best_candidate_score: float = 0.0
+    score_margin: float = 0.0
+    conflict_detected: bool = False
+    needs_review: bool = False
+    evidence_summary: Optional[str] = None
+    raw_region: Optional[AnswerRegion] = None
+
+
+QuestionType = Literal[
+    "definition",
+    "short_conceptual",
+    "long_conceptual",
+    "comparison",
+    "explanation",
+    "process",
+    "numerical",
+    "mathematical_derivation",
+    "mcq",
+    "one_word",
+    "true_false",
+    "fill_blank",
+    "code",
+    "algorithm",
+    "diagram",
+    "diagram_explanation",
+    "table",
+    "mixed",
+    "unknown",
+]
+
+AnswerContentType = Literal[
+    "text",
+    "short_text",
+    "long_text",
+    "number",
+    "formula",
+    "mathematical_work",
+    "code",
+    "diagram",
+    "table",
+    "mcq_selection",
+    "mixed",
+    "visual_only",
+    "unknown",
+]
+
+CriterionStatus = Literal["present", "partially_present", "missing", "contradicted", "uncertain"]
+
+
+class QuestionRequirementSpec(BaseModel):
+    expected_answer_type: QuestionType = "unknown"
+    max_marks: Optional[float] = None
+    marks_confidence: str = "high"
+    required_concepts: List[str] = []
+    required_operations: List[str] = []
+    has_diagram_requirement: bool = False
+    has_numerical_requirement: bool = False
+    has_code_requirement: bool = False
+    evaluation_criteria_descriptions: List[str] = []
+
+
+class RubricCriterion(BaseModel):
+    id: str
+    description: str
+    max_marks: float
+    weight: float = 1.0
+
+
+class Rubric(BaseModel):
+    answer_type: QuestionType = "unknown"
+    total_max_marks: float = 2.0
+    criteria: List[RubricCriterion] = []
+
+
+EvidenceProvenance = Literal[
+    "local",
+    "llm",
+    "fused_agreement",
+    "fused_resolution",
+    "conflict_flagged",
+]
+
+
+class CriterionEvidence(BaseModel):
+    criterion_id: str
+    description: str
+    status: CriterionStatus = "uncertain"
+    evidence_text: Optional[str] = None
+    confidence: float = 0.0
+    awarded_marks: float = 0.0
+    max_marks: float = 0.0
+    notes: Optional[str] = None
+    provenance: Optional[EvidenceProvenance] = "local"
+
+
+RoutingDecision = Literal[
+    "LOCAL_CLEAR",
+    "LOCAL_CLEAR_WITH_HIGH_CONFIDENCE",
+    "LLM_REQUIRED",
+    "LLM_RECOMMENDED",
+    "REVIEW_REQUIRED",
+]
+
+
+class GradingResult(BaseModel):
+    question_id: str
+    answer_id: Optional[str] = None
+    max_marks: float = 2.0
+    awarded_marks: float = 0.0
+    confidence: float = 0.0
+    status: AnswerStatus = "graded"
+    needs_review: bool = False
+    answer_type: QuestionType = "unknown"
+    content_type: AnswerContentType = "unknown"
+    criteria: List[CriterionEvidence] = []
+    correct_evidence: List[str] = []
+    missing_evidence: List[str] = []
+    incorrect_evidence: List[str] = []
+    partial_evidence: List[str] = []
+    uncertain_evidence: List[str] = []
+    semantic_score: float = 0.0
+    factual_score: float = 0.0
+    completeness_score: float = 0.0
+    mathematical_score: float = 0.0
+    visual_score: float = 0.0
+    code_score: float = 0.0
+    evaluation_method: str = "local"
+    routing_decision: Optional[RoutingDecision] = None
+    escalation_reason: Optional[str] = None
+    llm_used: bool = False
+    llm_provider: Optional[str] = None
+    total_questions: int = 1
+    local_evaluations: int = 1
+    llm_evaluations: int = 0
+    llm_calls_avoided: int = 1
+    estimated_input_tokens: int = 0
+    estimated_output_tokens: int = 0
+    estimated_tokens_saved: int = 0
+    token_provenance: str = "estimated"
+    llm_failure_count: int = 0
+    feedback: str = ""
 
 
 class Grading(BaseModel):
@@ -63,6 +295,7 @@ class Grading(BaseModel):
     strengths: List[str] = []
     missing_points: List[str] = []
     feedback: Optional[str] = None
+    result_details: Optional[GradingResult] = None
 
 
 class QuestionResult(BaseModel):
@@ -102,6 +335,112 @@ class AssessmentStatus(BaseModel):
     progress: float = 0.0
 
 
+ReviewStatus = Literal[
+    "NOT_REQUIRED",
+    "PENDING_REVIEW",
+    "REVIEWED",
+    "TEACHER_OVERRIDE",
+]
+
+
+class CriterionResult(BaseModel):
+    criterion_id: str
+    description: str
+    max_marks: float
+    awarded_marks: float
+    evidence_status: CriterionStatus = "uncertain"
+    evidence_text: Optional[str] = None
+    confidence: float = 0.0
+    provenance: Optional[EvidenceProvenance] = "local"
+    needs_review: bool = False
+    source_regions: List[Dict[str, Any]] = []
+
+
+class TeacherReview(BaseModel):
+    review_id: str
+    question_id: str
+    original_ai_marks: float
+    teacher_marks: float
+    reason: str
+    comment: Optional[str] = None
+    reviewer: Optional[str] = "Teacher"
+    timestamp: str = ""
+    changed: bool = True
+
+
+class AuditEvent(BaseModel):
+    event_id: str
+    timestamp: str = ""
+    assessment_id: str
+    question_id: Optional[str] = None
+    event_type: str
+    previous_value: Optional[Any] = None
+    new_value: Optional[Any] = None
+    source: str = "system"
+    reason: Optional[str] = None
+
+
+class AssessmentRevision(BaseModel):
+    revision_id: str
+    revision_index: int
+    timestamp: str = ""
+    final_awarded_marks: float
+    percentage: float
+    finalized_by: str = "Teacher"
+    reason: str = "Finalization"
+    snapshot_hash: Optional[str] = None
+    snapshot_file: Optional[str] = None
+
+
+class StructuredQuestionResult(BaseModel):
+    question_id: str
+    question_number: str
+    question_text: str
+    max_marks: float
+    answer_id: Optional[str] = None
+    answer_text: str = ""
+    answer_pages: List[int] = []
+    answer_regions: List[Dict[str, Any]] = []
+    status: AnswerStatus = "graded"
+    awarded_marks: float = 0.0
+    original_ai_marks: float = 0.0
+    teacher_adjusted_marks: Optional[float] = None
+    evaluation_confidence: float = 0.0
+    needs_review: bool = False
+    criterion_results: List[CriterionResult] = []
+    evidence_summary: List[str] = []
+    feedback: str = ""
+    mapping_provenance: Optional[str] = "explicit_question_anchor"
+    grading_provenance: Optional[str] = "local"
+    escalation_reason: Optional[str] = None
+    review_status: ReviewStatus = "NOT_REQUIRED"
+    teacher_review: Optional[TeacherReview] = None
+
+
+class StructuredAssessmentResult(BaseModel):
+    assessment_id: str
+    assessment_status: Literal["IN_REVIEW", "FINALIZED"] = "IN_REVIEW"
+    revision_index: int = 1
+    total_questions: int = 0
+    answered_questions: int = 0
+    unanswered_questions: int = 0
+    unmatched_answers_count: int = 0
+    total_max_marks: float = 0.0
+    ai_awarded_marks: float = 0.0
+    teacher_adjusted_marks: Optional[float] = None
+    final_awarded_marks: float = 0.0
+    percentage: float = 0.0
+    overall_confidence: float = 0.0
+    questions_needing_review: int = 0
+    question_results: List[StructuredQuestionResult] = []
+    review_summary: Dict[str, Any] = {}
+    grading_statistics: Dict[str, Any] = {}
+    audit_trail: List[AuditEvent] = []
+    version_history: List[AssessmentRevision] = []
+    created_at: str = ""
+    updated_at: str = ""
+
+
 class AssessmentResult(BaseModel):
     assessment_id: str
     state: ProcessingState
@@ -113,6 +452,8 @@ class AssessmentResult(BaseModel):
     answer_sheet_is_pdf: bool = False
     question_paper_url: Optional[str] = None
     answer_sheet_url: Optional[str] = None
+    structured_result: Optional[StructuredAssessmentResult] = None
+    audit_trail: List[AuditEvent] = []
 
 
 class AssistantRequest(BaseModel):
@@ -125,3 +466,109 @@ class AssistantResponse(BaseModel):
     attention_questions: List[str] = []
     unanswered_questions: List[str] = []
     review_questions: List[str] = []
+
+
+class StudentPerformanceSummary(BaseModel):
+    assessment_id: str
+    total_max_marks: float
+    final_awarded_marks: float
+    percentage: float
+    overall_confidence: float
+    answered_questions: int
+    unanswered_questions: int
+    questions_needing_review: int
+    performance_band: str = "Proficient"
+
+
+class CriterionPerformanceSummary(BaseModel):
+    criterion_id: str
+    description: str
+    max_marks: float
+    awarded_marks: float
+    evidence_status: str
+    confidence: float
+    provenance: str = "local"
+
+
+class QuestionPerformanceSummary(BaseModel):
+    question_id: str
+    question_number: str
+    question_text: str
+    max_marks: float
+    final_awarded_marks: float
+    percentage: float
+    status: str = "graded"
+    feedback: str = ""
+    strengths: List[str] = []
+    improvement_points: List[str] = []
+    review_status: str = "NOT_REQUIRED"
+    source_regions: List[Dict[str, Any]] = []
+    criteria_summary: List[CriterionPerformanceSummary] = []
+
+
+class StudentAssessmentReport(BaseModel):
+    assessment_id: str
+    assessment_status: str = "FINALIZED"
+    final_score: float
+    total_max_marks: float
+    percentage: float
+    performance_summary: StudentPerformanceSummary
+    question_results: List[QuestionPerformanceSummary] = []
+    strengths: List[str] = []
+    weaknesses: List[str] = []
+    recommendations: List[str] = []
+    feedback: str = ""
+    generated_at: str = ""
+    report_version: int = 1
+
+
+class AssessmentInsight(BaseModel):
+    insight_id: str
+    type: Literal["STRENGTH", "WEAKNESS", "ERROR_PATTERN", "REVIEW_PRIORITY", "GENERAL"] = "GENERAL"
+    title: str
+    summary: str
+    question_ids: List[str] = []
+    evidence_refs: List[str] = []
+    confidence: float = 0.9
+    source: str = "evidence_engine"
+
+
+class QuestionInsight(BaseModel):
+    question_id: str
+    question_number: str
+    strengths: List[str] = []
+    improvement_areas: List[str] = []
+    error_patterns: List[str] = []
+    evidence_refs: List[str] = []
+    source_regions: List[Dict[str, Any]] = []
+    confidence: float = 0.9
+
+
+class AssessmentInsights(BaseModel):
+    assessment_id: str
+    final_awarded_marks: float
+    total_max_marks: float
+    percentage: float
+    answered_questions: int
+    unanswered_questions: int
+    unmatched_answers_count: int
+    questions_needing_review: int
+    strengths: List[str] = []
+    areas_needing_attention: List[str] = []
+    error_patterns: List[AssessmentInsight] = []
+    review_priorities: List[AssessmentInsight] = []
+    question_insights: List[QuestionInsight] = []
+    generated_at: str = ""
+
+
+StructuredQuestionResult.model_rebuild()
+StructuredAssessmentResult.model_rebuild()
+AssessmentResult.model_rebuild()
+StudentPerformanceSummary.model_rebuild()
+QuestionPerformanceSummary.model_rebuild()
+StudentAssessmentReport.model_rebuild()
+AssessmentInsight.model_rebuild()
+QuestionInsight.model_rebuild()
+AssessmentInsights.model_rebuild()
+
+

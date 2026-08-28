@@ -40,8 +40,8 @@ async def _call_gemini(prompt: str, image_b64: Optional[str] = None, mime_type: 
     models_to_try = [
         settings.GEMINI_MODEL or "gemini-2.5-flash",
         "gemini-2.5-flash",
-        "gemini-3.6-flash",
-        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
     ]
     seen = set()
     models = [m for m in models_to_try if not (m in seen or seen.add(m))]
@@ -264,7 +264,35 @@ def extract_json_payload(text: str) -> Any:
         raise ValueError(f"Could not parse valid JSON from LLM response: {text[:200]}")
 
 
-async def llm_complete_json(prompt: str) -> Any:
+async def _execute_provider_chain(prompt: str) -> Tuple[Any, str]:
+    async with _llm_sem:
+        for name in _ORDER:
+            fn = _PROVIDERS.get(name)
+            if not fn:
+                continue
+            try:
+                raw = await fn(prompt)
+                if raw and len(raw.strip()) > 0:
+                    parsed = extract_json_payload(raw)
+                    return parsed, name
+            except Exception as e:
+                err_msg = str(e).split("\n")[0]
+                print(f"[LLMProvider] {name} notice: {err_msg[:80]}")
+                continue
+
+        raise LLMError("All configured LLM providers failed or returned unparseable JSON")
+
+
+async def llm_complete_json_with_provider(prompt: str, timeout: float = 15.0) -> Tuple[Any, str]:
+    """
+    Invokes LLM provider chain cleanly behind single interface, wrapping the ENTIRE operation
+    (including retries and fallback providers) inside the global operation timeout.
+    Returns (parsed_json, provider_name).
+    """
+    return await asyncio.wait_for(_execute_provider_chain(prompt), timeout=timeout)
+
+
+async def llm_complete_json(prompt: str, timeout: float = 15.0) -> Any:
     """Invokes LLM and parses JSON output safely."""
-    raw = await llm_complete(prompt, allow_fallback=False)
-    return extract_json_payload(raw)
+    data, _ = await llm_complete_json_with_provider(prompt, timeout=timeout)
+    return data

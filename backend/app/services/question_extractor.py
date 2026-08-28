@@ -46,6 +46,9 @@ INDEPENDENT_SUB_RE = re.compile(
     re.IGNORECASE
 )
 
+# Valid Subquestion Letter Matcher (Pure letters/roman numerals without embedded digits like S2)
+VALID_SUBPART_LETTER = re.compile(r"^[a-z]{1,2}$|^(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)$", re.IGNORECASE)
+
 # Supporting Intent Verbs & Action Markers (Supporting signal only; NOT required)
 SUPPORTING_INTENT_VERBS = re.compile(
     r"\b(?:what|why|how|explain|discuss|calculate|derive|prove|compare|define|state|find|show|list|describe|illustrate|evaluate|analyze|differentiate|determine|solve|convert|identify|construct|write|compute|trace|sketch|distinguish|design|briefly)\b",
@@ -146,7 +149,7 @@ def _calculate_candidate_confidence(
     - Subquestion Sequence (+0.60)
     - Intent Verb present (+0.25, SUPPORTING ONLY, not required)
     - Question Mark ? or Math/Code syntax (+0.25)
-    - Exam Attempt Rule (e.g. "SECTION-B contains 5 questions carrying 5 marks each...") (-0.60)
+    - Exam Attempt Rule (e.g. "SECTION-B contains 5 questions carrying 5 marks each...") (-0.65)
     - Top of Page Header Key-Value Metadata without Question Marker (-0.70)
     
     No single keyword is the sole decision maker, and intent verbs are never mandatory.
@@ -179,7 +182,6 @@ def _calculate_candidate_confidence(
         score += 0.10
 
     # 3. Instruction & Attempt Rule Penalty (Evaluated if describing exam rules without question intent)
-    # E.g., "1. SECTION-A is COMPULSORY consisting of TEN questions carrying 2 marks each"
     if "compulsory" in t_low or "consisting of" in t_low or "carrying" in t_low or "attempt any" in t_low or "have to attempt" in t_low:
         if ("section" in t_low or "part" in t_low or "questions" in t_low) and not has_q_intent:
             score -= 0.65
@@ -292,29 +294,30 @@ def _extract_candidates_from_blocks(blocks: List[Block]) -> List[RawCandidate]:
                 sub_c = comb_m.group(2).lower()
                 body = comb_m.group(3).strip()
 
-                q_num = f"Q{main_n}({sub_c})"
-                disp_num = f"{main_n}({sub_c})"
-                current_main_num = main_n
+                if VALID_SUBPART_LETTER.match(sub_c) and sum(1 for char in body if char.isalpha()) >= 3:
+                    q_num = f"Q{main_n}({sub_c})"
+                    disp_num = f"{main_n}({sub_c})"
+                    current_main_num = main_n
 
-                conf = _calculate_candidate_confidence(
-                    text=body,
-                    number_pattern_matched=True,
-                    is_subquestion=True,
-                    page_num=page_num,
-                    y_ratio=0.5,
-                )
+                    conf = _calculate_candidate_confidence(
+                        text=body,
+                        number_pattern_matched=True,
+                        is_subquestion=True,
+                        page_num=page_num,
+                        y_ratio=0.5,
+                    )
 
-                curr_candidate = RawCandidate(
-                    q_num=q_num,
-                    display_num=disp_num,
-                    text=body,
-                    page=page_num,
-                    blocks=[b],
-                    section=active_section,
-                    confidence=conf,
-                )
-                candidates.append(curr_candidate)
-                continue
+                    curr_candidate = RawCandidate(
+                        q_num=q_num,
+                        display_num=disp_num,
+                        text=body,
+                        page=page_num,
+                        blocks=[b],
+                        section=active_section,
+                        confidence=conf,
+                    )
+                    candidates.append(curr_candidate)
+                    continue
 
             # 3. Check Group Parent Header: e.g. "1. Write briefly :" or "2. Operating Systems (10 Marks)"
             if _is_group_parent_header(txt):
@@ -332,34 +335,36 @@ def _extract_candidates_from_blocks(blocks: List[Block]) -> List[RawCandidate]:
 
                 # Check if q_rest contains subquestion e.g. "(a) Define..."
                 sub_in = INDEPENDENT_SUB_RE.match(q_rest)
-                if sub_in:
+                if sub_in and VALID_SUBPART_LETTER.match(sub_in.group(1)):
                     sub_c = sub_in.group(1).lower()
                     sub_body = sub_in.group(2).strip()
-                    full_q_num = f"Q{q_num_str}({sub_c})"
-                    full_disp_num = f"{q_num_str}({sub_c})"
-                    current_main_num = q_num_str
 
-                    conf = _calculate_candidate_confidence(
-                        text=sub_body,
-                        number_pattern_matched=True,
-                        is_subquestion=True,
-                        page_num=page_num,
-                        y_ratio=0.5,
-                    )
+                    if sum(1 for char in sub_body if char.isalpha()) >= 3:
+                        full_q_num = f"Q{q_num_str}({sub_c})"
+                        full_disp_num = f"{q_num_str}({sub_c})"
+                        current_main_num = q_num_str
 
-                    curr_candidate = RawCandidate(
-                        q_num=full_q_num,
-                        display_num=full_disp_num,
-                        text=sub_body,
-                        page=page_num,
-                        blocks=[b],
-                        section=active_section,
-                        confidence=conf,
-                    )
-                    candidates.append(curr_candidate)
-                    continue
+                        conf = _calculate_candidate_confidence(
+                            text=sub_body,
+                            number_pattern_matched=True,
+                            is_subquestion=True,
+                            page_num=page_num,
+                            y_ratio=0.5,
+                        )
 
-                if q_rest:
+                        curr_candidate = RawCandidate(
+                            q_num=full_q_num,
+                            display_num=full_disp_num,
+                            text=sub_body,
+                            page=page_num,
+                            blocks=[b],
+                            section=active_section,
+                            confidence=conf,
+                        )
+                        candidates.append(curr_candidate)
+                        continue
+
+                if q_rest and sum(1 for char in q_rest if char.isalpha()) >= 3:
                     current_main_num = q_num_str
                     conf = _calculate_candidate_confidence(
                         text=q_rest,
@@ -387,7 +392,7 @@ def _extract_candidates_from_blocks(blocks: List[Block]) -> List[RawCandidate]:
                 sub_c = sub_m.group(1).lower()
                 sub_body = sub_m.group(2).strip()
 
-                if sub_body and len(sub_body) >= 2:
+                if VALID_SUBPART_LETTER.match(sub_c) and sum(1 for char in sub_body if char.isalpha()) >= 3:
                     full_q_num = f"Q{current_main_num}({sub_c})"
                     full_disp_num = f"{current_main_num}({sub_c})"
 
