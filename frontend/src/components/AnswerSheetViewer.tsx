@@ -215,24 +215,34 @@ export default function AnswerSheetViewer({
             />
           )}
 
-          {/* Single Unified Vivid Rectangle Bounding Box Highlight */}
-          {renderedSize && mergedBounds && (
-            <div
-              className="absolute border-3 border-emerald-500 bg-emerald-400/20 rounded-2xl transition-all duration-300 shadow-[0_0_30px_rgba(16,185,129,0.45)] ring-4 ring-emerald-400/30 pointer-events-none z-20"
-              style={{
-                left: mergedBounds.x * scaleX,
-                top: mergedBounds.y * scaleY,
-                width: mergedBounds.width * scaleX,
-                height: mergedBounds.height * scaleY,
-              }}
-            >
-              {/* Corner Accent Indicators for total visual clarity */}
-              <div className="absolute -top-1.5 -left-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
-              <div className="absolute -top-1.5 -right-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
-              <div className="absolute -bottom-1.5 -left-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
-              <div className="absolute -bottom-1.5 -right-1.5 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-md" />
-            </div>
-          )}
+          {/* Precision Disjoint Sub-Region Bounding Box Highlights */}
+          {renderedSize && regionsOnPage.map((r, idx) => {
+            const padX = 4;
+            const padY = 3;
+            const rx = Math.max(0, r.bbox.x - padX) * scaleX;
+            const ry = Math.max(0, r.bbox.y - padY) * scaleY;
+            const rw = (r.bbox.width + padX * 2) * scaleX;
+            const rh = (r.bbox.height + padY * 2) * scaleY;
+
+            return (
+              <div
+                key={`reg_${idx}_${r.page}`}
+                className="absolute border-2 border-emerald-500 bg-emerald-400/20 rounded-xl transition-all duration-300 shadow-[0_0_18px_rgba(16,185,129,0.35)] ring-2 ring-emerald-400/30 pointer-events-none z-20"
+                style={{
+                  left: rx,
+                  top: ry,
+                  width: rw,
+                  height: rh,
+                }}
+              >
+                {/* Corner Accent Indicators */}
+                <div className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
+                <div className="absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
+                <div className="absolute -bottom-1 -left-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
+                <div className="absolute -bottom-1 -right-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
+              </div>
+            );
+          })}
 
           {/* Question Anchor Badge placed cleanly outside to the left of the answer text */}
           {renderedSize && mergedBounds && (

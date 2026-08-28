@@ -34,9 +34,9 @@ MAIN_Q_RE = re.compile(
     re.IGNORECASE
 )
 
-# Standalone Q prefix without dot if followed by digit: e.g. Q1 What is...
+# Standalone Q / Q. prefix followed by digit and space: e.g. Q1 What is..., Q.1 Discuss...
 MAIN_Q_PREFIX_RE = re.compile(
-    r"^\s*Q\s*(\d{1,3})\s+(.*)$",
+    r"^\s*Q\.?\s*(\d{1,3})\s+(.*)$",
     re.IGNORECASE
 )
 
