@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import os
 import io
+import json
 import unittest
 from PIL import Image
 
@@ -76,53 +77,48 @@ class TestDocumentIntelligenceCore(unittest.TestCase):
 
     def test_03_visual_region_grounding_manifest(self):
         """Validates creation of Region Manifest and structural VLM prompt grounding."""
-        regions = [
+        provider = MultimodalDocumentVisionProvider(api_key="mock_key")
+        target_regions = [
             DocumentRegion(region_id="r91", page=1, text="1. What is ReLU?", bbox=BBox(x=100, y=100, width=300, height=30), region_type="QUESTION"),
             DocumentRegion(region_id="r92", page=1, text="(A) Activation function", bbox=BBox(x=120, y=140, width=200, height=25), region_type="OPTION"),
         ]
-        doc_res = DocumentUnderstandingResult(document_id="doc_manifest", pages=[], regions=regions, relationships=[])
-        
-        provider = MultimodalDocumentVisionProvider()
-        prompt = provider._build_verification_prompt(regions, doc_res)
-        
-        self.assertIn("REGION MANIFEST:", prompt)
+        doc_res = DocumentUnderstandingResult(document_id="doc_test", pages=[], regions=target_regions, relationships=[])
+        prompt = provider._build_verification_prompt(target_regions, doc_res)
+        print("\n--- GENERATED REGION MANIFEST PROMPT ---")
+        print(prompt)
         self.assertIn("r91", prompt)
         self.assertIn("r92", prompt)
-        self.assertIn("VISUAL REGION GROUNDING", prompt)
+        self.assertIn("Region Manifest:", prompt)
         print("[TEST 3 PASSED] Visual region grounding manifest & prompt verification verified.")
 
     def test_04_strict_structural_vlm_output_validation(self):
         """Validates that unknown region IDs and self-referential links are strictly rejected."""
-        provider = MultimodalDocumentVisionProvider()
+        provider = MultimodalDocumentVisionProvider(api_key="mock_key")
         target_regions = [
-            DocumentRegion(region_id="r1", page=1, text="1. Q1", bbox=BBox(x=10, y=10, width=100, height=20), region_type="QUESTION"),
-            DocumentRegion(region_id="r2", page=1, text="(A) Opt", bbox=BBox(x=10, y=40, width=100, height=20), region_type="OPTION"),
+            DocumentRegion(region_id="r91", page=1, text="1. What is ReLU?", bbox=BBox(x=100, y=100, width=300, height=30), region_type="QUESTION"),
+            DocumentRegion(region_id="r92", page=1, text="(A) Activation function", bbox=BBox(x=120, y=140, width=200, height=25), region_type="OPTION"),
         ]
-        
-        raw_vlm_json = """{
-            "document_purpose": "QUESTION_PAPER",
+        raw_vlm_json = json.dumps({
             "verifications": [
-                {"region_id": "r1", "proposed_type": "QUESTION", "confidence": 0.95},
-                {"region_id": "r2", "proposed_type": "OPTION", "confidence": 0.95},
-                {"region_id": "UNKNOWN_REG_999", "proposed_type": "QUESTION", "confidence": 0.99}
+                {"region_id": "r91", "proposed_type": "QUESTION", "confidence": 0.95},
+                {"region_id": "r92", "proposed_type": "OPTION", "confidence": 0.90},
+                {"region_id": "r999_fake", "proposed_type": "QUESTION", "confidence": 0.99},
             ],
             "relationships": [
-                {"source_region_id": "r2", "target_region_id": "r1", "relationship_type": "option_of", "confidence": 0.95},
-                {"source_region_id": "r1", "target_region_id": "r1", "relationship_type": "belongs_to", "confidence": 0.90},
-                {"source_region_id": "FAKE_SRC", "target_region_id": "r1", "relationship_type": "option_of", "confidence": 0.95}
+                {"source_region_id": "r92", "target_region_id": "r91", "relationship_type": "option_of", "confidence": 0.95},
+                {"source_region_id": "r91", "target_region_id": "r91", "relationship_type": "self_link", "confidence": 0.99},
+                {"source_region_id": "r92", "target_region_id": "r999_fake", "relationship_type": "option_of", "confidence": 0.95},
             ]
-        }"""
-        
-        hypotheses, rels = provider._parse_and_validate_response(raw_vlm_json, target_regions)
-        
-        # Confirm UNKNOWN_REG_999 was rejected
-        self.assertEqual(len(hypotheses), 2)
-        self.assertEqual({h.region_id for h in hypotheses}, {"r1", "r2"})
+        })
+        hypotheses, rels, rejected_rels = provider._parse_and_validate_response(raw_vlm_json, target_regions)
+        valid_hypo_ids = {h.region_id for h in hypotheses}
+        self.assertIn("r91", valid_hypo_ids)
+        self.assertIn("r92", valid_hypo_ids)
+        self.assertNotIn("r999_fake", valid_hypo_ids)
 
-        # Confirm self-link r1->r1 and FAKE_SRC link were rejected
         self.assertEqual(len(rels), 1)
-        self.assertEqual(rels[0].source_region_id, "r2")
-        self.assertEqual(rels[0].target_region_id, "r1")
+        self.assertEqual(rels[0].source_region_id, "r92")
+        self.assertEqual(rels[0].target_region_id, "r91")
         print("[TEST 4 PASSED] Strict structural VLM output validation verified.")
 
     def test_05_stable_document_scoped_question_identity(self):

@@ -1,20 +1,21 @@
 """
-Step 11 Core — Real Visual Intelligence Validation & Diagnostic CLI.
+Step 11 Core — Real Visual Intelligence Validation & Empirical Diagnostic CLI.
 
 Usage:
     python backend/scratch/run_document_intelligence_diagnostic.py [file_path]
 
 Outputs:
-1. Document Ingestion Breakdown (File, Pages, Dimensions, Native PDF Blocks, OCR Blocks)
+1. Complete Document Ingestion Audit (Raw OCR Detections -> Normalized Blocks -> DocumentRegion -> Manifest)
 2. Region Manifest Payload Supplied to VLM (Region ID, Page, BBox, OCR Text, Hypothesis)
 3. Page Image Payload Inspection (Page Number, Image Resolution, Format, Base64 Payload Present)
-4. Raw Structured VLM Response & Returned Relationships (SECTION -> QUESTION, QUESTION -> OPTION, etc.)
-5. VLM Region ID Subset Validation (Returned Region IDs subset of Manifest IDs)
-6. Evidence Fusion Decision Explanation (Combines Native, OCR, Layout, and VLM evidence)
-7. Final DocumentStructureGraph (Nodes, Edges, Graph Purpose)
-8. Graph-Driven Document Structure Hierarchy Tree
-9. Real VLM Acceptance Gate Status (PASSED if VLM executed and verified; FAILED with VLM_NOT_AVAILABLE if unconfigured)
-10. Empirical Acceptance Quality Metrics Table
+4. Raw Structured VLM Response & Validated Relationships
+5. Rejected VLM Relationships & Semantic Contradiction Audit
+6. VLM Region ID Subset Validation (Returned Region IDs subset of Manifest IDs)
+7. Evidence Fusion Decision Explanation (Combines Native, OCR, Layout, and VLM evidence)
+8. Final DocumentStructureGraph (Nodes, Edges, Graph Purpose)
+9. Graph-Driven Document Structure Hierarchy Tree
+10. Real VLM Acceptance Gate Status (PASSED if VLM executed, verified & semantically consistent; FAILED otherwise)
+11. Empirical Acceptance Quality Metrics Table
 """
 from __future__ import annotations
 import sys
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.core.config import settings
 from app.models.schemas import Block, DocumentQuestionExtractionResult, VisualVerificationResponse, CostAccounting
-from app.services.document_processor import process_document
+from app.services.document_processor import process_document, _get_ocr_engine
 from app.services.document_understanding_service import DocumentUnderstandingService
 from app.services.document_vision_provider import MultimodalDocumentVisionProvider
 from app.services.intelligent_question_extraction_service import IntelligentQuestionExtractionService
@@ -56,7 +57,7 @@ def run_empirical_diagnostic(file_path: str, force_vlm: bool = True):
     native_blocks_count = sum(1 for b in blocks if b.source == "native_pdf")
     ocr_blocks_count = sum(1 for b in blocks if b.source == "ocr")
 
-    print("\n1. DOCUMENT INGESTION BREAKDOWN")
+    print("\n1. DOCUMENT INGESTION AUDIT (IMAGE -> OCR DETECTIONS -> BLOCKS -> REGIONS)")
     print(f"+-- File: {os.path.basename(file_path)} (Type: {ext}, Pages: {num_pages})")
     print(f"+-- Page Dimensions: {sizes}")
     print(f"+-- Total Ingested Blocks: {len(blocks)} (Native PDF: {native_blocks_count}, OCR: {ocr_blocks_count})")
@@ -82,6 +83,10 @@ def run_empirical_diagnostic(file_path: str, force_vlm: bool = True):
         print(f"|   +-- Native PDF Blocks: {p_native}")
         print(f"|   +-- OCR Blocks: {p_ocr}")
         print(f"|   +-- Total Page Blocks: {len(p_blocks)}")
+        for idx, b in enumerate(p_blocks[:10]):
+            print(f"|       [{idx+1}] Block {b.id} | BBox: [{b.bbox.x}, {b.bbox.y}, {b.bbox.width}, {b.bbox.height}] | Conf: {b.confidence} | '{b.text[:40]}'")
+        if len(p_blocks) > 10:
+            print(f"|       ... and {len(p_blocks) - 10} more blocks on page {p_num}")
 
     # 2. Document Understanding & Structure Graph Construction with Live VLM Path
     doc_service = DocumentUnderstandingService()
@@ -156,24 +161,41 @@ def run_empirical_diagnostic(file_path: str, force_vlm: bool = True):
     else:
         print(f"  Subset Region ID Validation:  PASS (All VLM Region IDs subset of Manifest IDs)")
 
-    # Print VLM Relationships
-    print("\n--- VLM RELATIONSHIP GRAPH EDGES ---")
+    # Print Valid VLM Relationships
+    print("\n--- VALIDATED VLM RELATIONSHIP GRAPH EDGES ---")
     if doc_result.relationships:
-        for rel in doc_result.relationships[:15]:
+        for rel in doc_result.relationships:
             print(f"  {rel.source_region_id:<12} --[{rel.relationship_type}]--> {rel.target_region_id:<12} (Conf: {rel.confidence:.2f})")
-        if len(doc_result.relationships) > 15:
-            print(f"  ... and {len(doc_result.relationships) - 15} more edges.")
     else:
-        print("  (No explicit VLM relationships returned)")
+        print("  (No valid non-contradictory VLM relationships)")
+
+    # Print Rejected / Contradictory VLM Relationships
+    rejected_rels = doc_result.metadata.get("rejected_vlm_relationships", [])
+    print("\n--- REJECTED / CONTRADICTORY VLM RELATIONSHIP EDGES (AUDIT LOG) ---")
+    if rejected_rels:
+        for rej in rejected_rels:
+            print(f"  [REJECTED] {rej.get('source')} --[{rej.get('rel_type')}]--> {rej.get('target')} | Reason: {rej.get('reason')}")
+    else:
+        print("  (No VLM relationships were rejected)")
 
     # --- REAL VLM ACCEPTANCE GATE REPORT ---
     print("\n" + "=" * 110)
     print("REAL VLM ACCEPTANCE GATE REPORT")
     print("=" * 110)
+    vlm_acceptance_passed = True
+    vlm_failure_reason = ""
+
     if vlm_status in ("NOT_CONFIGURED", "VLM_UNAVAILABLE") and not vlm_has_keys:
+        vlm_acceptance_passed = False
+        vlm_failure_reason = "VLM_NOT_AVAILABLE (No GEMINI_API_KEY or OPENROUTER_API_KEY configured in environment)"
+    elif rejected_rels and any("contradiction" in r.get("reason", "").lower() for r in rejected_rels):
+        vlm_acceptance_passed = False
+        vlm_failure_reason = f"SEMANTIC_CONTRADICTIONS_DETECTED ({len(rejected_rels)} contradictory VLM edges filtered)"
+
+    if not vlm_acceptance_passed:
         print("  REAL_VLM_ACCEPTANCE: FAILED")
-        print("  REASON: VLM_NOT_AVAILABLE (No GEMINI_API_KEY or OPENROUTER_API_KEY configured in environment)")
-        print("  NOTICE: Visual intelligence mode fallbacks to deterministic/semantic evidence safely.")
+        print(f"  REASON: {vlm_failure_reason}")
+        result.invariant_violations.append(f"INVARIANT_VIOLATION: Real VLM Acceptance Gate failed: {vlm_failure_reason}")
     else:
         print("  REAL_VLM_ACCEPTANCE: PASSED")
         print(f"  STATUS: {vlm_status}")
@@ -251,6 +273,7 @@ def run_empirical_diagnostic(file_path: str, force_vlm: bool = True):
     print(f"  Duplicate Internal IDs:         {duplicate_id_count}")
     print(f"  Unresolved Regions:             {len(result.uncertain_candidates)}")
     print(f"  VLM Status / Calls Made:        {doc_result.vlm_status} ({vlm_cost.vlm_calls if vlm_cost else 0} calls)")
+    print(f"  Rejected VLM Relationships:     {len(rejected_rels)}")
     print(f"  Fallback Used (ACCEPTANCE):     {result.fallback_used}")
     print("=" * 110)
 

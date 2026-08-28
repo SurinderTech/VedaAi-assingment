@@ -166,6 +166,9 @@ class DocumentUnderstandingService:
             res_initial.vlm_status = vlm_response.status
             if vlm_response.cost_accounting:
                 res_initial.cost_accounting = vlm_response.cost_accounting
+            if vlm_response.rejected_vlm_relationships:
+                res_initial.metadata["rejected_vlm_relationships"] = vlm_response.rejected_vlm_relationships
+
 
 
         # 5. PROVIDER-AGNOSTIC EVIDENCE FUSION

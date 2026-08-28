@@ -775,8 +775,10 @@ class VisualVerificationResponse(BaseModel):
     model_name: str = "vlm_default"
     vlm_hypotheses: List[VLMHypothesis] = []
     verified_relationships: List[RegionRelationship] = []
+    rejected_vlm_relationships: List[Dict[str, Any]] = []
     cost_accounting: CostAccounting = CostAccounting()
     error_message: Optional[str] = None
+
 
 
 class DocumentRegion(BaseModel):

@@ -245,7 +245,7 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                 )
 
             # Schema validate JSON output from VLM
-            hypotheses, verified_rels = self._parse_and_validate_response(response_text, target_regions)
+            hypotheses, verified_rels, rejected_rels = self._parse_and_validate_response(response_text, target_regions)
             cost.successful_calls += 1
 
             return VisualVerificationResponse(
@@ -253,6 +253,7 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                 model_name=self.model_name,
                 vlm_hypotheses=hypotheses,
                 verified_relationships=verified_rels,
+                rejected_vlm_relationships=rejected_rels,
                 cost_accounting=cost,
             )
 
@@ -276,60 +277,40 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                 {
                     "region_id": r.region_id,
                     "page": r.page,
-                    "bbox": [r.bbox.x, r.bbox.y, r.bbox.width, r.bbox.height],
-                    "ocr_text": r.text,
+                    "bbox": [round(r.bbox.x, 1), round(r.bbox.y, 1), round(r.bbox.width, 1), round(r.bbox.height, 1)],
+                    "ocr_text": r.text[:60],
                     "initial_hypothesis": r.region_type,
                 }
             )
 
-        return f"""You are an expert Document Layout & Structural Intelligence Verifier.
-Analyze the provided document page image alongside the supplied REGION MANIFEST.
-
-CRITICAL INSTRUCTIONS:
-1. Document-Level Semantic Decision: Determine the role and purpose of content using page/document context. Distinguish meaningful assessment content from administrative/irrelevant text based on visual layout, hierarchy, and surrounding context.
-2. NO SINGLE SIGNAL AUTHORITY: No single keyword, numbering pattern, page position, or confidence score independently promotes a region to a question.
-3. VISUAL REGION GROUNDING: You MUST ONLY reference region_ids that exist in the supplied manifest. NEVER invent region IDs.
-
-REGION MANIFEST:
-{json.dumps(manifest_items, indent=2)}
-
-Return ONLY valid JSON matching this exact schema:
-{{
-  "document_purpose": "QUESTION_PAPER" | "INSTRUCTIONS" | "COVER" | "ANSWER_KEY" | "UNKNOWN",
-  "page_roles": {{"1": "COVER", "2": "QUESTION_PAPER"}},
-  "verifications": [
-    {{
-      "region_id": "string",
-      "proposed_type": "QUESTION" | "SUBQUESTION" | "OPTION" | "INSTRUCTION" | "SECTION_HEADER" | "TABLE" | "DIAGRAM" | "METADATA" | "HEADER" | "FOOTER",
-      "confidence": float (0.0 to 1.0),
-      "reasoning": "string explanation",
-      "uncertainty": float (0.0 to 1.0)
-    }}
-  ],
-  "relationships": [
-    {{
-      "source_region_id": "string",
-      "target_region_id": "string",
-      "relationship_type": "option_of" | "belongs_to" | "continuation_of" | "subquestion_of" | "section_member" | "associated_visual",
-      "confidence": float (0.0 to 1.0)
-    }}
-  ]
-}}
-"""
+        return (
+            "Analyze the attached document page image and the provided Region Manifest.\n"
+            "Produce structured layout verification and relationships in valid JSON format:\n"
+            "{\n"
+            '  "verifications": [\n'
+            '    {"region_id": "string", "proposed_type": "QUESTION"|"OPTION"|"SUBQUESTION"|"SECTION_HEADER"|"INSTRUCTION"|"HEADER"|"FOOTER"|"TABLE"|"DIAGRAM", "confidence": float, "reasoning": "string"}\n'
+            "  ],\n"
+            '  "relationships": [\n'
+            '    {"source_region_id": "string", "target_region_id": "string", "relationship_type": "option_of"|"subquestion_of"|"section_member"|"continuation_of"|"follows", "confidence": float}\n'
+            "  ]\n"
+            "}\n"
+            f"Region Manifest:\n{json.dumps(manifest_items, indent=2)}\n"
+        )
 
     def _parse_and_validate_response(
         self, response_text: str, target_regions: List[DocumentRegion]
-    ) -> Tuple[List[VLMHypothesis], List[RegionRelationship]]:
-        """Parses and strictly schema-validates VLM JSON output against known region manifest."""
+    ) -> Tuple[List[VLMHypothesis], List[RegionRelationship], List[Dict[str, Any]]]:
+        """Parses and strictly schema-validates VLM JSON output against known region manifest and semantic constraints."""
         hypotheses: List[VLMHypothesis] = []
         relationships: List[RegionRelationship] = []
+        rejected_relationships: List[Dict[str, Any]] = []
 
         try:
             valid_region_map = {r.region_id: r for r in target_regions}
             # Extract JSON block
             json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
             if not json_match:
-                return hypotheses, relationships
+                return hypotheses, relationships, rejected_relationships
 
             data = json.loads(json_match.group(0))
             verifications = data.get("verifications", [])
@@ -372,22 +353,83 @@ Return ONLY valid JSON matching this exact schema:
                     )
                 )
 
+            # First pass: filter structural region bounds
+            candidate_edges = []
             for rel in raw_relationships:
                 src_id = rel.get("source_region_id")
                 tgt_id = rel.get("target_region_id")
                 rel_type = rel.get("relationship_type", "belongs_to")
 
-                # STRICT VALIDATION: reject unknown region IDs, self-links, or invalid relationship types
                 if not src_id or not tgt_id:
+                    rejected_relationships.append({"source": src_id, "target": tgt_id, "rel_type": rel_type, "reason": "Missing source or target ID"})
                     continue
                 if src_id not in valid_region_map or tgt_id not in valid_region_map:
+                    rejected_relationships.append({"source": src_id, "target": tgt_id, "rel_type": rel_type, "reason": "Region ID not in manifest"})
                     continue
                 if src_id == tgt_id:
+                    rejected_relationships.append({"source": src_id, "target": tgt_id, "rel_type": rel_type, "reason": "Self-referential link"})
                     continue
                 if rel_type not in valid_rel_types:
                     rel_type = "belongs_to"
 
-                conf = float(rel.get("confidence", 0.9))
+                candidate_edges.append((src_id, tgt_id, rel_type, float(rel.get("confidence", 0.9))))
+
+            # Second pass: Semantic Consistency & Contradiction Filter
+            edge_set = {(src, tgt): rtype for src, tgt, rtype, _ in candidate_edges}
+
+            for src_id, tgt_id, rel_type, conf in candidate_edges:
+                src_reg = valid_region_map[src_id]
+                tgt_reg = valid_region_map[tgt_id]
+
+                # 1. Contradictory bidirectional check (e.g. A follows B AND B follows/continuation_of A)
+                opposite_rel = edge_set.get((tgt_id, src_id))
+                if opposite_rel:
+                    if (rel_type in ("continuation_of", "follows") and opposite_rel in ("follows", "continuation_of")):
+                        # Break bidirectional cycle: reject edge if source is spatially above target
+                        if src_reg.page < tgt_reg.page or (src_reg.page == tgt_reg.page and src_reg.bbox.y < tgt_reg.bbox.y):
+                            rejected_relationships.append({
+                                "source": src_id,
+                                "target": tgt_id,
+                                "rel_type": rel_type,
+                                "reason": f"Semantic contradiction: Bidirectional relationship loop detected between {src_id} and {tgt_id}; inverted edge from upper region rejected."
+                            })
+                            continue
+
+                # 2. Reading order & Spatial Hierarchy validation for continuation_of & follows
+                if rel_type == "follows":
+                    # Source region MUST appear after target region spatially (tgt before src)
+                    if src_reg.page < tgt_reg.page or (src_reg.page == tgt_reg.page and src_reg.bbox.y < tgt_reg.bbox.y - 10.0):
+                        rejected_relationships.append({
+                            "source": src_id,
+                            "target": tgt_id,
+                            "rel_type": rel_type,
+                            "reason": f"Semantic contradiction: Inverted follows relationship. Source region {src_id} (Y={src_reg.bbox.y}) is above target {tgt_id} (Y={tgt_reg.bbox.y})."
+                        })
+                        continue
+
+                if rel_type == "continuation_of":
+                    # Source region MUST appear after target region in reading/spatial order (tgt before src)
+                    if src_reg.page < tgt_reg.page or (src_reg.page == tgt_reg.page and src_reg.bbox.y < tgt_reg.bbox.y):
+                        rejected_relationships.append({
+                            "source": src_id,
+                            "target": tgt_id,
+                            "rel_type": rel_type,
+                            "reason": f"Semantic contradiction: Source region {src_id} (Page {src_reg.page}, Y={src_reg.bbox.y}) is spatially above target region {tgt_id} (Page {tgt_reg.page}, Y={tgt_reg.bbox.y}); continuation_of is impossible."
+                        })
+                        continue
+
+                    # Independently numbered main question headers cannot be continuations of each other
+                    src_is_main_q = bool(re.match(r"^\s*(?:Q\s*\d+|\d+\.)", src_reg.text, re.IGNORECASE))
+                    tgt_is_main_q = bool(re.match(r"^\s*(?:Q\s*\d+|\d+\.)", tgt_reg.text, re.IGNORECASE))
+                    if src_is_main_q and tgt_is_main_q:
+                        rejected_relationships.append({
+                            "source": src_id,
+                            "target": tgt_id,
+                            "rel_type": rel_type,
+                            "reason": f"Semantic contradiction: Independently numbered main question regions '{src_reg.text[:20]}' and '{tgt_reg.text[:20]}' cannot have continuation_of relationship."
+                        })
+                        continue
+
                 relationships.append(
                     RegionRelationship(
                         source_region_id=src_id,
@@ -397,8 +439,8 @@ Return ONLY valid JSON matching this exact schema:
                     )
                 )
 
+
         except Exception as e:
             print(f"[DocumentVisionProvider] JSON validation warning: {e}")
 
-        return hypotheses, relationships
-
+        return hypotheses, relationships, rejected_relationships
