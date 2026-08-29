@@ -140,6 +140,8 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                 page_number=page_number,
                 page_purpose="UNKNOWN",
                 document_purpose="UNKNOWN",
+                structure_source="DETERMINISTIC_FALLBACK",
+                vlm_result="NOT_CONFIGURED",
             )
 
         # Build the page understanding prompt with COMPLETE OCR evidence
@@ -150,20 +152,39 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
             page_context=page_context,
         )
 
-        # Encode page image for VLM
-        page_b64 = self._encode_image(page_image)
+        # Encode page image & validate payload
+        page_b64, mime_type, img_meta = self._encode_image_with_metadata(page_image)
 
-        # Call VLM
-        response_text = self._execute_vlm_call(prompt, page_b64)
+        # Call VLM with metadata tracking
+        response_text, vlm_meta = self._execute_vlm_call_with_metadata(prompt, page_b64, mime_type=mime_type)
+
+        vlm_meta["prompt_chars"] = len(prompt)
+        vlm_meta["image_bytes"] = img_meta.get("byte_size", 0)
+        vlm_meta["base64_chars"] = len(page_b64) if page_b64 else 0
+        if img_meta.get("dimensions"):
+            vlm_meta["image_dimensions"] = [float(img_meta["dimensions"][0]), float(img_meta["dimensions"][1])]
 
         if not response_text:
-            print(f"[VLM] Page {page_number}: VLM returned empty response")
+            print(f"[VLM] Page {page_number}: VLM call failed or returned empty response")
             return VLMPageUnderstanding(
                 page_number=page_number,
                 page_purpose="UNKNOWN",
                 image_sent=page_b64 is not None,
+                image_dimensions=vlm_meta.get("image_dimensions"),
+                image_bytes=vlm_meta.get("image_bytes", 0),
+                base64_chars=vlm_meta.get("base64_chars", 0),
                 ocr_blocks_sent=len(ocr_blocks),
+                prompt_chars=vlm_meta.get("prompt_chars", 0),
+                vlm_attempt=True,
                 vlm_model=self.model_name,
+                structure_source="DETERMINISTIC_FALLBACK",
+                vlm_provider=vlm_meta.get("provider", "gemini"),
+                vlm_result="FAILED",
+                finish_reason=vlm_meta.get("finish_reason", "N/A"),
+                retry_count=vlm_meta.get("retry_count", 0),
+                fallback_provider=vlm_meta.get("fallback_provider", "N/A"),
+                structures_produced=0,
+                relationships_produced=0,
             )
 
         # Parse VLM response into structured page understanding
@@ -172,6 +193,7 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
             page_number=page_number,
             ocr_blocks=ocr_blocks,
             page_b64_sent=page_b64 is not None,
+            vlm_meta=vlm_meta,
         )
 
         return understanding
@@ -249,56 +271,113 @@ Respond in valid JSON:
   ]
 }}"""
 
-    def _encode_image(self, page_image: Any) -> Optional[str]:
-        """Encodes a page image (PIL Image or bytes) to base64 for VLM."""
+    def _encode_image_with_metadata(self, page_image: Any) -> Tuple[Optional[str], str, Dict[str, Any]]:
+        """Encodes a page image (PIL Image or bytes) to base64 for VLM and returns (b64, mime_type, metadata)."""
+        meta = {"valid": False, "dimensions": (0, 0), "byte_size": 0, "b64_valid": False}
+        mime_type = "image/png"
         try:
             if page_image is None:
-                return None
+                return None, mime_type, meta
+
             if isinstance(page_image, bytes):
-                return base64.b64encode(page_image).decode("utf-8")
+                meta["byte_size"] = len(page_image)
+                # Auto-detect MIME type from magic bytes
+                if page_image.startswith(b"\x89PNG"):
+                    mime_type = "image/png"
+                elif page_image.startswith(b"\xff\xd8\xff"):
+                    mime_type = "image/jpeg"
+                elif page_image.startswith(b"RIFF") and b"WEBP" in page_image[:16]:
+                    mime_type = "image/webp"
+
+                # Verify PIL decoding & dimensions
+                from PIL import Image
+                try:
+                    pil_img = Image.open(io.BytesIO(page_image))
+                    meta["dimensions"] = pil_img.size
+                    meta["valid"] = True
+                except Exception as e_pil:
+                    print(f"[VLM] Image bytes PIL decode warning: {e_pil}")
+
+                b64_str = base64.b64encode(page_image).decode("utf-8").replace("\n", "").replace("\r", "").strip()
+                # Verify base64 decoding validity
+                try:
+                    test_dec = base64.b64decode(b64_str[:100] + "==")
+                    meta["b64_valid"] = len(test_dec) > 0
+                except Exception:
+                    meta["b64_valid"] = True
+
+                return b64_str, mime_type, meta
+
             if hasattr(page_image, "save"):  # PIL Image
+                meta["dimensions"] = page_image.size
+                meta["valid"] = True
                 buf = io.BytesIO()
                 page_image.save(buf, format="PNG")
-                return base64.b64encode(buf.getvalue()).decode("utf-8")
+                raw_bytes = buf.getvalue()
+                meta["byte_size"] = len(raw_bytes)
+                b64_str = base64.b64encode(raw_bytes).decode("utf-8").replace("\n", "").replace("\r", "").strip()
+                meta["b64_valid"] = True
+                return b64_str, "image/png", meta
+
         except Exception as e:
             print(f"[VLM] Image encoding error: {e}")
-        return None
+        return None, mime_type, meta
 
-    def _execute_vlm_call(self, prompt: str, image_b64: Optional[str]) -> str:
-        """Executes the actual VLM API call."""
+    def _encode_image(self, page_image: Any) -> Optional[str]:
+        b64, _, _ = self._encode_image_with_metadata(page_image)
+        return b64
+
+    def _execute_vlm_call_with_metadata(self, prompt: str, image_b64: Optional[str], mime_type: str = "image/png") -> Tuple[str, Dict[str, Any]]:
+        """Executes the actual VLM API call with metadata tracking."""
+        default_meta = {
+            "provider": "gemini",
+            "model": self.model_name,
+            "vlm_result": "FAILED",
+            "retry_count": 0,
+            "fallback_used": False,
+            "fallback_provider": "N/A",
+            "structure_source": "DETERMINISTIC_FALLBACK",
+        }
         try:
-            from app.services.llm_provider import llm_complete_multimodal, llm_complete
+            from app.services.llm_provider import llm_complete_multimodal_with_metadata, llm_complete
             import asyncio
 
             async def _run_vlm():
                 if image_b64 and len(image_b64) > 0:
-                    return await llm_complete_multimodal(
+                    return await llm_complete_multimodal_with_metadata(
                         prompt,
                         image_b64=image_b64,
-                        mime_type="image/png",
+                        mime_type=mime_type,
                         purpose="document_vision",
                     )
                 else:
-                    return await llm_complete(prompt, purpose="document_vision")
+                    text = await llm_complete(prompt, purpose="document_vision")
+                    return text, default_meta
 
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+
+                if loop and loop.is_running():
                     import nest_asyncio
                     nest_asyncio.apply()
                     return loop.run_until_complete(_run_vlm())
                 else:
-                    return loop.run_until_complete(_run_vlm())
-            except Exception:
-                try:
                     return asyncio.run(_run_vlm())
-                except Exception as e_run:
-                    print(f"[VLM] VLM call failed: {e_run}")
-                    return ""
+            except Exception as e_run:
+                print(f"[VLM] VLM call failed: {e_run}")
+                return "", default_meta
+
 
         except Exception as e:
             print(f"[VLM] VLM execution error: {e}")
-            return ""
+            return "", default_meta
+
+    def _execute_vlm_call(self, prompt: str, image_b64: Optional[str]) -> str:
+        text, _ = self._execute_vlm_call_with_metadata(prompt, image_b64)
+        return text
 
     def _parse_page_understanding(
         self,
@@ -306,9 +385,11 @@ Respond in valid JSON:
         page_number: int,
         ocr_blocks: List[Block],
         page_b64_sent: bool,
+        vlm_meta: Optional[Dict[str, Any]] = None,
     ) -> VLMPageUnderstanding:
         """Parses VLM JSON response into structured VLMPageUnderstanding, validating region IDs."""
         valid_ids = {b.id for b in ocr_blocks}
+        meta = vlm_meta or {}
 
         try:
             from app.services.llm_provider import extract_json_payload
@@ -318,6 +399,113 @@ Respond in valid JSON:
 
             page_purpose = data.get("page_purpose", "UNKNOWN")
             document_purpose = data.get("document_purpose", "UNKNOWN")
+
+            # Parse structures — validate region IDs against real OCR blocks
+            structures: List[VLMStructureItem] = []
+            for item in data.get("structures", []):
+                raw_ids = item.get("region_ids", [])
+                validated_ids = [rid for rid in raw_ids if rid in valid_ids]
+                if not validated_ids:
+                    continue
+
+                role = item.get("role", "UNKNOWN")
+                role_map = {
+                    "ADMINISTRATIVE": "INSTRUCTION",
+                    "CONTINUATION": "UNKNOWN",
+                }
+                normalized_role = role_map.get(role, role)
+
+                valid_roles = {
+                    "HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER",
+                    "QUESTION", "SUBQUESTION", "OPTION", "TABLE", "TABLE_CELL",
+                    "DIAGRAM", "FIGURE", "ANSWER_SPACE", "UNKNOWN",
+                }
+                if normalized_role not in valid_roles:
+                    normalized_role = "UNKNOWN"
+
+                structures.append(VLMStructureItem(
+                    region_ids=validated_ids,
+                    role=normalized_role,
+                    display_number=item.get("display_number"),
+                    display_label=item.get("display_label"),
+                    reasoning=str(item.get("reasoning", "")),
+                    confidence=float(item.get("confidence", 0.5)),
+                ))
+
+            # Parse relationships — validate all referenced IDs
+            relationships: List[VLMRelationshipItem] = []
+            for rel in data.get("relationships", []):
+                src_ids = [rid for rid in rel.get("source_ids", []) if rid in valid_ids]
+                tgt_ids = [rid for rid in rel.get("target_ids", []) if rid in valid_ids]
+                if not src_ids or not tgt_ids:
+                    continue
+
+                valid_rel_types = {
+                    "follows", "contains", "belongs_to", "continuation_of",
+                    "option_of", "subquestion_of", "section_member",
+                    "associated_visual",
+                }
+                rel_type = rel.get("type", rel.get("relationship_type", "belongs_to"))
+                if rel_type not in valid_rel_types:
+                    rel_type = "belongs_to"
+
+                relationships.append(VLMRelationshipItem(
+                    source_ids=src_ids,
+                    target_ids=tgt_ids,
+                    relationship_type=rel_type,
+                    confidence=float(rel.get("confidence", 0.5)),
+                ))
+
+            struct_source = meta.get("structure_source", "VLM_SUCCESS") if structures else "DETERMINISTIC_FALLBACK"
+
+            return VLMPageUnderstanding(
+                page_number=page_number,
+                page_purpose=page_purpose,
+                document_purpose=document_purpose,
+                structures=structures,
+                relationships=relationships,
+                raw_response=response_text[:2000],
+                vlm_model=meta.get("model", self.model_name),
+                image_sent=page_b64_sent,
+                image_dimensions=meta.get("image_dimensions"),
+                image_bytes=meta.get("image_bytes", 0),
+                base64_chars=meta.get("base64_chars", 0),
+                ocr_blocks_sent=len(ocr_blocks),
+                prompt_chars=meta.get("prompt_chars", 0),
+                vlm_attempt=True,
+                structure_source=struct_source,
+                vlm_provider=meta.get("provider", "gemini"),
+                vlm_result="SUCCESS" if structures else "VLM_NO_STRUCTURES",
+                finish_reason=meta.get("finish_reason", "STOP"),
+                retry_count=meta.get("retry_count", 0),
+                fallback_provider=meta.get("fallback_provider", "N/A"),
+                structures_produced=len(structures),
+                relationships_produced=len(relationships),
+            )
+
+        except Exception as e:
+            print(f"[VLM] Page {page_number}: Parse error: {e}")
+            return VLMPageUnderstanding(
+                page_number=page_number,
+                raw_response=response_text[:500],
+                image_sent=page_b64_sent,
+                image_dimensions=meta.get("image_dimensions"),
+                image_bytes=meta.get("image_bytes", 0),
+                base64_chars=meta.get("base64_chars", 0),
+                ocr_blocks_sent=len(ocr_blocks),
+                prompt_chars=meta.get("prompt_chars", 0),
+                vlm_attempt=True,
+                vlm_model=meta.get("model", self.model_name),
+                structure_source="DETERMINISTIC_FALLBACK",
+                vlm_provider=meta.get("provider", "gemini"),
+                vlm_result="FAILED",
+                finish_reason=meta.get("finish_reason", "N/A"),
+                retry_count=meta.get("retry_count", 0),
+                fallback_provider=meta.get("fallback_provider", "N/A"),
+                structures_produced=0,
+                relationships_produced=0,
+            )
+
 
             # Parse structures — validate region IDs against real OCR blocks
             structures: List[VLMStructureItem] = []

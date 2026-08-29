@@ -899,7 +899,21 @@ class VLMPageUnderstanding(BaseModel):
     raw_response: str = ""
     vlm_model: str = ""
     image_sent: bool = False
+    image_dimensions: Optional[List[float]] = None
+    image_bytes: int = 0
+    base64_chars: int = 0
     ocr_blocks_sent: int = 0
+    prompt_chars: int = 0
+    vlm_attempt: bool = True
+    structure_source: str = "DETERMINISTIC_FALLBACK"
+    vlm_provider: str = "N/A"
+    vlm_result: str = "NOT_ATTEMPTED"
+    finish_reason: str = "N/A"
+    retry_count: int = 0
+    fallback_provider: str = "N/A"
+    structures_produced: int = 0
+    relationships_produced: int = 0
+
 
 
 class DocumentQuestionExtractionResult(BaseModel):

@@ -152,7 +152,8 @@ class TestDocumentIntelligenceCore(unittest.TestCase):
             Block(id="b103", text="(B) Random search", confidence=0.98, bbox=BBox(x=20, y=65, width=150, height=20), page=1),
         ]
         
-        res = self.extractor.extract_validated_questions(blocks=blocks, document_id="doc_ocr")
+        doc_result = self.doc_service.process_document(blocks=blocks, document_id="doc_ocr", force_vlm_verification=False)
+        res = self.extractor.extract_validated_questions(blocks=blocks, document_id="doc_ocr", doc_understanding_result=doc_result)
         q = res.questions[0]
         
         self.assertEqual(q.text, "1. Define hyperparameter tuning.")

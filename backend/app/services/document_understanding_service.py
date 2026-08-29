@@ -173,9 +173,30 @@ class DocumentUnderstandingService:
 
                 if understanding.structures:
                     cost.successful_calls += 1
-                    print(f"[DocUnderstanding] Page {page_num}: VLM identified {len(understanding.structures)} structures, {len(understanding.relationships)} relationships")
                 else:
-                    print(f"[DocUnderstanding] Page {page_num}: VLM returned no structures")
+                    cost.failed_calls += 1
+
+                print(
+                    f"[DocUnderstanding Diagnostic] Page: {page_num} | "
+                    f"Image Present: {understanding.image_sent} | "
+                    f"Image Dimensions: {understanding.image_dimensions or 'N/A'} | "
+                    f"Image Bytes: {understanding.image_bytes} | "
+                    f"Base64 Chars: {understanding.base64_chars} | "
+                    f"OCR Blocks: {understanding.ocr_blocks_sent} | "
+                    f"Prompt Chars: {understanding.prompt_chars} | "
+                    f"VLM Attempt: {understanding.vlm_attempt} | "
+                    f"VLM Provider: {understanding.vlm_provider} | "
+                    f"VLM Model: {understanding.vlm_model} | "
+                    f"VLM Result: {understanding.vlm_result} | "
+                    f"Finish Reason: {understanding.finish_reason} | "
+                    f"Retry Count: {understanding.retry_count} | "
+                    f"Fallback Provider: {understanding.fallback_provider} | "
+                    f"Structure Source: {understanding.structure_source} | "
+                    f"Structures Produced: {understanding.structures_produced} | "
+                    f"Relationships Produced: {understanding.relationships_produced}"
+                )
+
+
 
             # 6. APPLY VLM UNDERSTANDING — VLM is the primary intelligence
             self._apply_vlm_page_understandings(
@@ -345,7 +366,8 @@ class DocumentUnderstandingService:
                         reg.conflicting_hypotheses.append(vlm_hyp)
                     reg.vlm_hypothesis = vlm_hyp
 
-                    if struct.confidence >= 0.60:
+                    if struct.confidence >= 0.60 and struct.role != "UNKNOWN":
+
                         det_agrees = any(
                             h.hypothesized_type == struct.role
                             for h in reg.conflicting_hypotheses

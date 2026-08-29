@@ -51,26 +51,25 @@ def is_openrouter_configured() -> bool:
     return bool(key and len(key) >= 10)
 
 
-async def _call_gemini(
+async def _call_gemini_with_metadata(
     prompt: str,
     image_b64: Optional[str] = None,
     mime_type: str = "image/jpeg",
     purpose: str = "general",
-) -> str:
+) -> Tuple[str, str, int, str]:
+    """Calls Gemini API, returning (text_out, model_name, retry_count, finish_reason)."""
     key = settings.GEMINI_API_KEY.strip()
     if not key or len(key) < 10:
         err_msg = "Gemini API key missing or invalid"
         print(f"[LLM ERROR] provider=gemini model=N/A status=401 error={err_msg} endpoint=generativelanguage.googleapis.com stage={purpose}")
         raise LLMError(err_msg)
 
-    # Currently active & supported Gemini models
     models_to_try = [
-        settings.GEMINI_MODEL or "gemini-flash-lite-latest",
-        "gemini-flash-lite-latest",
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
-        "gemini-2.5-flash-lite",
+        settings.GEMINI_MODEL or "gemini-2.5-flash",
+        "gemini-2.5-flash",
         "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-flash-lite-latest",
     ]
     seen = set()
     models = [m for m in models_to_try if not (m in seen or seen.add(m))]
@@ -80,13 +79,15 @@ async def _call_gemini(
     image_bytes = len(image_b64) if image_present else 0
 
     if image_present:
-        parts.append({"inline_data": {"mime_type": mime_type, "data": image_b64}})
+        clean_b64 = image_b64.replace("\n", "").replace("\r", "").strip()
+        parts.append({"inline_data": {"mime_type": mime_type, "data": clean_b64}})
 
     body = {
         "contents": [{"parts": parts}],
-        "generationConfig": {"maxOutputTokens": 4096, "temperature": 0.1},
+        "generationConfig": {"maxOutputTokens": 8192, "temperature": 0.1},
     }
     last_err = None
+    total_retries = 0
 
     for model_name in models:
         print(
@@ -94,9 +95,10 @@ async def _call_gemini(
             f"multimodal={image_present} image_present={image_present} "
             f"image_bytes={image_bytes} mime_type={mime_type if image_present else 'N/A'}"
         )
-        for attempt in range(2):
+        max_attempts = 3
+        for attempt in range(max_attempts):
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                async with httpx.AsyncClient(timeout=60.0) as client:
                     r = await client.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}",
                         json=body,
@@ -104,44 +106,101 @@ async def _call_gemini(
                     if r.status_code == 200:
                         data = r.json()
                         candidates = data.get("candidates", [])
-                        if candidates and "content" in candidates[0]:
-                            parts_res = candidates[0]["content"].get("parts", [])
-                            if parts_res and "text" in parts_res[0]:
-                                text_out = parts_res[0]["text"]
-                                if text_out and len(text_out.strip()) > 0:
-                                    return text_out.strip()
+                        finish_reason = "STOP"
+                        if candidates and len(candidates) > 0:
+                            finish_reason = candidates[0].get("finishReason", "STOP")
+                            if "content" in candidates[0]:
+                                parts_res = candidates[0]["content"].get("parts", [])
+                                if parts_res and "text" in parts_res[0]:
+                                    text_out = parts_res[0]["text"]
+                                    if text_out and len(text_out.strip()) > 0:
+                                        return text_out.strip(), model_name, total_retries, finish_reason
 
-                    err_snippet = r.text[:120].replace("\n", " ").strip()
+                    err_snippet = r.text[:300].replace("\n", " ").strip()
                     last_err = f"Status {r.status_code} - {err_snippet}"
-                    print(
-                        f"[LLM ERROR] provider=gemini model={model_name} status={r.status_code} "
-                        f"error={err_snippet[:100]} endpoint=generativelanguage.googleapis.com stage={purpose}"
-                    )
 
                     if r.status_code == 429:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                        continue
+                        err_lower = err_snippet.lower()
+                        is_quota = any(q in err_lower for q in ["quota", "resource_exhausted", "free_tier", "daily_limit", "per_day"])
+                        if is_quota:
+                            print(
+                                f"[LLM ERROR] provider=gemini model={model_name} status=429_QUOTA "
+                                f"error={err_snippet[:150]} endpoint=generativelanguage.googleapis.com stage={purpose}"
+                            )
+                            # Project quota exhausted: do NOT cycle through remaining Gemini models sharing the same key!
+                            raise LLMError(f"Gemini API quota exhausted: 429_QUOTA - {err_snippet}")
+                        else:
+                            print(
+                                f"[LLM ERROR] provider=gemini model={model_name} status=429_RATE_LIMIT "
+                                f"error={err_snippet[:150]} endpoint=generativelanguage.googleapis.com stage={purpose}"
+                            )
+                            if attempt < max_attempts - 1:
+                                total_retries += 1
+                                backoff = 1.5 * (attempt + 1)
+                                print(f"[LLM RETRY] provider=gemini model={model_name} transient status=429_RATE_LIMIT. Retrying in {backoff:.1f}s (attempt {attempt + 1}/{max_attempts})...")
+                                await asyncio.sleep(backoff)
+                                continue
+
+                    else:
+                        print(
+                            f"[LLM ERROR] provider=gemini model={model_name} status={r.status_code} "
+                            f"error={err_snippet[:150]} endpoint=generativelanguage.googleapis.com stage={purpose}"
+                        )
+
                     if r.status_code == 404:
                         break  # Move to next Gemini model immediately on 404
 
+                    if r.status_code in TRANSIENT_STATUS:
+                        if attempt < max_attempts - 1:
+                            total_retries += 1
+                            backoff = 1.5 * (attempt + 1)
+                            print(f"[LLM RETRY] provider=gemini model={model_name} transient status={r.status_code}. Retrying in {backoff:.1f}s (attempt {attempt + 1}/{max_attempts})...")
+                            await asyncio.sleep(backoff)
+                            continue
+
+            except LLMError:
+                raise
             except Exception as e:
                 err_str = str(e).split("\n")[0]
                 last_err = err_str
                 print(
                     f"[LLM ERROR] provider=gemini model={model_name} status=500 "
-                    f"error={err_str[:100]} endpoint=generativelanguage.googleapis.com stage={purpose}"
+                    f"error={err_str[:150]} endpoint=generativelanguage.googleapis.com stage={purpose}"
                 )
-                await asyncio.sleep(0.5)
+                if attempt < max_attempts - 1:
+                    total_retries += 1
+                    await asyncio.sleep(1.0)
+                    continue
 
     raise LLMError(f"Gemini API failed across models: {last_err}")
 
 
-async def _call_openrouter(
+async def _call_gemini(
+    prompt: str,
+    image_b64: Optional[str] = None,
+    mime_type: str = "image/jpeg",
+    purpose: str = "general",
+) -> str:
+    text, _, _, _ = await _call_gemini_with_metadata(prompt, image_b64, mime_type, purpose)
+    return text
+
+
+OPENROUTER_VISION_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
+    "google/gemini-flash-1.5:free",
+    "qwen/qwen-2-vl-72b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+    "mistralai/pixtral-12b:free",
+]
+
+
+async def _call_openrouter_with_metadata(
     prompt: str,
     image_b64: Optional[str] = None,
     mime_type: str = "image/png",
     purpose: str = "general",
-) -> str:
+) -> Tuple[str, str, int, str]:
+    """Calls OpenRouter API, returning (text_out, model_name, retry_count, finish_reason)."""
     key = settings.OPENROUTER_API_KEY.strip()
     if not key or len(key) < 10:
         err_msg = "OpenRouter API key missing or invalid"
@@ -161,38 +220,31 @@ async def _call_openrouter(
 
     content_payload: Any = prompt
     if image_present:
+        clean_b64 = image_b64.replace("\n", "").replace("\r", "").strip()
         content_payload = [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{clean_b64}"}},
         ]
 
     models_to_try = []
 
-    # Priority 1: Configured model
-    if settings.OPENROUTER_MODEL:
-        models_to_try.append(settings.OPENROUTER_MODEL)
-
-    # Priority 2: Verified static free models
-    for m in OPENROUTER_FREE_MODELS:
-        if m not in models_to_try:
-            models_to_try.append(m)
-
-    # Priority 3: Dynamic live discovery of free models from OpenRouter API
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            res_m = await client.get("https://openrouter.ai/api/v1/models", headers=headers)
-            if res_m.status_code == 200:
-                live_data = res_m.json().get("data", [])
-                for item in live_data:
-                    mid = item.get("id", "")
-                    pricing = item.get("pricing", {})
-                    if mid.endswith(":free") or (pricing.get("prompt") == "0" and pricing.get("completion") == "0"):
-                        if mid not in models_to_try:
-                            models_to_try.append(mid)
-    except Exception:
-        pass
+    if image_present:
+        if settings.OPENROUTER_MODEL and any(v in settings.OPENROUTER_MODEL for v in ["vision", "flash", "vl", "pixtral"]):
+            models_to_try.append(settings.OPENROUTER_MODEL)
+        for m in OPENROUTER_VISION_MODELS:
+            if m not in models_to_try:
+                models_to_try.append(m)
+    else:
+        if settings.OPENROUTER_MODEL:
+            models_to_try.append(settings.OPENROUTER_MODEL)
+        for m in OPENROUTER_FREE_MODELS:
+            if m not in models_to_try:
+                models_to_try.append(m)
 
     last_err = None
+    retries = 0
+    max_tokens_val = 8192 if image_present else 4096
+
     for model in models_to_try:
         print(
             f"[LLM CALL] purpose={purpose} provider=openrouter model={model} "
@@ -203,34 +255,49 @@ async def _call_openrouter(
             body = {
                 "model": model,
                 "messages": [{"role": "user", "content": content_payload}],
-                "max_tokens": 2048,
+                "max_tokens": max_tokens_val,
             }
-            async with httpx.AsyncClient(timeout=25.0) as client:
+            async with httpx.AsyncClient(timeout=45.0) as client:
                 r = await client.post(url, json=body, headers=headers)
                 if r.status_code == 200:
                     data = r.json()
                     choices = data.get("choices", [])
-                    if choices and "message" in choices[0]:
-                        content = choices[0]["message"].get("content", "")
-                        if content and len(content.strip()) > 0:
-                            return content.strip()
+                    finish_reason = "STOP"
+                    if choices:
+                        finish_reason = choices[0].get("finish_reason", "STOP").upper()
+                        if "message" in choices[0]:
+                            content = choices[0]["message"].get("content", "")
+                            if content and len(content.strip()) > 0:
+                                return content.strip(), model, retries, finish_reason
 
-                err_snippet = r.text[:120].replace("\n", " ").strip()
+                err_snippet = r.text[:200].replace("\n", " ").strip()
                 last_err = f"{model} status {r.status_code} - {err_snippet}"
                 print(
                     f"[LLM ERROR] provider=openrouter model={model} status={r.status_code} "
-                    f"error={err_snippet[:100]} endpoint=openrouter.ai stage={purpose}"
+                    f"error={err_snippet[:150]} endpoint=openrouter.ai stage={purpose}"
                 )
+                retries += 1
         except Exception as e:
             err_str = str(e).split("\n")[0]
             last_err = f"{model} exception: {err_str}"
             print(
                 f"[LLM ERROR] provider=openrouter model={model} status=500 "
-                f"error={err_str[:100]} endpoint=openrouter.ai stage={purpose}"
+                f"error={err_str[:150]} endpoint=openrouter.ai stage={purpose}"
             )
+            retries += 1
             continue
 
     raise LLMError(f"OpenRouter all candidate models failed: {last_err}")
+
+
+async def _call_openrouter(
+    prompt: str,
+    image_b64: Optional[str] = None,
+    mime_type: str = "image/png",
+    purpose: str = "general",
+) -> str:
+    text, _, _, _ = await _call_openrouter_with_metadata(prompt, image_b64, mime_type, purpose)
+    return text
 
 
 _PROVIDERS = {
@@ -264,14 +331,14 @@ async def llm_complete(prompt: str, allow_fallback: bool = True, purpose: str = 
         raise LLMError(f"All configured LLM providers (Gemini -> OpenRouter) failed: {combined_err}")
 
 
-async def llm_complete_multimodal(
+async def llm_complete_multimodal_with_metadata(
     prompt: str,
     image_b64: str,
     mime_type: str = "image/png",
     purpose: str = "document_vision",
-) -> str:
+) -> Tuple[str, Dict[str, Any]]:
     """
-    Explicit multimodal interface for VLM / Document Vision requests.
+    Explicit multimodal interface for VLM / Document Vision requests with metadata tracking.
     Enforces that image_b64 is non-empty and every provider attempt remains multimodal.
     NO SILENT DOWNGRADE TO TEXT-ONLY IS ALLOWED.
     """
@@ -280,25 +347,68 @@ async def llm_complete_multimodal(
 
     async with _llm_sem:
         last_errs = []
-        for name in _ORDER:
-            fn = _PROVIDERS.get(name)
-            if not fn:
-                continue
+
+        # Attempt Gemini
+        if "gemini" in _PROVIDERS and is_gemini_configured():
             try:
-                res = await asyncio.wait_for(
-                    fn(prompt, image_b64=image_b64, mime_type=mime_type, purpose=purpose),
+                res_text, model_used, retries, finish_reason = await asyncio.wait_for(
+                    _call_gemini_with_metadata(prompt, image_b64=image_b64, mime_type=mime_type, purpose=purpose),
                     timeout=60.0,
                 )
-                if res and len(res.strip()) > 0:
-                    return res
+                if res_text and len(res_text.strip()) > 0:
+                    source = "VLM_RETRY_SUCCESS" if retries > 0 else "VLM_SUCCESS"
+                    meta = {
+                        "provider": "gemini",
+                        "model": model_used,
+                        "vlm_result": "SUCCESS",
+                        "finish_reason": finish_reason,
+                        "retry_count": retries,
+                        "fallback_used": False,
+                        "fallback_provider": "N/A",
+                        "structure_source": source,
+                    }
+                    return res_text, meta
             except Exception as e:
                 err_msg = str(e).split("\n")[0]
-                last_errs.append(f"{name}: {err_msg}")
-                print(f"[LLM FALLBACK] Multimodal provider '{name}' failed for purpose '{purpose}'. Trying next provider...")
-                continue
+                last_errs.append(f"gemini: {err_msg}")
+                print(f"[LLM FALLBACK] Multimodal provider 'gemini' failed for purpose '{purpose}'. Trying OpenRouter...")
+
+        # Attempt OpenRouter
+        if "openrouter" in _PROVIDERS and is_openrouter_configured():
+            try:
+                res_text, model_used, retries, finish_reason = await asyncio.wait_for(
+                    _call_openrouter_with_metadata(prompt, image_b64=image_b64, mime_type=mime_type, purpose=purpose),
+                    timeout=60.0,
+                )
+                if res_text and len(res_text.strip()) > 0:
+                    meta = {
+                        "provider": "openrouter",
+                        "model": model_used,
+                        "vlm_result": "SUCCESS",
+                        "finish_reason": finish_reason,
+                        "retry_count": retries,
+                        "fallback_used": True,
+                        "fallback_provider": "openrouter",
+                        "structure_source": "OPENROUTER_VLM_SUCCESS",
+                    }
+                    return res_text, meta
+            except Exception as e:
+                err_msg = str(e).split("\n")[0]
+                last_errs.append(f"openrouter: {err_msg}")
 
         combined_err = " | ".join(last_errs)
         raise VLMError(f"No configured vision-capable provider succeeded: {combined_err}")
+
+
+async def llm_complete_multimodal(
+    prompt: str,
+    image_b64: str,
+    mime_type: str = "image/png",
+    purpose: str = "document_vision",
+) -> str:
+    text, _ = await llm_complete_multimodal_with_metadata(prompt, image_b64, mime_type, purpose)
+    return text
+
 
 
 def _repair_truncated_json(json_str: str) -> Any:
