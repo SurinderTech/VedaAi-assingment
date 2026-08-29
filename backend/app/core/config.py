@@ -66,6 +66,9 @@ class Settings:
     DOCUMENT_VLM_TIMEOUT: float = float(os.getenv("DOCUMENT_VLM_TIMEOUT", "30.0"))
     DOCUMENT_VLM_MAX_PAGES_PER_REQUEST: int = int(os.getenv("DOCUMENT_VLM_MAX_PAGES_PER_REQUEST", "5"))
     DOCUMENT_VLM_MAX_REGIONS_PER_REQUEST: int = int(os.getenv("DOCUMENT_VLM_MAX_REGIONS_PER_REQUEST", "20"))
+    DOCUMENT_VLM_CONFIDENCE_THRESHOLD: float = float(os.getenv("DOCUMENT_VLM_CONFIDENCE_THRESHOLD", "0.80"))
+    # Page-level VLM document understanding (primary intelligence mode)
+    DOCUMENT_VLM_PAGE_UNDERSTANDING: bool = os.getenv("DOCUMENT_VLM_PAGE_UNDERSTANDING", "true").lower() == "true"
     # Step 11C Intelligent Extraction Settings
     INTELLIGENT_EXTRACTION_ENABLED: bool = os.getenv("INTELLIGENT_EXTRACTION_ENABLED", "true").lower() == "true"
 

@@ -826,6 +826,10 @@ class DocumentUnderstandingResult(BaseModel):
     verification_summary: Dict[str, Any] = {}
     cost_accounting: Optional[CostAccounting] = None
     metadata: Dict[str, Any] = {}
+    structure_graph: Optional[DocumentStructureGraph] = None
+    vlm_page_understandings: List[Any] = []  # List[VLMPageUnderstanding] (forward ref)
+    document_purpose: str = "UNKNOWN"
+    page_roles: Dict[int, str] = {}
 
 
 # ============================================================
@@ -867,6 +871,37 @@ class ExtractionAudit(BaseModel):
 ExtractedQuestion = Question
 
 
+class VLMStructureItem(BaseModel):
+    """One structural element identified by the VLM's page understanding."""
+    region_ids: List[str] = []
+    role: DocumentRegionType = "UNKNOWN"
+    display_number: Optional[str] = None
+    display_label: Optional[str] = None
+    reasoning: str = ""
+    confidence: float = 0.5
+
+
+class VLMRelationshipItem(BaseModel):
+    """One relationship identified by the VLM between structural elements."""
+    source_ids: List[str] = []
+    target_ids: List[str] = []
+    relationship_type: str = "belongs_to"
+    confidence: float = 0.5
+
+
+class VLMPageUnderstanding(BaseModel):
+    """The VLM's independent understanding of a single document page."""
+    page_number: int
+    page_purpose: str = "UNKNOWN"
+    document_purpose: str = "UNKNOWN"
+    structures: List[VLMStructureItem] = []
+    relationships: List[VLMRelationshipItem] = []
+    raw_response: str = ""
+    vlm_model: str = ""
+    image_sent: bool = False
+    ocr_blocks_sent: int = 0
+
+
 class DocumentQuestionExtractionResult(BaseModel):
     document_id: str
     questions: List[ExtractedQuestion] = []
@@ -878,7 +913,9 @@ class DocumentQuestionExtractionResult(BaseModel):
     invariant_violations: List[str] = []
 
 
-
+VLMStructureItem.model_rebuild()
+VLMRelationshipItem.model_rebuild()
+VLMPageUnderstanding.model_rebuild()
 DocumentEvidence.model_rebuild()
 StructureHypothesis.model_rebuild()
 RegionRelationship.model_rebuild()

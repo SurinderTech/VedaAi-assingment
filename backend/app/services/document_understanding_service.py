@@ -1,12 +1,16 @@
 """
-Step 11B — Universal Document Understanding Orchestration Service.
+Document Understanding Service — VLM-First Architecture.
 
-Converts OCR outputs and document page structures into a structured, evidence-backed
-DocumentUnderstandingResult with rich multi-hypothesis region types, parent-child
-relationships, spatial/semantic signals, conflict representation, selective VLM provider verification,
-and provider-agnostic evidence fusion.
+Architecture:
+  Page Image + OCR Evidence → VLM DOCUMENT BRAIN → Evidence Fusion → Structure Graph
 
-Strictly provider-agnostic: document_understanding_service.py contains zero vendor-specific code.
+The VLM is the primary document-understanding intelligence.
+Deterministic analysis (regex, position, keywords) provides EVIDENCE, not AUTHORITY.
+The structure graph is built BEFORE question extraction and drives it.
+
+When VLM is disabled, deterministic analysis is the sole evidence source
+and the graph is built from deterministic hypotheses alone.
+
 Preserves 100% of original OCR geometry, BBoxes, and text without alteration.
 """
 from __future__ import annotations
@@ -28,6 +32,11 @@ from app.models.schemas import (
     RelationshipType,
     CostAccounting,
     VisualVerificationResponse,
+    VLMPageUnderstanding,
+    VLMStructureItem,
+    DocumentStructureGraph,
+    GraphNode,
+    GraphEdge,
 )
 from app.services.document_vision_provider import DocumentVisionProvider, MultimodalDocumentVisionProvider
 from app.services.embedding_service import embed_texts
@@ -36,8 +45,15 @@ from app.services.evidence_fusion_service import EvidenceFusionService
 
 class DocumentUnderstandingService:
     """
-    Orchestration service for building structured multi-modal document representations.
-    Contains selective VLM routing and provider-agnostic evidence fusion.
+    Orchestration service for building structured document representations.
+
+    Flow:
+    1. Create DocumentRegions from OCR blocks (preserving exact geometry)
+    2. Generate deterministic hypotheses (as EVIDENCE, not authority)
+    3. If VLM enabled: call understand_page() for EACH page
+    4. Fuse VLM understanding + deterministic evidence
+    5. Build DocumentStructureGraph from fused evidence
+    6. Return result with populated graph for downstream extraction
     """
 
     def __init__(self, vision_provider: Optional[DocumentVisionProvider] = None):
@@ -49,12 +65,13 @@ class DocumentUnderstandingService:
         blocks: List[Block],
         document_id: str = "doc_1",
         page_sizes: Optional[Dict[int, List[float]]] = None,
-        page_images: Optional[Dict[int, bytes]] = None,
+        page_images: Optional[Dict[int, Any]] = None,
         attach_embeddings: bool = True,
         force_vlm_verification: bool = False,
     ) -> DocumentUnderstandingResult:
         """
-        Converts low-level OCR blocks into a verified DocumentUnderstandingResult.
+        Converts low-level OCR blocks into a verified DocumentUnderstandingResult
+        with a populated DocumentStructureGraph.
         """
         if not blocks:
             return DocumentUnderstandingResult(
@@ -68,7 +85,7 @@ class DocumentUnderstandingService:
                 metadata={"block_count": 0},
             )
 
-        # 1. Group blocks by page and preserve order
+        # 1. Group blocks by page
         pages_dict: Dict[int, List[Block]] = {}
         for block in blocks:
             pages_dict.setdefault(block.page, []).append(block)
@@ -78,7 +95,7 @@ class DocumentUnderstandingService:
         all_relationships: List[RegionRelationship] = []
         global_conflicts: List[Dict[str, Any]] = []
 
-        # Process each page (Step 11A initial analysis)
+        # 2. Create regions from blocks and generate deterministic evidence
         for page_num in sorted(pages_dict.keys()):
             page_blocks = pages_dict[page_num]
             p_width = 1000.0
@@ -98,83 +115,347 @@ class DocumentUnderstandingService:
             global_conflicts.extend(page_conflicts)
 
             reading_order = [r.region_id for r in page_regions]
-            doc_pages.append(
-                DocumentPage(
-                    page_number=page_num,
-                    width=p_width,
-                    height=p_height,
-                    regions=page_regions,
-                    reading_order=reading_order,
-                )
-            )
+            doc_pages.append(DocumentPage(
+                page_number=page_num,
+                width=p_width,
+                height=p_height,
+                regions=page_regions,
+                reading_order=reading_order,
+            ))
 
-        # 2. Extract cross-page relationships (e.g. continuation_of across pages)
+        # 3. Cross-page relationships
         cross_page_rels = self._extract_cross_page_relationships(doc_pages)
         all_relationships.extend(cross_page_rels)
 
-        # 3. Attach dense vector embeddings via Step 8 embedding service if enabled
+        # 4. Attach embeddings
         if attach_embeddings and getattr(settings, "EMBEDDING_ENGINE_ENABLED", True):
             self._attach_embeddings(all_doc_regions)
 
-        # 4. SELECTIVE VLM VERIFICATION ROUTER
-        # Selective VLM verification logic:
-        # High confidence consistent regions -> SKIP VLM
-        # Ambiguous / conflicting regions -> VLM VERIFY
-        target_ids_to_verify: List[str] = []
-        skipped_count = 0
+        # 5. PAGE-LEVEL VLM DOCUMENT UNDERSTANDING
+        vlm_page_understandings: List[VLMPageUnderstanding] = []
+        vlm_enabled = getattr(settings, "DOCUMENT_VLM_ENABLED", False) or force_vlm_verification
+        vlm_page_mode = getattr(settings, "DOCUMENT_VLM_PAGE_UNDERSTANDING", True)
+        total_pages = len(doc_pages)
+        cost = CostAccounting(
+            pages_considered=total_pages,
+            regions_considered=len(all_doc_regions),
+        )
 
-        for r in all_doc_regions:
-            conf_threshold = getattr(settings, "DOCUMENT_VLM_CONFIDENCE_THRESHOLD", 0.80)
-            is_ambiguous = r.classification_conflict or (r.confidence < conf_threshold) or (r.region_type in ("TABLE", "DIAGRAM", "UNKNOWN"))
-            if force_vlm_verification or is_ambiguous:
-                target_ids_to_verify.append(r.region_id)
-            else:
-                skipped_count += 1
+        if vlm_enabled and vlm_page_mode and isinstance(self.vision_provider, MultimodalDocumentVisionProvider):
+            print(f"[DocUnderstanding] VLM Page Intelligence: Processing {total_pages} page(s)")
 
-        res_initial = DocumentUnderstandingResult(
+            for page_obj in doc_pages:
+                page_num = page_obj.page_number
+                page_blocks = pages_dict.get(page_num, [])
+
+                # Get page image
+                page_img = None
+                if page_images and page_num in page_images:
+                    page_img = page_images[page_num]
+
+                # Build page context from neighboring pages
+                page_context = self._build_page_context(page_num, pages_dict, total_pages)
+
+                # VLM understands this page
+                understanding = self.vision_provider.understand_page(
+                    page_image=page_img,
+                    ocr_blocks=page_blocks,
+                    page_number=page_num,
+                    total_pages=total_pages,
+                    page_context=page_context,
+                    force_vlm=force_vlm_verification,
+                )
+
+                vlm_page_understandings.append(understanding)
+                cost.vlm_calls += 1
+                cost.pages_sent += 1 if understanding.image_sent else 0
+                cost.regions_sent += understanding.ocr_blocks_sent
+
+                if understanding.structures:
+                    cost.successful_calls += 1
+                    print(f"[DocUnderstanding] Page {page_num}: VLM identified {len(understanding.structures)} structures, {len(understanding.relationships)} relationships")
+                else:
+                    print(f"[DocUnderstanding] Page {page_num}: VLM returned no structures")
+
+            # 6. APPLY VLM UNDERSTANDING — VLM is the primary intelligence
+            self._apply_vlm_page_understandings(
+                vlm_understandings=vlm_page_understandings,
+                all_regions=all_doc_regions,
+                all_relationships=all_relationships,
+                pages_dict=pages_dict,
+            )
+
+            vlm_status = "SUCCESS" if any(u.structures for u in vlm_page_understandings) else "VLM_NO_STRUCTURES"
+        elif vlm_enabled and not vlm_page_mode:
+            # Legacy selective verification mode
+            vlm_status = "LEGACY_MODE"
+        else:
+            vlm_status = "NOT_CONFIGURED"
+
+        # 7. BUILD STRUCTURE GRAPH — this drives extraction
+        raw_inferred_purpose = "UNKNOWN"
+        inferred_roles: Dict[int, str] = {}
+        for u in vlm_page_understandings:
+            if u.document_purpose and u.document_purpose != "UNKNOWN":
+                raw_inferred_purpose = u.document_purpose
+            if u.page_purpose and u.page_purpose != "UNKNOWN":
+                inferred_roles[u.page_number] = u.page_purpose
+
+        # Normalize purpose to schema DocumentPurpose literal
+        purpose_map = {
+            "EXAMINATION_PAPER": "QUESTION_PAPER",
+            "QUESTION_PAPER": "QUESTION_PAPER",
+            "EXAM": "QUESTION_PAPER",
+            "ASSIGNMENT": "QUESTION_PAPER",
+            "INSTRUCTIONS": "INSTRUCTIONS",
+            "COVER": "COVER",
+            "ANSWER_KEY": "ANSWER_KEY",
+            "REFERENCE": "REFERENCE",
+        }
+        inferred_purpose = purpose_map.get(raw_inferred_purpose, "UNKNOWN")
+
+        # Fallback: if no VLM, infer from deterministic evidence
+        if inferred_purpose == "UNKNOWN":
+            q_count = sum(1 for r in all_doc_regions if r.region_type == "QUESTION")
+            if q_count > 0:
+                inferred_purpose = "QUESTION_PAPER"
+
+        for page_obj in doc_pages:
+            if page_obj.page_number not in inferred_roles:
+                page_regs = [r for r in all_doc_regions if r.page == page_obj.page_number]
+                q_on_page = sum(1 for r in page_regs if r.region_type == "QUESTION")
+                if q_on_page > 0:
+                    inferred_roles[page_obj.page_number] = "QUESTION_PAGE"
+                else:
+                    meta_on_page = sum(1 for r in page_regs if r.region_type in ("HEADER", "METADATA", "INSTRUCTION", "FOOTER"))
+                    if meta_on_page > len(page_regs) * 0.6:
+                        inferred_roles[page_obj.page_number] = "ADMINISTRATIVE"
+                    else:
+                        inferred_roles[page_obj.page_number] = "MIXED"
+
+        structure_graph = self._build_structure_graph(
+            all_regions=all_doc_regions,
+            all_relationships=all_relationships,
+            document_purpose=inferred_purpose,
+            page_roles=inferred_roles,
+        )
+
+        # 8. Evidence Fusion
+        result = DocumentUnderstandingResult(
             document_id=document_id,
             pages=doc_pages,
             regions=all_doc_regions,
             relationships=all_relationships,
             conflicts=global_conflicts,
-            vlm_status="NOT_CONFIGURED",
-            cost_accounting=CostAccounting(
-                pages_considered=len(doc_pages),
-                regions_considered=len(all_doc_regions),
-                skipped_high_confidence_count=skipped_count,
-            ),
+            vlm_status=vlm_status,
+            cost_accounting=cost,
+            structure_graph=structure_graph,
+            vlm_page_understandings=vlm_page_understandings,
+            document_purpose=inferred_purpose,
+            page_roles=inferred_roles,
             metadata={
                 "total_blocks": len(blocks),
-                "total_pages": len(doc_pages),
+                "total_pages": total_pages,
                 "total_regions": len(all_doc_regions),
                 "total_relationships": len(all_relationships),
                 "total_conflicts": len(global_conflicts),
-                "skipped_high_confidence": skipped_count,
-                "regions_targeted_for_vlm": len(target_ids_to_verify),
+                "vlm_pages_processed": len(vlm_page_understandings),
+                "vlm_structures_found": sum(len(u.structures) for u in vlm_page_understandings),
             },
         )
 
-        # Invoke VLM provider boundary only if targeted regions exist or forced
-        vlm_response: Optional[VisualVerificationResponse] = None
-        if target_ids_to_verify or force_vlm_verification:
-            vlm_response = self.vision_provider.verify_structure(
-                result=res_initial,
-                page_images=page_images,
-                target_region_ids=target_ids_to_verify,
-                force_vlm_verification=force_vlm_verification,
-            )
-            res_initial.vlm_status = vlm_response.status
-            if vlm_response.cost_accounting:
-                res_initial.cost_accounting = vlm_response.cost_accounting
-            if vlm_response.rejected_vlm_relationships:
-                res_initial.metadata["rejected_vlm_relationships"] = vlm_response.rejected_vlm_relationships
-
-
-
-        # 5. PROVIDER-AGNOSTIC EVIDENCE FUSION
-        final_result = self.fusion_service.fuse_document_evidence(res_initial, vlm_response)
+        # Apply evidence fusion (upgrades verification states)
+        vlm_response = None  # Page understanding replaces old verify_structure response
+        final_result = self.fusion_service.fuse_document_evidence(result, vlm_response)
 
         return final_result
+
+    def _build_page_context(
+        self, page_num: int, pages_dict: Dict[int, List[Block]], total_pages: int
+    ) -> Dict[str, Any]:
+        """Builds context from neighboring pages for VLM."""
+        context: Dict[str, Any] = {}
+
+        # Previous page summary
+        if page_num > 1 and (page_num - 1) in pages_dict:
+            prev_blocks = pages_dict[page_num - 1]
+            prev_texts = [b.text for b in sorted(prev_blocks, key=lambda b: b.bbox.y)[:5]]
+            context["prev_page_summary"] = " | ".join(prev_texts)[:200]
+
+        # Next page summary
+        if page_num < total_pages and (page_num + 1) in pages_dict:
+            next_blocks = pages_dict[page_num + 1]
+            next_texts = [b.text for b in sorted(next_blocks, key=lambda b: b.bbox.y)[:5]]
+            context["next_page_summary"] = " | ".join(next_texts)[:200]
+
+        return context
+
+    def _apply_vlm_page_understandings(
+        self,
+        vlm_understandings: List[VLMPageUnderstanding],
+        all_regions: List[DocumentRegion],
+        all_relationships: List[RegionRelationship],
+        pages_dict: Dict[int, List[Block]],
+    ) -> None:
+        """
+        Applies VLM page understanding as the PRIMARY intelligence source.
+
+        The VLM's structural analysis OVERRIDES deterministic hypotheses
+        when the VLM has sufficient confidence.
+
+        Deterministic analysis remains as a fallback evidence source
+        for regions the VLM didn't address.
+        """
+        region_map = {r.region_id: r for r in all_regions}
+
+        for understanding in vlm_understandings:
+            if not understanding.structures:
+                continue
+
+            # Apply VLM structural decisions to regions
+            vlm_assigned_ids: Set[str] = set()
+
+            for struct in understanding.structures:
+                for region_id in struct.region_ids:
+                    if region_id not in region_map:
+                        continue
+
+                    reg = region_map[region_id]
+                    vlm_assigned_ids.add(region_id)
+
+                    # VLM hypothesis is the primary evidence source
+                    vlm_hyp = StructureHypothesis(
+                        region_id=region_id,
+                        hypothesized_type=struct.role,
+                        confidence=struct.confidence,
+                        source="vlm_page_understanding",
+                        evidence=[DocumentEvidence(
+                            signal_type="visual_vlm_verification",
+                            description=f"VLM page understanding: {struct.reasoning}",
+                            weight=0.9,
+                            score=struct.confidence,
+                        )],
+                    )
+
+                    # Attach VLM hypothesis — it has highest weight
+                    existing_sources = {h.source for h in reg.conflicting_hypotheses}
+                    if "vlm_page_understanding" not in existing_sources:
+                        reg.conflicting_hypotheses.append(vlm_hyp)
+                    reg.vlm_hypothesis = vlm_hyp
+
+                    # VLM is primary: set region type from VLM when confidence sufficient
+                    if struct.confidence >= 0.60:
+                        # Check if deterministic agrees — if so, boost confidence
+                        det_agrees = any(
+                            h.hypothesized_type == struct.role
+                            for h in reg.conflicting_hypotheses
+                            if h.source != "vlm_page_understanding"
+                        )
+
+                        if det_agrees:
+                            reg.region_type = struct.role
+                            reg.confidence = min(1.0, struct.confidence + 0.05)
+                            reg.verification_state = "VERIFIED"
+                            reg.classification_conflict = False
+                        else:
+                            # VLM disagrees with deterministic — VLM takes priority
+                            # but mark the conflict
+                            old_type = reg.region_type
+                            reg.region_type = struct.role
+                            reg.confidence = struct.confidence
+                            if old_type != "UNKNOWN" and old_type != struct.role:
+                                reg.classification_conflict = True
+                                reg.verification_state = "VERIFIED"  # VLM verified, even if different from regex
+                            else:
+                                reg.verification_state = "VERIFIED"
+                    else:
+                        # Low VLM confidence — mark uncertain
+                        reg.verification_state = "UNCERTAIN"
+                        reg.uncertainty = 1.0 - struct.confidence
+
+                    reg.evidence.append(DocumentEvidence(
+                        signal_type="visual_vlm_verification",
+                        description=f"VLM: {struct.reasoning[:100]}",
+                        weight=0.9,
+                        score=struct.confidence,
+                    ))
+
+            # Apply VLM relationships
+            for rel in understanding.relationships:
+                for src_id in rel.source_ids:
+                    for tgt_id in rel.target_ids:
+                        if src_id in region_map and tgt_id in region_map:
+                            # Check for duplicates
+                            existing_key = (src_id, tgt_id, rel.relationship_type)
+                            already_exists = any(
+                                (r.source_region_id, r.target_region_id, r.relationship_type) == existing_key
+                                for r in all_relationships
+                            )
+                            if not already_exists:
+                                all_relationships.append(RegionRelationship(
+                                    source_region_id=src_id,
+                                    target_region_id=tgt_id,
+                                    relationship_type=rel.relationship_type,
+                                    confidence=rel.confidence,
+                                    evidence=[DocumentEvidence(
+                                        signal_type="visual_vlm_verification",
+                                        description=f"VLM relationship: {rel.relationship_type}",
+                                        weight=0.9,
+                                        score=rel.confidence,
+                                    )],
+                                ))
+
+    def _build_structure_graph(
+        self,
+        all_regions: List[DocumentRegion],
+        all_relationships: List[RegionRelationship],
+        document_purpose: str,
+        page_roles: Dict[int, str],
+    ) -> DocumentStructureGraph:
+        """
+        Constructs the DocumentStructureGraph from fused evidence.
+
+        This graph is the PRIMARY input for question extraction.
+        It is built BEFORE extraction, not as an output report.
+        """
+        nodes: Dict[str, GraphNode] = {}
+        for r in all_regions:
+            nodes[r.region_id] = GraphNode(
+                region_id=r.region_id,
+                role=r.region_type,
+                text=r.text,
+                page=r.page,
+                bbox=r.bbox,
+                confidence=r.confidence,
+            )
+
+        edges: List[GraphEdge] = []
+        for rel in all_relationships:
+            evidence_sources = [e.signal_type for e in rel.evidence] if rel.evidence else []
+            edges.append(GraphEdge(
+                source_id=rel.source_region_id,
+                target_id=rel.target_region_id,
+                relationship=rel.relationship_type,
+                confidence=rel.confidence,
+                evidence_sources=evidence_sources,
+            ))
+
+        return DocumentStructureGraph(
+            nodes=nodes,
+            edges=edges,
+            document_purpose=document_purpose,
+            page_roles=page_roles,
+        )
+
+    # Legacy method preserved for backward compatibility
+    def build_structure_graph(self, doc_result: DocumentUnderstandingResult) -> DocumentStructureGraph:
+        """Legacy method: builds graph from a DocumentUnderstandingResult."""
+        return self._build_structure_graph(
+            all_regions=doc_result.regions,
+            all_relationships=doc_result.relationships,
+            document_purpose=doc_result.document_purpose or "UNKNOWN",
+            page_roles=doc_result.page_roles or {},
+        )
 
     def _process_page(
         self,
@@ -183,12 +464,12 @@ class DocumentUnderstandingService:
         page_width: float,
         page_height: float,
     ) -> Tuple[List[DocumentRegion], List[RegionRelationship], List[Dict[str, Any]]]:
-        """Processes blocks on a single page into DocumentRegions and Relationships."""
+        """Processes blocks on a single page into DocumentRegions with deterministic evidence."""
         doc_regions: List[DocumentRegion] = []
         page_relationships: List[RegionRelationship] = []
         page_conflicts: List[Dict[str, Any]] = []
 
-        # Step A: Create basic DocumentRegion for each Block preserving exact BBox & text
+        # Create DocumentRegion for each Block preserving exact BBox & text
         for b in page_blocks:
             exact_bbox = BBox(x=b.bbox.x, y=b.bbox.y, width=b.bbox.width, height=b.bbox.height)
             reg = DocumentRegion(
@@ -209,31 +490,27 @@ class DocumentUnderstandingService:
             )
             doc_regions.append(reg)
 
-        # Step B: Gather evidence and hypotheses for each region
+        # Generate deterministic hypotheses (EVIDENCE, not authority)
         for reg in doc_regions:
             self._analyze_region_hypotheses(reg, page_width, page_height)
-
             if reg.classification_conflict:
-                page_conflicts.append(
-                    {
-                        "region_id": reg.region_id,
-                        "page": reg.page,
-                        "text": reg.text[:60],
-                        "hypotheses": [
-                            {"type": h.hypothesized_type, "confidence": h.confidence, "source": h.source}
-                            for h in reg.conflicting_hypotheses
-                        ],
-                    }
-                )
+                page_conflicts.append({
+                    "region_id": reg.region_id,
+                    "page": reg.page,
+                    "text": reg.text[:60],
+                    "hypotheses": [
+                        {"type": h.hypothesized_type, "confidence": h.confidence, "source": h.source}
+                        for h in reg.conflicting_hypotheses
+                    ],
+                })
 
-        # Step C: Establish intra-page relationships
+        # Establish intra-page relationships
         intra_rels = self._extract_intra_page_relationships(doc_regions)
         page_relationships.extend(intra_rels)
 
         rel_map: Dict[str, List[RegionRelationship]] = {}
         for rel in intra_rels:
             rel_map.setdefault(rel.source_region_id, []).append(rel)
-
         for reg in doc_regions:
             reg.relationships = rel_map.get(reg.region_id, [])
 
@@ -242,10 +519,13 @@ class DocumentUnderstandingService:
     def _analyze_region_hypotheses(
         self, reg: DocumentRegion, page_width: float, page_height: float
     ) -> None:
-        """Collects evidence and generates multi-source structure hypotheses for a region."""
+        """
+        Generates deterministic hypotheses for a region.
+        These are EVIDENCE sources, not final classifications.
+        The VLM's page understanding takes priority when available.
+        """
         text = reg.text.strip()
         bbox = reg.bbox
-
         hypotheses: List[StructureHypothesis] = []
 
         # 1. PARSER HYPOTHESIS (Text-pattern based)
@@ -254,122 +534,90 @@ class DocumentUnderstandingService:
         parser_conf = 0.5
 
         q_num_match = re.search(
-            r"^(?:Q(?:uestion)?[\s\.\:]*)?(\d+|[IVXLCDM]+)[\.\:\)\s]+", text, re.IGNORECASE
+            r"^(?:Q(?:uestion)?[\s\.\\:]*)?\d+[\.\)\:\s]+", text, re.IGNORECASE
         )
         subq_match = re.search(r"^\(?([a-z]|[ivxlcdm]+)\)[\.\:\s]+", text, re.IGNORECASE)
         interrogative_match = re.search(
             r"\b(what|why|how|explain|describe|calculate|evaluate|find|prove|derive|compare|define|list|state|discuss|show|write|determine|solve|select|choose|identify|mark|indicate)\b",
-            text,
-            re.IGNORECASE,
+            text, re.IGNORECASE,
         )
 
         if q_num_match:
-            parser_ev.append(
-                DocumentEvidence(
-                    signal_type="numbering_pattern",
-                    description=f"Matched primary question numbering pattern '{q_num_match.group(0).strip()}'",
-                    weight=0.4,
-                    score=0.9,
-                )
-            )
-
+            parser_ev.append(DocumentEvidence(
+                signal_type="numbering_pattern",
+                description=f"Matched primary question numbering pattern '{q_num_match.group(0).strip()}'",
+                weight=0.4, score=0.9,
+            ))
         if subq_match and not q_num_match:
-            parser_ev.append(
-                DocumentEvidence(
-                    signal_type="numbering_pattern",
-                    description=f"Matched subquestion numbering pattern '{subq_match.group(0).strip()}'",
-                    weight=0.4,
-                    score=0.85,
-                )
-            )
-
+            parser_ev.append(DocumentEvidence(
+                signal_type="numbering_pattern",
+                description=f"Matched subquestion numbering pattern '{subq_match.group(0).strip()}'",
+                weight=0.4, score=0.85,
+            ))
         if interrogative_match:
-            parser_ev.append(
-                DocumentEvidence(
-                    signal_type="question_interrogative",
-                    description=f"Contains question interrogative keyword '{interrogative_match.group(1)}'",
-                    weight=0.3,
-                    score=0.8,
-                )
-            )
+            parser_ev.append(DocumentEvidence(
+                signal_type="question_interrogative",
+                description=f"Contains question keyword '{interrogative_match.group(1)}'",
+                weight=0.3, score=0.8,
+            ))
 
         opt_match = re.search(
             r"^\(?[A-Da-d1-9i-zIVXLCDM]+\)[\.\:\s]+|^(?:Option|Choice)\s+[\(]?[A-Za-z0-9ivxlcdm]+\)?[\.\:\s]*",
-            text,
-            re.IGNORECASE,
+            text, re.IGNORECASE,
         )
         if opt_match and not interrogative_match:
-            parser_ev.append(
-                DocumentEvidence(
-                    signal_type="option_formatting",
-                    description=f"Matched option pattern '{opt_match.group(0).strip()}'",
-                    weight=0.5,
-                    score=0.95,
-                )
-            )
+            parser_ev.append(DocumentEvidence(
+                signal_type="option_formatting",
+                description=f"Matched option pattern '{opt_match.group(0).strip()}'",
+                weight=0.5, score=0.95,
+            ))
 
         inst_match = re.search(
             r"^\s*(?:Note|Instructions|General Instructions|Notice|Read carefully|Answer all|All questions carry)[\s\:\-\.]",
-            text,
-            re.IGNORECASE,
+            text, re.IGNORECASE,
         )
         if inst_match:
-            parser_ev.append(
-                DocumentEvidence(
-                    signal_type="section_formatting",
-                    description=f"Matched instruction keyword pattern '{inst_match.group(0).strip()}'",
-                    weight=0.5,
-                    score=0.9,
-                )
-            )
+            parser_ev.append(DocumentEvidence(
+                signal_type="section_formatting",
+                description=f"Matched instruction keyword pattern",
+                weight=0.5, score=0.9,
+            ))
 
         sec_match = re.search(
             r"^\s*(?:SECTION|PART|GROUP|UNIT|CHAPTER)\s+[\-–\s]*[A-Z0-9IVX]+", text, re.IGNORECASE
         )
         if sec_match:
-            parser_ev.append(
-                DocumentEvidence(
-                    signal_type="heading_formatting",
-                    description=f"Matched section header pattern '{sec_match.group(0).strip()}'",
-                    weight=0.5,
-                    score=0.95,
-                )
-            )
+            parser_ev.append(DocumentEvidence(
+                signal_type="heading_formatting",
+                description=f"Matched section header pattern '{sec_match.group(0).strip()}'",
+                weight=0.5, score=0.95,
+            ))
 
         if sec_match:
-            parser_type = "SECTION_HEADER"
-            parser_conf = 0.95
+            parser_type = "SECTION_HEADER"; parser_conf = 0.95
         elif inst_match:
-            parser_type = "INSTRUCTION"
-            parser_conf = 0.90
+            parser_type = "INSTRUCTION"; parser_conf = 0.90
         elif opt_match and not interrogative_match:
-            parser_type = "OPTION"
-            parser_conf = 0.88
+            parser_type = "OPTION"; parser_conf = 0.88
         elif q_num_match and interrogative_match:
-            parser_type = "QUESTION"
-            parser_conf = 0.92
+            parser_type = "QUESTION"; parser_conf = 0.92
         elif q_num_match:
-            parser_type = "QUESTION"
-            parser_conf = 0.80
+            parser_type = "QUESTION"; parser_conf = 0.80
         elif subq_match:
-            parser_type = "SUBQUESTION"
-            parser_conf = 0.82
+            parser_type = "SUBQUESTION"; parser_conf = 0.82
         elif interrogative_match:
-            parser_type = "QUESTION"
-            parser_conf = 0.70
+            parser_type = "QUESTION"; parser_conf = 0.70
 
         if parser_type != "UNKNOWN":
-            hypotheses.append(
-                StructureHypothesis(
-                    region_id=reg.region_id,
-                    hypothesized_type=parser_type,
-                    confidence=parser_conf,
-                    source="parser",
-                    evidence=parser_ev,
-                )
-            )
+            hypotheses.append(StructureHypothesis(
+                region_id=reg.region_id,
+                hypothesized_type=parser_type,
+                confidence=parser_conf,
+                source="parser",
+                evidence=parser_ev,
+            ))
 
-        # 2. LAYOUT ANALYZER HYPOTHESIS (Geometry & Position based)
+        # 2. LAYOUT ANALYZER HYPOTHESIS
         layout_ev: List[DocumentEvidence] = []
         layout_type: DocumentRegionType = "UNKNOWN"
         layout_conf = 0.50
@@ -378,93 +626,64 @@ class DocumentUnderstandingService:
         rel_bottom = (bbox.y + bbox.height) / page_height if page_height > 0 else 0
 
         if rel_top < 0.06:
-            layout_ev.append(
-                DocumentEvidence(
-                    signal_type="page_position",
-                    description=f"Positioned near top margin (rel_y={rel_top:.3f})",
-                    weight=0.4,
-                    score=0.85,
-                )
-            )
-            layout_type = "HEADER"
-            layout_conf = 0.85
+            layout_ev.append(DocumentEvidence(
+                signal_type="page_position",
+                description=f"Positioned near top margin (rel_y={rel_top:.3f})",
+                weight=0.4, score=0.85,
+            ))
+            layout_type = "HEADER"; layout_conf = 0.85
         elif rel_bottom > 0.94:
-            layout_ev.append(
-                DocumentEvidence(
-                    signal_type="page_position",
-                    description=f"Positioned near bottom margin (rel_y={rel_bottom:.3f})",
-                    weight=0.4,
-                    score=0.85,
-                )
-            )
-            layout_type = "FOOTER"
-            layout_conf = 0.85
+            layout_ev.append(DocumentEvidence(
+                signal_type="page_position",
+                description=f"Positioned near bottom margin (rel_y={rel_bottom:.3f})",
+                weight=0.4, score=0.85,
+            ))
+            layout_type = "FOOTER"; layout_conf = 0.85
 
         if reg.metadata.get("role") == "visual_element" or re.search(
             r"\[(?:Diagram|Figure|Image|Graph)\]|\b(?:Fig\.|Figure|Diagram)\s*\d+", text, re.IGNORECASE
         ):
-            layout_ev.append(
-                DocumentEvidence(
-                    signal_type="table_geometry",
-                    description="Visual element / Diagram reference detected in block metadata",
-                    weight=0.5,
-                    score=0.9,
-                )
-            )
-            layout_type = "DIAGRAM"
-            layout_conf = 0.90
+            layout_ev.append(DocumentEvidence(
+                signal_type="table_geometry",
+                description="Visual element / Diagram reference detected",
+                weight=0.5, score=0.9,
+            ))
+            layout_type = "DIAGRAM"; layout_conf = 0.90
         elif re.search(r"^\|.*?\|", text, re.MULTILINE) or re.search(r"\bTable\s*\d*[\:\.\s]", text, re.IGNORECASE) or (
             "\t" in text and text.count("\t") >= 2
         ):
-            layout_ev.append(
-                DocumentEvidence(
-                    signal_type="table_geometry",
-                    description="Tabular syntax / grid structure detected",
-                    weight=0.5,
-                    score=0.88,
-                )
-            )
-            layout_type = "TABLE"
-            layout_conf = 0.88
+            layout_ev.append(DocumentEvidence(
+                signal_type="table_geometry",
+                description="Tabular syntax / grid structure detected",
+                weight=0.5, score=0.88,
+            ))
+            layout_type = "TABLE"; layout_conf = 0.88
 
         if layout_type != "UNKNOWN":
-            hypotheses.append(
-                StructureHypothesis(
-                    region_id=reg.region_id,
-                    hypothesized_type=layout_type,
-                    confidence=layout_conf,
-                    source="layout_analyzer",
-                    evidence=layout_ev,
-                )
-            )
+            hypotheses.append(StructureHypothesis(
+                region_id=reg.region_id,
+                hypothesized_type=layout_type,
+                confidence=layout_conf,
+                source="layout_analyzer",
+                evidence=layout_ev,
+            ))
 
         # 3. SEMANTIC ANALYZER HYPOTHESIS
-        sem_ev: List[DocumentEvidence] = []
-        sem_type: DocumentRegionType = "UNKNOWN"
-        sem_conf = 0.50
-
         if re.search(r"\b(?:Roll No|Name|Date|Subject|Time Allowed|Maximum Marks|Class|Session)\b", text, re.IGNORECASE):
-            sem_ev.append(
-                DocumentEvidence(
-                    signal_type="semantic_signal",
-                    description="Document metadata header terms detected",
-                    weight=0.5,
-                    score=0.9,
-                )
-            )
-            sem_type = "METADATA"
-            sem_conf = 0.90
-            hypotheses.append(
-                StructureHypothesis(
-                    region_id=reg.region_id,
-                    hypothesized_type=sem_type,
-                    confidence=sem_conf,
-                    source="semantic_analyzer",
-                    evidence=sem_ev,
-                )
-            )
+            sem_ev = [DocumentEvidence(
+                signal_type="semantic_signal",
+                description="Document metadata header terms detected",
+                weight=0.5, score=0.9,
+            )]
+            hypotheses.append(StructureHypothesis(
+                region_id=reg.region_id,
+                hypothesized_type="METADATA",
+                confidence=0.90,
+                source="semantic_analyzer",
+                evidence=sem_ev,
+            ))
 
-        # 4. RESOLVE / CONSOLIDATE HYPOTHESES
+        # 4. RESOLVE HYPOTHESES (deterministic only — VLM will override later)
         if not hypotheses:
             reg.region_type = "UNKNOWN"
             reg.confidence = 0.5
@@ -494,7 +713,7 @@ class DocumentUnderstandingService:
     def _extract_intra_page_relationships(
         self, regions: List[DocumentRegion]
     ) -> List[RegionRelationship]:
-        """Extracts spatial, hierarchical, section membership, and reading order relationships on a page."""
+        """Extracts spatial, hierarchical, and reading order relationships on a page."""
         rels: List[RegionRelationship] = []
         if not regions:
             return rels
@@ -506,70 +725,54 @@ class DocumentUnderstandingService:
         for idx, reg in enumerate(sorted_regs):
             if idx > 0:
                 prev_reg = sorted_regs[idx - 1]
-                rels.append(
-                    RegionRelationship(
-                        source_region_id=reg.region_id,
-                        target_region_id=prev_reg.region_id,
-                        relationship_type="follows",
-                        confidence=0.95,
-                        evidence=[
-                            DocumentEvidence(
-                                signal_type="spatial_position",
-                                description=f"Sequentially follows region '{prev_reg.region_id}' in reading order",
-                                weight=0.3,
-                                score=0.95,
-                            )
-                        ],
-                    )
-                )
+                rels.append(RegionRelationship(
+                    source_region_id=reg.region_id,
+                    target_region_id=prev_reg.region_id,
+                    relationship_type="follows",
+                    confidence=0.95,
+                    evidence=[DocumentEvidence(
+                        signal_type="spatial_position",
+                        description=f"Sequentially follows region '{prev_reg.region_id}' in reading order",
+                        weight=0.3, score=0.95,
+                    )],
+                ))
 
-            # Section Header Tracking
             if reg.region_type == "SECTION_HEADER" or re.search(r"^\s*(?:SECTION|PART|GROUP)\s+[A-Z0-9]", reg.text, re.IGNORECASE):
                 current_section_id = reg.region_id
             elif current_section_id and reg.region_id != current_section_id:
-                rels.append(
-                    RegionRelationship(
-                        source_region_id=current_section_id,
-                        target_region_id=reg.region_id,
-                        relationship_type="section_member",
-                        confidence=0.95,
-                    )
-                )
+                rels.append(RegionRelationship(
+                    source_region_id=current_section_id,
+                    target_region_id=reg.region_id,
+                    relationship_type="section_member",
+                    confidence=0.95,
+                ))
 
             if reg.region_type == "QUESTION":
-                # Check if this question is actually a continuation of the preceding question
                 if current_question_id and not re.search(r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?\d{1,3}\s*[\.\):\-]", reg.text, re.IGNORECASE) and not re.search(r"^\s*\(\s*[a-z0-9]+\s*\)", reg.text, re.IGNORECASE):
-                    rels.append(
-                        RegionRelationship(
-                            source_region_id=reg.region_id,
-                            target_region_id=current_question_id,
-                            relationship_type="continuation_of",
-                            confidence=0.85,
-                        )
-                    )
-                else:
-                    current_question_id = reg.region_id
-            elif reg.region_type in ("UNKNOWN", "INSTRUCTION") and current_question_id and not re.search(r"^\s*(?:SECTION|PART|GROUP|Table|Figure)\b", reg.text, re.IGNORECASE):
-                # Continuation text block
-                rels.append(
-                    RegionRelationship(
+                    rels.append(RegionRelationship(
                         source_region_id=reg.region_id,
                         target_region_id=current_question_id,
                         relationship_type="continuation_of",
-                        confidence=0.80,
-                    )
-                )
+                        confidence=0.85,
+                    ))
+                else:
+                    current_question_id = reg.region_id
+            elif reg.region_type in ("UNKNOWN", "INSTRUCTION") and current_question_id and not re.search(r"^\s*(?:SECTION|PART|GROUP|Table|Figure)\b", reg.text, re.IGNORECASE):
+                rels.append(RegionRelationship(
+                    source_region_id=reg.region_id,
+                    target_region_id=current_question_id,
+                    relationship_type="continuation_of",
+                    confidence=0.80,
+                ))
             elif reg.region_type in ("OPTION", "SUBQUESTION", "TABLE", "DIAGRAM", "TABLE_CELL"):
                 rel_t = "option_of" if reg.region_type == "OPTION" else ("subquestion_of" if reg.region_type == "SUBQUESTION" else "belongs_to")
                 if current_question_id:
-                    rels.append(
-                        RegionRelationship(
-                            source_region_id=reg.region_id,
-                            target_region_id=current_question_id,
-                            relationship_type=rel_t,
-                            confidence=0.90,
-                        )
-                    )
+                    rels.append(RegionRelationship(
+                        source_region_id=reg.region_id,
+                        target_region_id=current_question_id,
+                        relationship_type=rel_t,
+                        confidence=0.90,
+                    ))
                     reg.parent_region_id = current_question_id
 
         return rels
@@ -577,7 +780,7 @@ class DocumentUnderstandingService:
     def _extract_cross_page_relationships(
         self, pages: List[DocumentPage]
     ) -> List[RegionRelationship]:
-        """Extracts relationships across pages (e.g., continuation_of across pages)."""
+        """Extracts relationships across pages (continuation_of across pages)."""
         cross_rels: List[RegionRelationship] = []
         if len(pages) < 2:
             return cross_rels
@@ -585,122 +788,76 @@ class DocumentUnderstandingService:
         for i in range(len(pages) - 1):
             curr_page = pages[i]
             next_page = pages[i + 1]
-
             if not curr_page.regions or not next_page.regions:
                 continue
 
-            # Find last question on page i and first text region on page i+1
             last_q = next((r for r in reversed(curr_page.regions) if r.region_type == "QUESTION"), curr_page.regions[-1])
             first_reg = next_page.regions[0]
 
             last_text = last_q.text.strip()
             first_text = first_reg.text.strip()
 
-            # Cross-page continuation check: unpunctuated text or non-numbered start
             if last_text and (not last_text[-1] in (".", "?", "!", ":", ";") or not re.search(r"^\s*(?:SECTION|PART|Q\d+|\d+\.)", first_text, re.IGNORECASE)):
-                cross_rels.append(
-                    RegionRelationship(
-                        source_region_id=first_reg.region_id,
-                        target_region_id=last_q.region_id,
-                        relationship_type="continuation_of",
-                        confidence=0.85,
-                        evidence=[
-                            DocumentEvidence(
-                                signal_type="continuation_relationship",
-                                description=f"Region '{first_reg.region_id}' on page {next_page.page_number} continues region '{last_q.region_id}' from page {curr_page.page_number}",
-                                weight=0.4,
-                                score=0.85,
-                            )
-                        ],
-                    )
-                )
+                cross_rels.append(RegionRelationship(
+                    source_region_id=first_reg.region_id,
+                    target_region_id=last_q.region_id,
+                    relationship_type="continuation_of",
+                    confidence=0.85,
+                    evidence=[DocumentEvidence(
+                        signal_type="continuation_relationship",
+                        description=f"Cross-page continuation: page {next_page.page_number} → page {curr_page.page_number}",
+                        weight=0.4, score=0.85,
+                    )],
+                ))
 
         return cross_rels
-
-    def build_structure_graph(self, doc_result: DocumentUnderstandingResult) -> DocumentStructureGraph:
-        """Constructs a complete DocumentStructureGraph with GraphNode and GraphEdge instances."""
-        from app.models.schemas import DocumentStructureGraph, GraphNode, GraphEdge
-        nodes: Dict[str, GraphNode] = {}
-        for r in doc_result.regions:
-            nodes[r.region_id] = GraphNode(
-                region_id=r.region_id,
-                role=r.region_type,
-                text=r.text,
-                page=r.page,
-                bbox=r.bbox,
-                confidence=r.confidence,
-            )
-        edges: List[GraphEdge] = []
-        for rel in doc_result.relationships:
-            edges.append(
-                GraphEdge(
-                    source_id=rel.source_region_id,
-                    target_id=rel.target_region_id,
-                    relationship=rel.relationship_type,
-                    confidence=rel.confidence,
-                )
-            )
-        return DocumentStructureGraph(
-            nodes=nodes,
-            edges=edges,
-            document_purpose="QUESTION_PAPER",
-            page_roles={p.page_number: "QUESTION_PAPER" for p in doc_result.pages},
-        )
-
 
     def _attach_embeddings(self, regions: List[DocumentRegion]) -> None:
         """Attaches dense embeddings to regions using Step 8 embedding service."""
         texts = [r.text for r in regions]
         if not texts:
             return
-
         try:
             vecs = embed_texts(texts)
             if vecs is not None and len(vecs) == len(regions):
                 for idx, reg in enumerate(regions):
                     reg.embedding = vecs[idx].tolist()
-                    reg.evidence.append(
-                        DocumentEvidence(
-                            signal_type="semantic_signal",
-                            description="Dense vector embedding attached from Step 8 embedding engine",
-                            weight=0.2,
-                            score=1.0,
-                        )
-                    )
+                    reg.evidence.append(DocumentEvidence(
+                        signal_type="semantic_signal",
+                        description="Dense vector embedding attached from Step 8 embedding engine",
+                        weight=0.2, score=1.0,
+                    ))
         except Exception as e:
             print(f"[DocumentUnderstandingService] Embedding attachment notice: {e}")
 
 
 def get_debug_summary(result: DocumentUnderstandingResult) -> Dict[str, Any]:
-    """
-    Developer / debug representation helper for inspecting document understanding state.
-    Exposes region hypotheses, evidence sources, verification states, and cost accounting.
-    """
+    """Developer / debug representation helper."""
     region_summaries = []
     for r in result.regions:
-        region_summaries.append(
-            {
-                "region_id": r.region_id,
-                "page": r.page,
-                "text_snippet": r.text[:80],
-                "bbox": {"x": r.bbox.x, "y": r.bbox.y, "w": r.bbox.width, "h": r.bbox.height},
-                "final_region_type": r.region_type,
-                "verification_state": r.verification_state,
-                "confidence": round(r.confidence, 4),
-                "classification_conflict": r.classification_conflict,
-                "hypotheses": [
-                    {"source": h.source, "type": h.hypothesized_type, "confidence": round(h.confidence, 4)}
-                    for h in r.conflicting_hypotheses
-                ],
-                "evidence_count": len(r.evidence),
-                "parent_region_id": r.parent_region_id,
-                "child_region_ids": r.child_region_ids,
-            }
-        )
+        region_summaries.append({
+            "region_id": r.region_id,
+            "page": r.page,
+            "text_snippet": r.text[:80],
+            "bbox": {"x": r.bbox.x, "y": r.bbox.y, "w": r.bbox.width, "h": r.bbox.height},
+            "final_region_type": r.region_type,
+            "verification_state": r.verification_state,
+            "confidence": round(r.confidence, 4),
+            "classification_conflict": r.classification_conflict,
+            "hypotheses": [
+                {"source": h.source, "type": h.hypothesized_type, "confidence": round(h.confidence, 4)}
+                for h in r.conflicting_hypotheses
+            ],
+            "evidence_count": len(r.evidence),
+            "parent_region_id": r.parent_region_id,
+            "child_region_ids": r.child_region_ids,
+        })
 
     return {
         "document_id": result.document_id,
         "vlm_status": result.vlm_status,
+        "document_purpose": result.document_purpose,
+        "page_roles": result.page_roles,
         "total_regions": len(result.regions),
         "total_relationships": len(result.relationships),
         "conflicts_count": len(result.conflicts),

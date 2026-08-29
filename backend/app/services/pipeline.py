@@ -46,10 +46,12 @@ async def run_pipeline(assessment_id: str) -> None:
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_answers",
             message="Reading handwritten answers", progress=0.45))
-        # Answer sheet ALWAYS uses force_ocr=True so bboxes are in image pixel coordinates
-        as_blocks, as_pages, as_sizes = await asyncio.to_thread(
+        as_res = await asyncio.to_thread(
             process_document, files["answer_sheet"], files["answer_sheet_ext"], True
         )
+        as_blocks = as_res[0]
+        as_pages = as_res[1]
+        as_sizes = as_res[2]
         page_types, metadata_pages = analyze_pages(as_blocks, as_pages)
         answers = await asyncio.to_thread(extract_answers, as_blocks, metadata_pages)
 

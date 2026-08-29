@@ -1,17 +1,23 @@
 """
-Step 11C — Intelligent Question & Structure Extraction Service.
+Intelligent Question Extraction Service — Graph-Driven Architecture.
 
-Converts OCR blocks and Step 11A/11B document-understanding structures into a validated,
-evidence-backed question set represented as a DocumentQuestionExtractionResult.
+The DocumentStructureGraph drives question extraction.
+Questions are found by walking graph nodes with role=QUESTION,
+not by regex pattern matching.
+
+Architecture:
+  DocumentStructureGraph (built by DocumentUnderstandingService)
+    → Find QUESTION nodes
+    → Follow edges for OPTIONS, SUBQUESTIONS, CONTINUATIONS
+    → Assemble text from source regions (zero hallucination)
+    → Fall back to regex ONLY when graph is empty/insufficient
 
 Core Principles:
-1. Strict Zero-Hallucination Rule: Every character of question/option text originates 100% from original OCR source regions.
-2. VLM Independence: Works reliably whether VLM is active, unavailable, or disabled.
-3. Feature-Gated Integration & Safe Fallback: Controlled via INTELLIGENT_EXTRACTION_ENABLED.
-4. Context-Aware UNCERTAIN Preservation: Ambiguous candidates are preserved in UNCERTAIN state & audit rather than deleted.
-5. Authoritative MCQ Option Source Regions: Options store source_region_ids, source_regions, page, and bbox.
-6. Multi-Column Geometry Reading Order: Detects reading order columns before ordering regions.
-7. Document-Level Audit Architecture: Full diagnostic ExtractionAudit metadata object produced per extraction run.
+1. Graph-first: The graph is the primary decision-making input
+2. Zero-hallucination: Every character comes from OCR source regions
+3. VLM independence: Works when VLM disabled (graph from deterministic evidence)
+4. Safe fallback: Falls back to regex when graph is truly empty
+5. Audit trail: Full diagnostic metadata for every extraction decision
 """
 from __future__ import annotations
 import re
@@ -32,24 +38,27 @@ from app.models.schemas import (
     DocumentRegion,
     DocumentPage,
     DocumentUnderstandingResult,
+    DocumentStructureGraph,
+    GraphNode,
+    GraphEdge,
     StructureHypothesis,
     VerificationState,
 )
 from app.services.document_understanding_service import DocumentUnderstandingService
 
 
-# --- Option Syntax Matchers ---
+# --- Regex patterns for legacy fallback ---
 OPTION_PREFIX_RE = re.compile(
     r"^\s*[\(\[]?\s*([A-Da-d1-4])\s*[\)\]\.\:]\s*(.*)$"
 )
 
 SUBQUESTION_PREFIX_RE = re.compile(
-    r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)$",
+    r"^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)$",
     re.IGNORECASE,
 )
 
 MAIN_QUESTION_PREFIX_RE = re.compile(
-    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\):\-]\s*(.*)$",
+    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?\d{1,3}\s*[\.\):\-]\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -58,16 +67,8 @@ SECTION_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
-ADMIN_INSTRUCTION_KEYWORDS = [
-    "time allowed", "maximum marks", "max marks", "general instructions",
-    "instructions to candidates", "roll no", "total pages", "total questions",
-    "attempt any", "all questions are compulsory", "duration", "paper code",
-    "subject code", "b.tech", "m.tech", "b.sc", "m.sc", "reg. no"
-]
-
 
 def _compute_bounding_box(regions: List[DocumentRegion]) -> Optional[BBox]:
-    """Computes unifying bounding box for a list of document regions."""
     if not regions:
         return None
     xs = [r.bbox.x for r in regions]
@@ -80,38 +81,32 @@ def _compute_bounding_box(regions: List[DocumentRegion]) -> Optional[BBox]:
 
 
 def _detect_reading_columns(regions: List[DocumentRegion], page_width: float) -> Dict[str, int]:
-    """
-    Multi-Column Geometry Reading Order Detector.
-    Detects whether page is multi-column (e.g. 2-column) based on region X-midpoints.
-    Returns region_id -> column_index mapping.
-    """
     column_map: Dict[str, int] = {}
     if not regions or page_width <= 0:
         for r in regions:
             column_map[r.region_id] = 0
         return column_map
 
-    # Check if regions fall clearly into left vs right halves
     mid = page_width / 2.0
     left_count = sum(1 for r in regions if (r.bbox.x + r.bbox.width / 2.0) < mid and r.bbox.width < page_width * 0.6)
     right_count = sum(1 for r in regions if (r.bbox.x + r.bbox.width / 2.0) >= mid and r.bbox.width < page_width * 0.6)
-
     is_multi_column = (left_count >= 2 and right_count >= 2)
 
     for r in regions:
         if is_multi_column:
             x_center = r.bbox.x + r.bbox.width / 2.0
-            col = 0 if x_center < mid else 1
-            column_map[r.region_id] = col
+            column_map[r.region_id] = 0 if x_center < mid else 1
         else:
             column_map[r.region_id] = 0
-
     return column_map
 
 
 class IntelligentQuestionExtractionService:
     """
-    Dedicated service for converting structured document understanding into a validated question set.
+    Graph-driven question extraction service.
+
+    Primary path: Walk the DocumentStructureGraph to extract questions.
+    Fallback path: Regex-based extraction when graph is empty.
     """
 
     def __init__(self, doc_understanding_service: Optional[DocumentUnderstandingService] = None):
@@ -125,7 +120,10 @@ class IntelligentQuestionExtractionService:
         page_sizes: Optional[Dict[int, List[float]]] = None,
     ) -> DocumentQuestionExtractionResult:
         """
-        Executes 10-stage intelligent question & structure extraction.
+        Extracts questions using graph-driven approach.
+
+        1. If structure_graph exists with QUESTION nodes → walk graph
+        2. Else → fall back to regex-based extraction
         """
         if not blocks:
             return DocumentQuestionExtractionResult(
@@ -136,124 +134,432 @@ class IntelligentQuestionExtractionService:
                 audit=ExtractionAudit(),
             )
 
-        # Ensure DocumentUnderstandingResult exists and contains regions
+        # Ensure DocumentUnderstandingResult exists
         if doc_understanding_result is None or not doc_understanding_result.regions:
-            vlm_stat = doc_understanding_result.vlm_status if doc_understanding_result else "NOT_CONFIGURED"
             doc_understanding_result = self.doc_understanding_service.process_document(
                 blocks=blocks, document_id=document_id, page_sizes=page_sizes
             )
-            if vlm_stat != "NOT_CONFIGURED":
-                doc_understanding_result.vlm_status = vlm_stat
 
-        regions = doc_understanding_result.regions
+        # PRIMARY PATH: Graph-driven extraction
+        graph = doc_understanding_result.structure_graph
+        if graph and graph.nodes:
+            question_nodes = [n for n in graph.nodes.values() if n.role == "QUESTION"]
+            if question_nodes:
+                print(f"[IntelligentExtraction] Graph-driven extraction: {len(question_nodes)} QUESTION nodes found")
+                return self._extract_from_graph(
+                    graph=graph,
+                    doc_result=doc_understanding_result,
+                    document_id=document_id,
+                )
+
+        # FALLBACK: Regex-based extraction from regions
+        print("[IntelligentExtraction] Graph has no QUESTION nodes, using region-based fallback")
+        return self._extract_from_regions(
+            doc_result=doc_understanding_result,
+            document_id=document_id,
+        )
+
+    # ================================================================
+    # PRIMARY: Graph-Driven Extraction
+    # ================================================================
+
+    def _extract_from_graph(
+        self,
+        graph: DocumentStructureGraph,
+        doc_result: DocumentUnderstandingResult,
+        document_id: str,
+    ) -> DocumentQuestionExtractionResult:
+        """
+        Walks the DocumentStructureGraph to construct questions.
+
+        QUESTION nodes → questions
+        OPTION edges → MCQ options attached to parent question
+        SUBQUESTION edges → subquestions
+        CONTINUATION edges → multi-line/multi-page question text
+        SECTION_HEADER nodes → section containers
+        """
+        region_map = {r.region_id: r for r in doc_result.regions}
+        audit = ExtractionAudit(candidate_count=len(graph.nodes))
+
+        # Build edge indices
+        # target_id → list of (source_id, relationship, confidence)
+        children_of: Dict[str, List[Tuple[str, str, float]]] = {}
+        # source_id → list of (target_id, relationship, confidence)
+        parents_of: Dict[str, List[Tuple[str, str, float]]] = {}
+
+        for edge in graph.edges:
+            children_of.setdefault(edge.target_id, []).append(
+                (edge.source_id, edge.relationship, edge.confidence)
+            )
+            parents_of.setdefault(edge.source_id, []).append(
+                (edge.target_id, edge.relationship, edge.confidence)
+            )
+
+        # Find sections
+        sections: List[ExtractedSection] = []
+        section_for_region: Dict[str, str] = {}  # region_id → section_title
+
+        for node_id, node in graph.nodes.items():
+            if node.role == "SECTION_HEADER":
+                sec_title = node.text.strip()
+                sec_m = SECTION_HEADER_RE.match(sec_title)
+                if sec_m:
+                    sec_title = f"Section-{sec_m.group(1).upper()}"
+                sec_id = f"sec_{len(sections)+1}_{sec_title[:20].lower().replace(' ','_')}"
+                sec = ExtractedSection(
+                    section_id=sec_id,
+                    title=sec_title,
+                    page=node.page,
+                    bbox=node.bbox,
+                    source_region_ids=[node_id],
+                )
+                sections.append(sec)
+                audit.section_count += 1
+
+                # Find section members via edges
+                for child_id, rel_type, _ in children_of.get(node_id, []):
+                    if rel_type == "section_member":
+                        section_for_region[child_id] = sec_title
+
+                audit.rejected_count += 1
+
+        # Find QUESTION nodes and build questions
+        question_nodes = sorted(
+            [n for n in graph.nodes.values() if n.role == "QUESTION"],
+            key=lambda n: (n.page, n.bbox.y, n.bbox.x),
+        )
+
+        extracted_questions: List[Question] = []
+        uncertain_candidates: List[Question] = []
+        rejection_records: List[RejectionRecord] = []
+        order_counter = 0
+
+        for q_node in question_nodes:
+            region = region_map.get(q_node.region_id)
+            if not region:
+                continue
+
+            # Extract display number from text
+            q_text = q_node.text.strip()
+            display_num = self._extract_display_number(q_text)
+
+            # Build question ID: document_id:region_id
+            q_id = f"{document_id}:{q_node.region_id}"
+
+            # Find section for this question
+            sec_title = section_for_region.get(q_node.region_id)
+
+            # Collect continuation text
+            continuation_ids, continuation_text = self._collect_continuations(
+                q_node.region_id, children_of, graph.nodes, region_map
+            )
+
+            # Assemble full question text from source regions
+            full_text = q_text
+            all_source_ids = [q_node.region_id]
+            all_source_regions = [Region(page=q_node.page, bbox=q_node.bbox)]
+
+            for cont_id in continuation_ids:
+                cont_node = graph.nodes.get(cont_id)
+                if cont_node:
+                    full_text = f"{full_text} {cont_node.text.strip()}"
+                    all_source_ids.append(cont_id)
+                    all_source_regions.append(Region(page=cont_node.page, bbox=cont_node.bbox))
+
+            # Determine question type
+            q_type = "SHORT_ANSWER"
+            if len(full_text) > 120 or "explain" in full_text.lower() or "discuss" in full_text.lower():
+                q_type = "LONG_ANSWER"
+
+            q_obj = Question(
+                id=q_id,
+                number=display_num,
+                text=full_text,
+                page=q_node.page,
+                bbox=_compute_bounding_box([region_map[rid] for rid in all_source_ids if rid in region_map]) or q_node.bbox,
+                order_index=order_counter,
+                section=sec_title,
+                question_type=q_type,
+                source_region_ids=all_source_ids,
+                source_regions=all_source_regions,
+                extraction_confidence=q_node.confidence,
+                verification_state=region.verification_state if region else "UNVERIFIED",
+                evidence_refs=[h.source for h in region.conflicting_hypotheses] if region else [],
+            )
+
+            # Find and attach OPTIONS
+            option_count = self._attach_options(
+                question=q_obj,
+                question_node_id=q_node.region_id,
+                children_of=children_of,
+                graph_nodes=graph.nodes,
+                region_map=region_map,
+            )
+            if option_count > 0:
+                q_obj.question_type = "MCQ"
+
+            # Find and attach SUBQUESTIONS
+            self._attach_subquestions(
+                parent_question=q_obj,
+                question_node_id=q_node.region_id,
+                children_of=children_of,
+                graph_nodes=graph.nodes,
+                region_map=region_map,
+                document_id=document_id,
+                extracted_questions=extracted_questions,
+                order_counter_ref=[order_counter + 1],
+                sec_title=sec_title,
+            )
+
+            # Check if uncertain
+            if region and (region.verification_state in ("UNCERTAIN", "CONFLICTED") or region.confidence < 0.65):
+                uncertain_candidates.append(q_obj)
+
+            extracted_questions.append(q_obj)
+            order_counter += 1
+
+        # Record non-question rejections for audit
+        for node_id, node in graph.nodes.items():
+            if node.role in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER"):
+                rejection_records.append(RejectionRecord(
+                    region_id=node_id,
+                    ocr_text=node.text[:60],
+                    classification=node.role,
+                    confidence=node.confidence,
+                    reason=f"Graph node classified as {node.role} — not a question.",
+                ))
+                audit.rejected_count += 1
+
+        audit.accepted_question_count = len(extracted_questions)
+        audit.rejection_reasons = rejection_records
+
+        # Count multi-region / multi-page questions
+        for q in extracted_questions:
+            q_pages = {r.page for r in q.source_regions}
+            if len(q_pages) > 1:
+                audit.multi_page_question_count += 1
+            if len(q.source_region_ids) > 1:
+                audit.multi_region_question_count += 1
+
+        return DocumentQuestionExtractionResult(
+            document_id=document_id,
+            questions=extracted_questions,
+            sections=sections,
+            uncertain_candidates=uncertain_candidates,
+            audit=audit,
+            structure_graph=graph,
+            fallback_used=False,
+            invariant_violations=audit.invariant_violations,
+        )
+
+    def _extract_display_number(self, text: str) -> str:
+        """Extracts the display question number from text like 'Q1. Explain...' → '1'."""
+        m = re.match(
+            r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\):\-]",
+            text, re.IGNORECASE
+        )
+        if m:
+            return m.group(1)
+
+        # Subquestion pattern: 1(a) or Q1(a)
+        m_sub = re.match(
+            r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]]",
+            text, re.IGNORECASE
+        )
+        if m_sub:
+            return f"{m_sub.group(1)}({m_sub.group(2).lower()})"
+
+        return str(uuid.uuid4())[:6]
+
+    def _collect_continuations(
+        self,
+        node_id: str,
+        children_of: Dict[str, List[Tuple[str, str, float]]],
+        graph_nodes: Dict[str, GraphNode],
+        region_map: Dict[str, DocumentRegion],
+    ) -> Tuple[List[str], str]:
+        """Collects continuation regions for a question node."""
+        continuation_ids: List[str] = []
+        continuation_text = ""
+
+        # Find all regions that are continuation_of this node
+        for child_id, rel_type, conf in children_of.get(node_id, []):
+            if rel_type == "continuation_of":
+                child_node = graph_nodes.get(child_id)
+                if child_node and child_node.role not in ("QUESTION", "SECTION_HEADER", "OPTION"):
+                    continuation_ids.append(child_id)
+                    continuation_text += " " + child_node.text.strip()
+
+        # Sort continuations by spatial order
+        continuation_ids.sort(key=lambda cid: (
+            graph_nodes[cid].page if cid in graph_nodes else 0,
+            graph_nodes[cid].bbox.y if cid in graph_nodes else 0,
+        ))
+
+        return continuation_ids, continuation_text
+
+    def _attach_options(
+        self,
+        question: Question,
+        question_node_id: str,
+        children_of: Dict[str, List[Tuple[str, str, float]]],
+        graph_nodes: Dict[str, GraphNode],
+        region_map: Dict[str, DocumentRegion],
+    ) -> int:
+        """Attaches MCQ options to a question from graph edges."""
+        option_count = 0
+
+        for child_id, rel_type, conf in children_of.get(question_node_id, []):
+            if rel_type != "option_of":
+                continue
+
+            child_node = graph_nodes.get(child_id)
+            if not child_node or child_node.role != "OPTION":
+                continue
+
+            region = region_map.get(child_id)
+            opt_text = child_node.text.strip()
+
+            # Extract option label
+            opt_m = OPTION_PREFIX_RE.match(opt_text)
+            label = opt_m.group(1).upper() if opt_m else chr(65 + option_count)  # A, B, C, D
+            text_val = opt_m.group(2).strip() if opt_m else opt_text
+
+            opt_id = f"opt_{question.id}_{label}_{uuid.uuid4().hex[:4]}"
+            extracted_opt = ExtractedOption(
+                option_id=opt_id,
+                question_id=question.id,
+                label=label,
+                text=opt_text,  # Full OCR text preserved
+                source_region_ids=[child_id],
+                source_regions=[Region(page=child_node.page, bbox=child_node.bbox)],
+                extraction_confidence=child_node.confidence,
+                verification_state=region.verification_state if region else "UNVERIFIED",
+            )
+            question.extracted_options.append(extracted_opt)
+            question.options.append(f"{label}. {text_val}")
+            option_count += 1
+            audit_count = getattr(question, '_opt_audit_count', 0)
+
+        return option_count
+
+    def _attach_subquestions(
+        self,
+        parent_question: Question,
+        question_node_id: str,
+        children_of: Dict[str, List[Tuple[str, str, float]]],
+        graph_nodes: Dict[str, GraphNode],
+        region_map: Dict[str, DocumentRegion],
+        document_id: str,
+        extracted_questions: List[Question],
+        order_counter_ref: List[int],
+        sec_title: Optional[str],
+    ) -> None:
+        """Attaches subquestions to a parent question from graph edges."""
+        for child_id, rel_type, conf in children_of.get(question_node_id, []):
+            if rel_type != "subquestion_of":
+                continue
+
+            child_node = graph_nodes.get(child_id)
+            if not child_node or child_node.role != "SUBQUESTION":
+                continue
+
+            region = region_map.get(child_id)
+            sub_text = child_node.text.strip()
+
+            # Extract subquestion display number
+            m = re.match(r"^\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)", sub_text, re.IGNORECASE)
+            sub_label = m.group(1).lower() if m else "?"
+            parent_num = parent_question.number
+            display_num = f"{parent_num}({sub_label})"
+
+            sub_id = f"{document_id}:{child_id}"
+            sub_q = Question(
+                id=sub_id,
+                number=display_num,
+                text=sub_text,
+                page=child_node.page,
+                bbox=child_node.bbox,
+                order_index=order_counter_ref[0],
+                section=sec_title,
+                parent_question_id=parent_question.id,
+                question_type="SUBQUESTION",
+                source_region_ids=[child_id],
+                source_regions=[Region(page=child_node.page, bbox=child_node.bbox)],
+                extraction_confidence=child_node.confidence,
+                verification_state=region.verification_state if region else "UNVERIFIED",
+            )
+            extracted_questions.append(sub_q)
+            order_counter_ref[0] += 1
+
+    # ================================================================
+    # FALLBACK: Region-based extraction (when graph has no QUESTION nodes)
+    # ================================================================
+
+    def _extract_from_regions(
+        self,
+        doc_result: DocumentUnderstandingResult,
+        document_id: str,
+    ) -> DocumentQuestionExtractionResult:
+        """
+        Fallback extraction using regex on regions.
+        Used ONLY when the structure graph has no QUESTION nodes.
+        """
+        regions = doc_result.regions
         audit = ExtractionAudit(candidate_count=len(regions))
         rejection_records: List[RejectionRecord] = []
-
-        # ---------------------------------------------------------------------
-        # Stage 1 & 2: Candidate Classification & Administrative Exclusion
-        # ---------------------------------------------------------------------
         classified_sections: List[ExtractedSection] = []
-        accepted_regions: List[DocumentRegion] = []
-        uncertain_regions: List[DocumentRegion] = []
+        extracted_questions: List[Question] = []
+        uncertain_candidates: List[Question] = []
         option_regions: List[DocumentRegion] = []
 
         active_section: Optional[ExtractedSection] = None
         sections_by_id: Dict[str, ExtractedSection] = {}
+        accepted_regions: List[DocumentRegion] = []
+        curr_section_title: Optional[str] = None
 
         for reg in regions:
             text_low = reg.text.strip().lower()
 
-            # 1. Section Header Check
+            # Section header
             sec_m = SECTION_HEADER_RE.match(reg.text.strip())
             if sec_m or reg.region_type == "SECTION_HEADER":
                 sec_title = f"Section-{sec_m.group(1).upper()}" if sec_m else reg.text.strip()
-                sec_id = f"sec_{len(classified_sections)+1}_{sec_title.lower()}"
+                sec_id = f"sec_{len(classified_sections)+1}"
                 active_section = ExtractedSection(
-                    section_id=sec_id,
-                    title=sec_title,
-                    page=reg.page,
-                    bbox=reg.bbox,
-                    source_region_ids=[reg.region_id],
+                    section_id=sec_id, title=sec_title, page=reg.page,
+                    bbox=reg.bbox, source_region_ids=[reg.region_id],
                 )
                 classified_sections.append(active_section)
                 sections_by_id[sec_id] = active_section
+                curr_section_title = sec_title
                 audit.section_count += 1
-                rejection_records.append(
-                    RejectionRecord(
-                        region_id=reg.region_id,
-                        ocr_text=reg.text[:60],
-                        classification="SECTION_HEADER",
-                        confidence=reg.confidence,
-                        reason="Structural container for section, not a question.",
-                    )
-                )
                 continue
 
-            # 2. Administrative / Instruction / Metadata / Header / Footer Filtering
-            is_header_kw = any(kw in text_low for kw in ["roll no", "b.tech", "m.tech", "semester", "subject code", "max. marks", "max marks", "time:", "page "])
-            is_kv_header = bool(re.match(r"^[A-Za-z0-9\s\.\(\)\–\-]{2,35}\s*:\s*.+$", reg.text.strip()))
-            is_true_header = (reg.region_type in ("HEADER", "FOOTER", "METADATA") and (is_header_kw or is_kv_header or reg.bbox.y < 15.0))
-
-            is_admin_kw = any(kw in text_low for kw in ADMIN_INSTRUCTION_KEYWORDS)
-            is_explicit_admin_header = ("general instructions" in text_low or "instructions to candidates" in text_low or "time allowed" in text_low or "maximum marks" in text_low or "roll no" in text_low)
-            is_top_instruction = (reg.region_type == "INSTRUCTION" and reg.page == 1 and reg.bbox.y < 200 and is_admin_kw)
-
-            if (
-                is_true_header
-                or is_explicit_admin_header
-                or is_top_instruction
-            ) and not MAIN_QUESTION_PREFIX_RE.match(reg.text.strip()) and not SUBQUESTION_PREFIX_RE.match(reg.text.strip()):
+            # Administrative/instruction filtering
+            if reg.region_type in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION"):
                 audit.rejected_count += 1
-                rejection_records.append(
-                    RejectionRecord(
-                        region_id=reg.region_id,
-                        ocr_text=reg.text[:60],
-                        classification=reg.region_type,
-                        confidence=reg.confidence,
-                        reason=f"Excluded non-question administrative/instruction content ({reg.region_type}).",
-                    )
-                )
+                rejection_records.append(RejectionRecord(
+                    region_id=reg.region_id, ocr_text=reg.text[:60],
+                    classification=reg.region_type, confidence=reg.confidence,
+                    reason=f"Non-question content ({reg.region_type}).",
+                ))
                 continue
 
-            # 2b. Structural Visual Element Filtering (Table / Diagram / Figure Text Leakage Protection)
-            is_visual_structure = (
-                reg.region_type in ("TABLE", "DIAGRAM", "FIGURE")
-                or bool(re.search(r"^\s*(?:Table|Figure|Fig\.)\s+\d+", reg.text.strip(), re.IGNORECASE))
-                or bool(re.search(r"\|.+\|", reg.text.strip()))
-            )
-            if is_visual_structure and not MAIN_QUESTION_PREFIX_RE.match(reg.text.strip()) and not SUBQUESTION_PREFIX_RE.match(reg.text.strip()):
-                audit.rejected_count += 1
-                v_type = reg.region_type if reg.region_type in ("TABLE", "DIAGRAM", "FIGURE") else "TABLE/FIGURE"
-                rejection_records.append(
-                    RejectionRecord(
-                        region_id=reg.region_id,
-                        ocr_text=reg.text[:60],
-                        classification=v_type,
-                        confidence=reg.confidence,
-                        reason=f"Excluded visual structural element ({v_type}) from question prose text.",
-                    )
-                )
-                continue
-
-            # 3. MCQ Option Check
+            # Option
             opt_m = OPTION_PREFIX_RE.match(reg.text.strip())
             if reg.region_type == "OPTION" or (opt_m and not MAIN_QUESTION_PREFIX_RE.match(reg.text.strip())):
                 option_regions.append(reg)
                 audit.option_count += 1
                 continue
 
-            # 4. Question / Subquestion / Uncertain Candidate Check
-            if reg.verification_state == "UNCERTAIN" or reg.confidence < 0.65:
-                uncertain_regions.append(reg)
-                audit.uncertain_count += 1
-                accepted_regions.append(reg)  # Preserved without deletion
-            else:
-                accepted_regions.append(reg)
+            accepted_regions.append(reg)
 
-        # ---------------------------------------------------------------------
-        # Stage 8: Multi-Column Geometry Reading Order Reconstruction
-        # ---------------------------------------------------------------------
-        # Organize regions by page, then column, then y-coordinate
+        # Build questions from accepted regions using regex
+        curr_question: Optional[Question] = None
+        order_counter = 0
+
+        # Sort by reading order
         regions_by_page: Dict[int, List[DocumentRegion]] = {}
         for r in accepted_regions:
             regions_by_page.setdefault(r.page, []).append(r)
@@ -262,240 +568,80 @@ class IntelligentQuestionExtractionService:
         for page_num in sorted(regions_by_page.keys()):
             p_regs = regions_by_page[page_num]
             p_width = 1000.0
-            if doc_understanding_result and doc_understanding_result.pages:
-                p_match = next((p for p in doc_understanding_result.pages if p.page_number == page_num), None)
+            if doc_result.pages:
+                p_match = next((p for p in doc_result.pages if p.page_number == page_num), None)
                 if p_match and p_match.width > 0:
                     p_width = p_match.width
-
             col_map = _detect_reading_columns(p_regs, p_width)
-            # Sort regions by (column_index, y_min, x_min)
-            sorted_p_regs = sorted(p_regs, key=lambda r: (col_map.get(r.region_id, 0), r.bbox.y, r.bbox.x))
-            ordered_regions.extend(sorted_p_regs)
-
-        # ---------------------------------------------------------------------
-        # Stage 3, 4, 5, 6, 7, 9: Question Boundary Construction & MCQ Assembly
-        # ---------------------------------------------------------------------
-        extracted_questions: List[Question] = []
-        uncertain_question_candidates: List[Question] = []
-        curr_section_id: Optional[str] = None
-        curr_section_title: Optional[str] = None
-
-        curr_question: Optional[Question] = None
-        order_counter = 0
-
-        current_main_parent_id: Optional[str] = None
+            sorted_regs = sorted(p_regs, key=lambda r: (col_map.get(r.region_id, 0), r.bbox.y, r.bbox.x))
+            ordered_regions.extend(sorted_regs)
 
         for reg in ordered_regions:
             txt = reg.text.strip()
             if not txt:
                 continue
 
-            # Check for section association update
-            for sec in classified_sections:
-                if sec.page == reg.page and reg.bbox.y >= sec.bbox.y:
-                    curr_section_id = sec.section_id
-                    curr_section_title = sec.title
-
-            sub_m = SUBQUESTION_PREFIX_RE.match(txt)
             main_m = MAIN_QUESTION_PREFIX_RE.match(txt)
-
-            # --- Subquestion Candidate e.g. 11(a) or 1(b) ---
-            if sub_m:
-                main_num = sub_m.group(1)
-                sub_let = sub_m.group(2).lower()
-                q_text = sub_m.group(3).strip() or txt
-
-                q_id = f"{document_id}:{reg.region_id}"
-                disp_num = f"{main_num}({sub_let})"
-                parent_id = current_main_parent_id or f"{document_id}:parent_{main_num}"
-
-                q_obj = Question(
-                    id=q_id,
-                    number=disp_num,
-                    text=txt,  # 100% original OCR text preserved
-                    page=reg.page,
-                    bbox=reg.bbox,
-                    order_index=order_counter,
-                    section=curr_section_title,
-                    section_id=curr_section_id,
-                    section_title=curr_section_title,
-                    parent_question_id=parent_id,
-                    question_type="SUBQUESTION",
-                    source_region_ids=[reg.region_id],
-                    source_regions=[Region(page=reg.page, bbox=reg.bbox)],
-                    extraction_confidence=reg.confidence,
-                    verification_state=reg.verification_state,
-                    evidence_refs=[h.source for h in reg.conflicting_hypotheses],
-                )
-
-                if reg.verification_state in ("UNCERTAIN", "CONFLICTED") or reg.confidence < 0.65:
-                    uncertain_question_candidates.append(q_obj)
-
-                extracted_questions.append(q_obj)
-                if curr_section_id and curr_section_id in sections_by_id:
-                    sections_by_id[curr_section_id].question_ids.append(q_id)
-
-                curr_question = q_obj
-                order_counter += 1
-                continue
-
-            # --- Main Question Candidate e.g. Q1. or 2. ---
             if main_m:
-                q_num = main_m.group(1)
-                q_text = main_m.group(2).strip() or txt
+                q_num_m = re.match(r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})", txt, re.IGNORECASE)
+                q_num = q_num_m.group(1) if q_num_m else str(order_counter + 1)
                 q_id = f"{document_id}:{reg.region_id}"
-                disp_num = q_num
 
-                q_type = "SHORT_ANSWER"
-                if len(q_text) > 120 or "explain" in q_text.lower() or "discuss" in q_text.lower():
-                    q_type = "LONG_ANSWER"
-
-                q_obj = Question(
-                    id=q_id,
-                    number=disp_num,
-                    text=txt,  # 100% original OCR text preserved
-                    page=reg.page,
-                    bbox=reg.bbox,
-                    order_index=order_counter,
+                curr_question = Question(
+                    id=q_id, number=q_num, text=txt, page=reg.page,
+                    bbox=reg.bbox, order_index=order_counter,
                     section=curr_section_title,
-                    section_id=curr_section_id,
-                    section_title=curr_section_title,
-                    parent_question_id=None,
-                    question_type=q_type,
                     source_region_ids=[reg.region_id],
                     source_regions=[Region(page=reg.page, bbox=reg.bbox)],
                     extraction_confidence=reg.confidence,
                     verification_state=reg.verification_state,
-                    evidence_refs=[h.source for h in reg.conflicting_hypotheses],
                 )
-
-                if reg.verification_state in ("UNCERTAIN", "CONFLICTED") or reg.confidence < 0.65:
-                    uncertain_question_candidates.append(q_obj)
-
-                extracted_questions.append(q_obj)
-                if curr_section_id and curr_section_id in sections_by_id:
-                    sections_by_id[curr_section_id].question_ids.append(q_id)
-
-                curr_question = q_obj
-                current_main_parent_id = q_id
+                extracted_questions.append(curr_question)
                 order_counter += 1
                 continue
 
-
-            # --- Continuation Region (Multi-line or Multi-page continuation) ---
+            # Continuation
             if curr_question is not None:
-                # Append exact OCR text without modifying original words
                 curr_question.text = f"{curr_question.text} {txt}"
                 curr_question.source_region_ids.append(reg.region_id)
                 curr_question.source_regions.append(Region(page=reg.page, bbox=reg.bbox))
-                curr_question.bbox = _compute_bounding_box(
-                    [DocumentRegion(region_id=r_id, page=r.page, bbox=r.bbox, text="") for r_id, r in zip(curr_question.source_region_ids, curr_question.source_regions)]
-                )
-                if curr_question.page != reg.page:
-                    audit.multi_page_question_count += 1
-                else:
-                    audit.multi_region_question_count += 1
 
-        # ---------------------------------------------------------------------
-        # Stage 4: MCQ Structure Extraction with Authoritative Region Storage
-        # ---------------------------------------------------------------------
+        # Attach options to questions
         for opt_reg in option_regions:
             opt_m = OPTION_PREFIX_RE.match(opt_reg.text.strip())
             label = opt_m.group(1).upper() if opt_m else "A"
             text_val = opt_m.group(2).strip() if opt_m else opt_reg.text.strip()
 
-            opt_x_center = opt_reg.bbox.x + opt_reg.bbox.width / 2.0
-            p_w = 1000.0
-            if doc_understanding_result and doc_understanding_result.pages:
-                p_match = next((p for p in doc_understanding_result.pages if p.page_number == opt_reg.page), None)
-                if p_match and p_match.width > 0:
-                    p_w = p_match.width
-
-            # Find matching parent question using spatial column compatibility & preceding layout position
-            candidate_matches = []
-            for q in extracted_questions:
-                if q.page != opt_reg.page and q.page != opt_reg.page - 1:
-                    continue
-
-                q_x_center = q.bbox.x + q.bbox.width / 2.0
-                col_compatible = abs(opt_x_center - q_x_center) < (0.35 * p_w) or (opt_reg.bbox.x >= q.bbox.x - 50 and opt_reg.bbox.x <= q.bbox.x + q.bbox.width + 50)
-                is_preceding = (opt_reg.page > q.page) or (opt_reg.page == q.page and opt_reg.bbox.y >= q.bbox.y - 15.0)
-
-                if col_compatible and is_preceding:
-                    page_diff = opt_reg.page - q.page
-                    y_diff = opt_reg.bbox.y - q.bbox.y if page_diff == 0 else opt_reg.bbox.y
-                    candidate_matches.append((page_diff, y_diff, q))
-
             target_q = None
-            if candidate_matches:
-                candidate_matches.sort(key=lambda item: (item[0], item[1]))
-                target_q = candidate_matches[0][2]
-            else:
-                fallback_candidates = [q for q in extracted_questions if q.page == opt_reg.page and opt_reg.bbox.y >= q.bbox.y - 15.0]
-                if fallback_candidates:
-                    fallback_candidates.sort(key=lambda q: opt_reg.bbox.y - q.bbox.y)
-                    target_q = fallback_candidates[0]
+            for q in reversed(extracted_questions):
+                if q.page == opt_reg.page and opt_reg.bbox.y >= q.bbox.y - 15.0:
+                    target_q = q
+                    break
 
-            if target_q is not None:
+            if target_q:
                 opt_id = f"opt_{target_q.id}_{label}_{uuid.uuid4().hex[:4]}"
-                extracted_opt = ExtractedOption(
-                    option_id=opt_id,
-                    question_id=target_q.id,
-                    label=label,
-                    text=opt_reg.text.strip(),  # Authoritative exact OCR text
+                target_q.extracted_options.append(ExtractedOption(
+                    option_id=opt_id, question_id=target_q.id, label=label,
+                    text=opt_reg.text.strip(),
                     source_region_ids=[opt_reg.region_id],
                     source_regions=[Region(page=opt_reg.page, bbox=opt_reg.bbox)],
                     extraction_confidence=opt_reg.confidence,
-                    verification_state=opt_reg.verification_state,
-                )
-                target_q.extracted_options.append(extracted_opt)
-                target_q.options.append(f"{label}. {text_val}")  # Backward compatible display array
+                ))
+                target_q.options.append(f"{label}. {text_val}")
                 target_q.question_type = "MCQ"
 
-        # Update final audit stats & multi-region / multi-page counts from extracted questions
         audit.accepted_question_count = len(extracted_questions)
         audit.rejection_reasons = rejection_records
 
-        multi_p_count = 0
-        multi_r_count = 0
-        for q in extracted_questions:
-            q_pages = {r.page for r in q.source_regions}
-            if len(q_pages) > 1:
-                multi_p_count += 1
-            if len(q.source_region_ids) > 1:
-                multi_r_count += 1
-
-        audit.multi_page_question_count = multi_p_count
-        audit.multi_region_question_count = multi_r_count
-
-        # Build DocumentStructureGraph
-        struct_graph = self.doc_understanding_service.build_structure_graph(doc_understanding_result)
-
-        # Invariant Verification: Check for internal graph/audit contradictions
-        cross_page_rels = [
-            rel for rel in doc_understanding_result.relationships if rel.relationship_type == "continuation_of"
-        ]
-        has_cross_page_edges = any(
-            next((r.page for r in doc_understanding_result.regions if r.region_id == rel.source_region_id), None) !=
-            next((r.page for r in doc_understanding_result.regions if r.region_id == rel.target_region_id), None)
-            for rel in cross_page_rels
-        )
-
-        if has_cross_page_edges and audit.multi_page_question_count == 0:
-            audit.invariant_violations.append("INVARIANT_VIOLATION: Cross-page continuations exist in graph but multi_page_question_count is 0")
-
-        duplicate_ids = len(extracted_questions) - len({q.id for q in extracted_questions})
-        if duplicate_ids > 0:
-            audit.invariant_violations.append(f"INVARIANT_VIOLATION: {duplicate_ids} duplicate internal question IDs detected")
+        graph = doc_result.structure_graph or self.doc_understanding_service.build_structure_graph(doc_result)
 
         return DocumentQuestionExtractionResult(
             document_id=document_id,
             questions=extracted_questions,
             sections=classified_sections,
-            uncertain_candidates=uncertain_question_candidates,
+            uncertain_candidates=uncertain_candidates,
             audit=audit,
-            structure_graph=struct_graph,
-            fallback_used=False,
+            structure_graph=graph,
+            fallback_used=True,  # Explicitly mark that regex fallback was used
             invariant_violations=audit.invariant_violations,
         )
-
