@@ -260,11 +260,12 @@ class IntelligentQuestionExtractionService:
             all_source_regions = [Region(page=q_node.page, bbox=q_node.bbox)]
 
             for cont_id in continuation_ids:
-                cont_node = graph.nodes.get(cont_id)
-                if cont_node:
-                    full_text = f"{full_text} {cont_node.text.strip()}"
-                    all_source_ids.append(cont_id)
-                    all_source_regions.append(Region(page=cont_node.page, bbox=cont_node.bbox))
+                if cont_id not in all_source_ids:
+                    cont_node = graph.nodes.get(cont_id)
+                    if cont_node:
+                        full_text = f"{full_text} {cont_node.text.strip()}"
+                        all_source_ids.append(cont_id)
+                        all_source_regions.append(Region(page=cont_node.page, bbox=cont_node.bbox))
 
             # Determine question type
             q_type = "SHORT_ANSWER"
@@ -333,13 +334,39 @@ class IntelligentQuestionExtractionService:
         audit.accepted_question_count = len(extracted_questions)
         audit.rejection_reasons = rejection_records
 
-        # Count multi-region / multi-page questions
+        # Count multi-region / multi-page questions and validate graph invariants
+        edge_map = {(e.source_id, e.target_id): e.relationship for e in graph.edges}
+        question_id_to_region_id = {q.id: q.source_region_ids[0] for q in extracted_questions if q.source_region_ids}
+
         for q in extracted_questions:
             q_pages = {r.page for r in q.source_regions}
             if len(q_pages) > 1:
                 audit.multi_page_question_count += 1
             if len(q.source_region_ids) > 1:
                 audit.multi_region_question_count += 1
+
+            # Invariant 1: Every source_region_id must resolve to an existing graph node
+            for rid in q.source_region_ids:
+                if rid not in graph.nodes:
+                    err = f"Invariant Violation: Question {q.id} source_region_id '{rid}' not found in DocumentStructureGraph."
+                    audit.invariant_violations.append(err)
+
+            # Invariant 2: Subquestion parent_question_id must resolve to an actual parent QUESTION node with subquestion_of edge
+            if q.parent_question_id:
+                parent_region_id = question_id_to_region_id.get(q.parent_question_id)
+                if not parent_region_id or parent_region_id not in graph.nodes:
+                    err = f"Invariant Violation: Subquestion {q.id} parent_question_id '{q.parent_question_id}' does not resolve to an existing graph node."
+                    audit.invariant_violations.append(err)
+                else:
+                    parent_node = graph.nodes[parent_region_id]
+                    if parent_node.role != "QUESTION":
+                        err = f"Invariant Violation: Subquestion {q.id} parent node '{parent_region_id}' has role '{parent_node.role}', expected 'QUESTION'."
+                        audit.invariant_violations.append(err)
+
+                    sub_region_id = q.source_region_ids[0] if q.source_region_ids else None
+                    if sub_region_id and edge_map.get((sub_region_id, parent_region_id)) != "subquestion_of":
+                        err = f"Invariant Violation: Subquestion {q.id} ('{sub_region_id}') missing 'subquestion_of' edge to parent node '{parent_region_id}'."
+                        audit.invariant_violations.append(err)
 
         return DocumentQuestionExtractionResult(
             document_id=document_id,
@@ -352,22 +379,31 @@ class IntelligentQuestionExtractionService:
             invariant_violations=audit.invariant_violations,
         )
 
-    def _extract_display_number(self, text: str) -> str:
-        """Extracts the display question number from text like 'Q1. Explain...' → '1'."""
+    def _extract_display_number(self, text: str, active_parent_num: str = "1") -> str:
+        """Extracts the display question number from text like 'Q1. Explain...' -> '1' or 'a) Define...' -> '1(a)'."""
+        # Subquestion pattern with main digit: 1(a) or Q1(a)
+        m_sub = re.match(
+            r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]",
+            text, re.IGNORECASE
+        )
+        if m_sub:
+            return f"{m_sub.group(1)}({m_sub.group(2).lower()})"
+
+        # Standalone subquestion letter: a) or (a) or a.
+        m_let = re.match(
+            r"^\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]",
+            text, re.IGNORECASE
+        )
+        if m_let:
+            return f"{active_parent_num}({m_let.group(1).lower()})"
+
+        # Primary main question number: Q1. or 1. or 1)
         m = re.match(
             r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\):\-]",
             text, re.IGNORECASE
         )
         if m:
             return m.group(1)
-
-        # Subquestion pattern: 1(a) or Q1(a)
-        m_sub = re.match(
-            r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]]",
-            text, re.IGNORECASE
-        )
-        if m_sub:
-            return f"{m_sub.group(1)}({m_sub.group(2).lower()})"
 
         return str(uuid.uuid4())[:6]
 

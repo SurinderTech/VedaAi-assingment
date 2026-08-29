@@ -213,12 +213,14 @@ TASK: Examine the attached page image AND the OCR text evidence below. Determine
 {context_info}
 IMPORTANT RULES:
 - A numbered item is NOT automatically a question. Consider the document context.
-  "1. Project Work" under an "Internal Assessment" heading is ADMINISTRATIVE content.
-  "1. Explain gradient descent" with a question mark or action verb IS a question.
+  "1. SECTION-A is COMPULSORY consisting of TEN questions..." is INSTRUCTION / SECTION_HEADER content.
+  "2. SECTION-B contains FIVE questions..." is INSTRUCTION / SECTION_HEADER content.
+  "3. SECTION-C contains THREE questions..." is INSTRUCTION / SECTION_HEADER content.
   "General Instructions: 1. Answer all questions" — these are INSTRUCTIONS, not questions.
 - Reference ONLY the supplied OCR region IDs. Do NOT invent new IDs.
 - Do NOT generate replacement text. The OCR text is the authoritative source.
-- If you are uncertain about a region's role, say so with lower confidence.
+- Keep reasoning string concise (max 6 words per entry) to fit response limits.
+- Group contiguous OCR text blocks for the same question into a single structure entry region_ids array.
 
 OCR Evidence (ordered by reading position on page {page_number}):
 {ocr_evidence}
@@ -265,23 +267,19 @@ Respond in valid JSON:
     def _execute_vlm_call(self, prompt: str, image_b64: Optional[str]) -> str:
         """Executes the actual VLM API call."""
         try:
-            from app.services.llm_provider import _call_gemini, _call_openrouter
+            from app.services.llm_provider import llm_complete_multimodal, llm_complete
             import asyncio
 
             async def _run_vlm():
-                primary = (getattr(settings, "PRIMARY_LLM_PROVIDER", "gemini")).lower().strip()
-                if primary == "openrouter" or getattr(settings, "OPENROUTER_API_KEY", ""):
-                    try:
-                        return await _call_openrouter(prompt, image_b64=image_b64)
-                    except Exception as eor:
-                        print(f"[VLM] OpenRouter: {str(eor)[:80]}. Trying Gemini...")
-                        return await _call_gemini(prompt, image_b64=image_b64)
+                if image_b64 and len(image_b64) > 0:
+                    return await llm_complete_multimodal(
+                        prompt,
+                        image_b64=image_b64,
+                        mime_type="image/png",
+                        purpose="document_vision",
+                    )
                 else:
-                    try:
-                        return await _call_gemini(prompt, image_b64=image_b64)
-                    except Exception as eg:
-                        print(f"[VLM] Gemini: {str(eg)[:80]}. Trying OpenRouter...")
-                        return await _call_openrouter(prompt, image_b64=image_b64)
+                    return await llm_complete(prompt, purpose="document_vision")
 
             try:
                 loop = asyncio.get_event_loop()

@@ -316,16 +316,19 @@ class DocumentUnderstandingService:
             vlm_assigned_ids: Set[str] = set()
 
             for struct in understanding.structures:
-                for region_id in struct.region_ids:
-                    if region_id not in region_map:
-                        continue
+                if not struct.region_ids:
+                    continue
 
-                    reg = region_map[region_id]
-                    vlm_assigned_ids.add(region_id)
+                head_id = struct.region_ids[0]
+                cont_ids = struct.region_ids[1:]
 
-                    # VLM hypothesis is the primary evidence source
+                # Process head region
+                if head_id in region_map:
+                    reg = region_map[head_id]
+                    vlm_assigned_ids.add(head_id)
+
                     vlm_hyp = StructureHypothesis(
-                        region_id=region_id,
+                        region_id=head_id,
                         hypothesized_type=struct.role,
                         confidence=struct.confidence,
                         source="vlm_page_understanding",
@@ -337,39 +340,22 @@ class DocumentUnderstandingService:
                         )],
                     )
 
-                    # Attach VLM hypothesis — it has highest weight
                     existing_sources = {h.source for h in reg.conflicting_hypotheses}
                     if "vlm_page_understanding" not in existing_sources:
                         reg.conflicting_hypotheses.append(vlm_hyp)
                     reg.vlm_hypothesis = vlm_hyp
 
-                    # VLM is primary: set region type from VLM when confidence sufficient
                     if struct.confidence >= 0.60:
-                        # Check if deterministic agrees — if so, boost confidence
                         det_agrees = any(
                             h.hypothesized_type == struct.role
                             for h in reg.conflicting_hypotheses
                             if h.source != "vlm_page_understanding"
                         )
-
-                        if det_agrees:
-                            reg.region_type = struct.role
-                            reg.confidence = min(1.0, struct.confidence + 0.05)
-                            reg.verification_state = "VERIFIED"
-                            reg.classification_conflict = False
-                        else:
-                            # VLM disagrees with deterministic — VLM takes priority
-                            # but mark the conflict
-                            old_type = reg.region_type
-                            reg.region_type = struct.role
-                            reg.confidence = struct.confidence
-                            if old_type != "UNKNOWN" and old_type != struct.role:
-                                reg.classification_conflict = True
-                                reg.verification_state = "VERIFIED"  # VLM verified, even if different from regex
-                            else:
-                                reg.verification_state = "VERIFIED"
+                        reg.region_type = struct.role
+                        reg.confidence = min(1.0, struct.confidence + 0.05) if det_agrees else struct.confidence
+                        reg.verification_state = "VERIFIED"
+                        reg.classification_conflict = False
                     else:
-                        # Low VLM confidence — mark uncertain
                         reg.verification_state = "UNCERTAIN"
                         reg.uncertainty = 1.0 - struct.confidence
 
@@ -378,6 +364,30 @@ class DocumentUnderstandingService:
                         description=f"VLM: {struct.reasoning[:100]}",
                         weight=0.9,
                         score=struct.confidence,
+                    ))
+
+                # Process trailing continuation regions in multi-region structure
+                for cont_id in cont_ids:
+                    if cont_id not in region_map:
+                        continue
+                    vlm_assigned_ids.add(cont_id)
+                    cont_reg = region_map[cont_id]
+                    # Continuation regions stay non-QUESTION so they don't spawn duplicate questions
+                    cont_reg.region_type = "UNKNOWN"
+                    cont_reg.verification_state = "VERIFIED"
+                    cont_reg.parent_region_id = head_id
+                    # Add continuation edge
+                    all_relationships.append(RegionRelationship(
+                        source_region_id=cont_id,
+                        target_region_id=head_id,
+                        relationship_type="continuation_of",
+                        confidence=struct.confidence,
+                        evidence=[DocumentEvidence(
+                            signal_type="visual_vlm_verification",
+                            description=f"Multi-region structure continuation of {head_id}",
+                            weight=0.9,
+                            score=struct.confidence,
+                        )],
                     ))
 
             # Apply VLM relationships
@@ -573,7 +583,7 @@ class DocumentUnderstandingService:
             ))
 
         inst_match = re.search(
-            r"^\s*(?:Note|Instructions|General Instructions|Notice|Read carefully|Answer all|All questions carry)[\s\:\-\.]",
+            r"\b(?:Note|Instructions|General Instructions|Notice|Read carefully|Answer all|All questions carry|COMPULSORY|carrying \w+ marks|attempt any \w+ questions)\b",
             text, re.IGNORECASE,
         )
         if inst_match:
@@ -584,7 +594,7 @@ class DocumentUnderstandingService:
             ))
 
         sec_match = re.search(
-            r"^\s*(?:SECTION|PART|GROUP|UNIT|CHAPTER)\s+[\-–\s]*[A-Z0-9IVX]+", text, re.IGNORECASE
+            r"\b(?:SECTION|PART|GROUP|UNIT|CHAPTER)\s*[\-–\s]*[A-Z0-9IVX]+", text, re.IGNORECASE
         )
         if sec_match:
             parser_ev.append(DocumentEvidence(
@@ -593,9 +603,9 @@ class DocumentUnderstandingService:
                 weight=0.5, score=0.95,
             ))
 
-        if sec_match:
+        if sec_match and not interrogative_match:
             parser_type = "SECTION_HEADER"; parser_conf = 0.95
-        elif inst_match:
+        elif inst_match and not interrogative_match:
             parser_type = "INSTRUCTION"; parser_conf = 0.90
         elif opt_match and not interrogative_match:
             parser_type = "OPTION"; parser_conf = 0.88
