@@ -6,7 +6,7 @@ app = FastAPI(title="VedaAI Assessment Extraction API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your deployed frontend origin in production
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
