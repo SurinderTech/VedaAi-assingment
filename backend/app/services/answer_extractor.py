@@ -183,13 +183,36 @@ def _detect_anchors_and_references_in_blocks(
             cleaned_txt = _clean_mark_annotations(txt)
 
             # 1. Combined Paren Anchor: e.g. "1(a)." or "1(j). Discuss in brief..."
+            #    BUT NOT MCQ-answer lines like "Q1. (D) Combustion..." where the option
+            #    letter follows a period+space and represents the chosen option, not a
+            #    subquestion label.  We detect this by checking whether the text between
+            #    the question number and the opening parenthesis contains a period followed
+            #    by at least one whitespace character (structurally: ". (").
             m_paren = DIRECT_PAREN_RE.match(cleaned_txt)
             if m_paren:
                 main_n = m_paren.group(1)
                 sub_c = m_paren.group(2).lower()
                 rest = m_paren.group(3).strip()
 
-                if not _is_false_positive_number(txt, main_n):
+                # Determine whether the separator is ". (" (MCQ-answer style) or
+                # directly adjacent "(" (true subquestion style).  We find the
+                # position of the matched number in the cleaned string and inspect
+                # what comes immediately after it.
+                num_end_pos = cleaned_txt.index(main_n) + len(main_n)
+                after_num = cleaned_txt[num_end_pos:]
+                # If the text after the number begins with optional whitespace then
+                # a period then whitespace before the opening paren, this is an
+                # MCQ-answer selection, not a subquestion anchor.
+                _is_mcq_option_separator = bool(
+                    re.match(r"^\s*\.\s+\(", after_num)
+                )
+
+                if _is_mcq_option_separator:
+                    # Fall through — let the MAIN_ANCHOR_RE branch below handle
+                    # this block as a plain main-question anchor (Q{n}), which
+                    # keeps the full "(D) Combustion..." text as the answer body.
+                    pass
+                elif not _is_false_positive_number(txt, main_n):
                     norm_anchor = f"Q{main_n}({sub_c})"
                     current_main_num = main_n
 

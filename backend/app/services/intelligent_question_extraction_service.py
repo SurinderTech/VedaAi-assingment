@@ -323,6 +323,97 @@ class IntelligentQuestionExtractionService:
                 )
                 continue
 
+            # --- GROUP-PARENT GUARD ---
+            # Some nodes the VLM may (or may not) label QUESTION are actually
+            # group-parent intro headers — they introduce sub-questions but are
+            # not themselves answerable.  Detection criteria (document-agnostic):
+            #   • Text ends with ":" after stripping trailing punctuation/spaces,  OR
+            #   • Body after the question number contains only a short intro phrase
+            #     whose entire content is a known-structural imperative (no real
+            #     question content follows).
+            # This guard is purely structural/linguistic and relies on no document-
+            # specific keywords, coordinates, or templates.
+            _group_parent_intro_re = re.compile(
+                r'\b(?:write\s+briefly|answer\s+the\s+following|attempt\s+any|'
+                r'short\s+answer\s+(?:questions?)?|attempt\s+the\s+following|'
+                r'answer\s+any|describe\s+briefly|explain\s+briefly|'
+                r'give\s+(?:short\s+)?(?:answers?|notes?))\b',
+                re.IGNORECASE,
+            )
+            # Strip number prefix to get the body ("1. Write briefly :" → "Write briefly :")
+            _body_after_num = re.sub(
+                r'^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[.):–-]?\s*', '', q_text
+            ).strip()
+            _ends_with_colon = q_text.rstrip().endswith(':')
+            _is_intro_only = bool(
+                _group_parent_intro_re.search(_body_after_num)
+                and len(_body_after_num) < 80       # intro phrase is short
+            )
+            if _ends_with_colon or _is_intro_only:
+                audit.rejected_count += 1
+                print(
+                    f"[IntelligentExtraction] Group-parent guard: rejected intro-only node "
+                    f"'{q_text[:60]}' (region={q_node.region_id}) — promoting its subquestions to top-level."
+                )
+                # PROMOTION: Walk subquestion_of children and emit them as top-level questions.
+                # Without this, Section-A style "1. Write briefly : → (a)(b)…(j)" would lose
+                # all sub-questions when the parent is rejected, making student answers unmatchable.
+                _parent_num = display_num or re.sub(
+                    r'^\s*(?:Q(?:uestion)?\.?\s*)?\D*(\d{1,3})\s*.*', r'\1', q_text
+                ).strip() or "1"
+                for _child_id, _rel, _conf in children_of.get(q_node.region_id, []):
+                    if _rel != "subquestion_of":
+                        continue
+                    _child_node = graph.nodes.get(_child_id)
+                    if not _child_node or _child_node.role not in ("SUBQUESTION", "QUESTION", "UNKNOWN"):
+                        continue
+                    _child_text = _child_node.text.strip()
+                    if not _child_text:
+                        continue
+                    # Derive display number: "(a) Define..." → "1(a)"
+                    _sub_m = re.match(
+                        r'^\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)', _child_text, re.IGNORECASE
+                    )
+                    _sub_label = _sub_m.group(1).lower() if _sub_m else None
+                    _promoted_num = f"{_parent_num}({_sub_label})" if _sub_label else _child_text[:10]
+                    _promoted_id = f"Q{_promoted_num.replace(' ', '')}"
+
+                    # Skip duplicates
+                    if _promoted_num in seen_display_numbers:
+                        continue
+                    _sp_key = (_child_node.page, round(_child_node.bbox.y / 5.0))
+                    if _sp_key in seen_spatial_keys:
+                        continue
+
+                    seen_display_numbers[_promoted_num] = (_child_id, _child_node.confidence)
+                    seen_spatial_keys.add(_sp_key)
+
+                    _child_region = region_map.get(_child_id)
+                    _promoted_sec = section_for_region.get(_child_id) or section_for_region.get(q_node.region_id)
+                    _promoted_q = Question(
+                        id=_promoted_id,
+                        number=_promoted_num,
+                        text=_child_text,
+                        page=_child_node.page,
+                        bbox=_child_node.bbox,
+                        order_index=order_counter,
+                        section=_promoted_sec,
+                        question_type="SHORT_ANSWER",
+                        source_region_ids=[_child_id],
+                        source_regions=[Region(page=_child_node.page, bbox=_child_node.bbox)],
+                        extraction_confidence=_child_node.confidence,
+                        verification_state=_child_region.verification_state if _child_region else "UNVERIFIED",
+                    )
+                    extracted_questions.append(_promoted_q)
+                    order_counter += 1
+                    print(
+                        f"[IntelligentExtraction] Group-parent promotion: emitted '{_promoted_num}' "
+                        f"as top-level question from parent '{q_text[:40]}'."
+                    )
+                continue
+
+
+
             # Deduplication: reject same display_number with lower confidence
             _is_uuid_fallback = len(display_num) == 6 and display_num.replace('-', '').isalnum()
             if display_num and not _is_uuid_fallback:
@@ -452,6 +543,99 @@ class IntelligentQuestionExtractionService:
                 if not (q.source_region_ids and q.source_region_ids[0] in rejected_region_ids)
             ]
 
+        # ORPHAN SUBQUESTION SWEEP
+        # Walk every SUBQUESTION node in the graph.  If its parent QUESTION was never
+        # emitted (e.g. because the VLM correctly labelled the parent as INSTRUCTION, or
+        # because the parent was rejected by the group-parent guard without any
+        # subquestion_of edges we could walk at that time), promote the orphan to a
+        # top-level question so it can be matched to student answers.
+        _emitted_region_ids = {
+            rid for q in extracted_questions for rid in (q.source_region_ids or [])
+        }
+        # Build a map: child_region_id → parent_region_id for subquestion_of edges
+        _subq_to_parent: Dict[str, str] = {}
+        for edge in graph.edges:
+            if edge.relationship == "subquestion_of":
+                _subq_to_parent[edge.source_id] = edge.target_id
+
+        for node_id, node in graph.nodes.items():
+            if node.role not in ("SUBQUESTION", "QUESTION"):
+                continue
+            # Only handle nodes NOT yet emitted
+            if node_id in _emitted_region_ids:
+                continue
+            # Only handle nodes whose parent is ALSO not emitted (true orphan)
+            parent_id = _subq_to_parent.get(node_id)
+            if parent_id and parent_id in _emitted_region_ids:
+                continue  # parent was emitted; subquestion is attached as child — skip
+
+            node_text = node.text.strip()
+            if not node_text:
+                continue
+
+            # Fragment guard — skip bare markers like "(i)", "(a)" with no body
+            _frag_re = re.compile(
+                r'^\s*[\(\[]?\s*(?:i{1,4}v?|vi{0,3}|ix|x{1,3}|[a-dA-D]|[ivxlcdm]{1,4})\s*[\)\]\.\:]?\s*$',
+                re.IGNORECASE
+            )
+            if _frag_re.match(node_text) and len(node_text) <= 8:
+                continue
+
+            # Derive parent number from edge target, or infer from text
+            _orphan_parent_num = "1"
+            if parent_id:
+                _p_node = graph.nodes.get(parent_id)
+                if _p_node:
+                    _pm = re.match(r'^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})', _p_node.text.strip(), re.IGNORECASE)
+                    if _pm:
+                        _orphan_parent_num = _pm.group(1)
+
+            # Derive subquestion label from text
+            _sub_m2 = re.match(
+                r'^\s*(?:(\d{1,3})\s*[\.\-]?\s*)?[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)',
+                node_text, re.IGNORECASE
+            )
+            if _sub_m2:
+                _main_n = _sub_m2.group(1) or _orphan_parent_num
+                _sub_l  = _sub_m2.group(2).lower()
+                _orphan_num = f"{_main_n}({_sub_l})"
+            else:
+                # Can't derive a structured number — use full text prefix as key
+                _orphan_num = node_text[:15]
+
+            if _orphan_num in seen_display_numbers:
+                continue
+            _sp_key2 = (node.page, round(node.bbox.y / 5.0))
+            if _sp_key2 in seen_spatial_keys:
+                continue
+
+            seen_display_numbers[_orphan_num] = (node_id, node.confidence)
+            seen_spatial_keys.add(_sp_key2)
+
+            _orphan_region = region_map.get(node_id)
+            _orphan_sec = section_for_region.get(node_id)
+            _orphan_q = Question(
+                id=f"Q{_orphan_num.replace(' ', '')}",
+                number=_orphan_num,
+                text=node_text,
+                page=node.page,
+                bbox=node.bbox,
+                order_index=order_counter,
+                section=_orphan_sec,
+                question_type="SHORT_ANSWER",
+                source_region_ids=[node_id],
+                source_regions=[Region(page=node.page, bbox=node.bbox)],
+                extraction_confidence=node.confidence,
+                verification_state=_orphan_region.verification_state if _orphan_region else "UNVERIFIED",
+            )
+            extracted_questions.append(_orphan_q)
+            order_counter += 1
+            print(
+                f"[IntelligentExtraction] Orphan sweep: promoted orphan subquestion '{_orphan_num}' "
+                f"(region={node_id}) to top-level question."
+            )
+
+
         # Record non-question rejections for audit — preserving all semantic visual structures
         _AUDIT_NON_QUESTION_ROLES = {
             "HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER",
@@ -474,8 +658,18 @@ class IntelligentQuestionExtractionService:
                 ))
                 audit.rejected_count += 1
 
+        # Re-sort by reading order (page, Y) after potential promotions have been appended
+        extracted_questions.sort(key=lambda q: (
+            q.source_regions[0].page if q.source_regions else q.page,
+            q.bbox.y if q.bbox else 0,
+            q.bbox.x if q.bbox else 0,
+        ))
+        for _oi, _q in enumerate(extracted_questions):
+            _q.order_index = _oi
+
         audit.accepted_question_count = len(extracted_questions)
         audit.rejection_reasons = rejection_records
+
 
         # Count multi-region / multi-page questions and validate graph invariants
         edge_map = {(e.source_id, e.target_id): e.relationship for e in graph.edges}

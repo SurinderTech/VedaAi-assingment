@@ -491,6 +491,13 @@ RULES:
 7. For figures/diagrams: use FIGURE or DIAGRAM and link to their caption with a "caption_of" relationship.
 8. Do NOT repeat long text in the output; the OCR evidence provides the exact text.
 9. An OPTION region belongs to exactly ONE QUESTION. Never assign the same option to multiple questions.
+10. CRITICAL — QUESTION vs INSTRUCTION distinction:
+    A real QUESTION is something a student must directly respond to (e.g. "What is photosynthesis?", "Define deep learning.", "Calculate the resistance.").
+    An INSTRUCTION or group-parent header is text that introduces or organises other questions but is NOT itself answerable — e.g. "Write briefly :", "Answer any FOUR of the following:", "1. Write short notes on:". These MUST be labelled INSTRUCTION, NOT QUESTION.
+    Rule: if a numbered item ends with a colon ":" or contains only an imperative intro phrase ("write briefly", "answer the following", "attempt any", "short answer questions") with no actual question body, label it INSTRUCTION.
+11. CRITICAL — SECTION_HEADER:
+    Labels like "SECTION-A", "SECTION A (COMPULSORY)", "PART B", "GROUP I" that delimit groups of questions must be labelled SECTION_HEADER, not QUESTION or INSTRUCTION.
+    Connect questions inside a section to the section using the "section_member" relationship.
 
 OCR Evidence (page {page_number}):
 {ocr_evidence}
