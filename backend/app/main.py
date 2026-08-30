@@ -8,6 +8,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://veda-ai-assingment-ldl1hla7z.vercel.app",
+        "https://veda-ai-assingment.vercel.app",
         "http://localhost:3000",
         "http://localhost:3001",
     ],
