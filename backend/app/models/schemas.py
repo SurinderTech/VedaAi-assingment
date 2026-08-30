@@ -671,6 +671,7 @@ class GraphEdge(BaseModel):
     relationship: RelationshipType
     confidence: float = 1.0
     evidence_sources: List[str] = []
+    semantic_state: Literal["CONFIDENT", "PARTIAL", "AMBIGUOUS", "UNKNOWN", "UNRESOLVED", "CONFLICTING"] = "CONFIDENT"
 
 
 class GraphNode(BaseModel):
@@ -680,6 +681,7 @@ class GraphNode(BaseModel):
     page: int
     bbox: BBox
     confidence: float = 1.0
+    semantic_state: Literal["CONFIDENT", "PARTIAL", "AMBIGUOUS", "UNKNOWN", "UNRESOLVED", "CONFLICTING"] = "CONFIDENT"
 
 
 class DocumentStructureGraph(BaseModel):
@@ -687,6 +689,7 @@ class DocumentStructureGraph(BaseModel):
     edges: List[GraphEdge] = []
     document_purpose: DocumentPurpose = "UNKNOWN"
     page_roles: Dict[int, str] = {}
+    graph_semantic_state: Literal["CONFIDENT", "PARTIAL", "AMBIGUOUS", "UNKNOWN", "UNRESOLVED", "CONFLICTING"] = "CONFIDENT"
 
 
 SignalType = Literal[
@@ -872,8 +875,18 @@ ExtractedQuestion = Question
 
 
 class VLMStructureItem(BaseModel):
-    """One structural element identified by the VLM's page understanding."""
+    """One structural element identified by the VLM's page understanding.
+
+    region_ids are optional because a meaningful visual structure may be discovered
+    from the page image even when no OCR block already encodes that semantic unit.
+    bbox is the authoritative visual geometry for such visual-only structures and is
+    later grounded back to OCR evidence when matching region IDs exist.
+    """
     region_ids: List[str] = []
+    grounded_region_ids: List[str] = []
+    grounding_status: str = "UNGROUNDED"
+    grounded_text: str = ""
+    bbox: Optional[BBox] = None
     role: DocumentRegionType = "UNKNOWN"
     display_number: Optional[str] = None
     display_label: Optional[str] = None

@@ -181,6 +181,22 @@ class IntelligentQuestionExtractionService:
         region_map = {r.region_id: r for r in doc_result.regions}
         audit = ExtractionAudit(candidate_count=len(graph.nodes))
 
+        if graph.graph_semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
+            for node in graph.nodes.values():
+                if node.semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
+                    audit.uncertain_count += 1
+                    audit.conflicts.append(f"Graph semantic state is {graph.graph_semantic_state} for node {node.region_id}.")
+            return DocumentQuestionExtractionResult(
+                document_id=document_id,
+                questions=[],
+                sections=[],
+                uncertain_candidates=[],
+                audit=audit,
+                structure_graph=graph,
+                fallback_used=False,
+                invariant_violations=[f"Semantic validation blocked extraction: graph semantic state is {graph.graph_semantic_state}"],
+            )
+
         # Build edge indices
         # target_id → list of (source_id, relationship, confidence)
         children_of: Dict[str, List[Tuple[str, str, float]]] = {}
@@ -235,6 +251,21 @@ class IntelligentQuestionExtractionService:
         order_counter = 0
 
         for q_node in question_nodes:
+            if q_node.semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
+                uncertain_candidates.append(Question(
+                    id=f"{document_id}:{q_node.region_id}",
+                    number=self._extract_display_number(q_node.text.strip()),
+                    text=q_node.text.strip(),
+                    page=q_node.page,
+                    bbox=q_node.bbox,
+                    source_region_ids=[q_node.region_id],
+                    source_regions=[Region(page=q_node.page, bbox=q_node.bbox)],
+                    extraction_confidence=q_node.confidence,
+                    verification_state="UNCERTAIN",
+                ))
+                audit.uncertain_count += 1
+                continue
+
             region = region_map.get(q_node.region_id)
             if not region:
                 continue
@@ -244,7 +275,7 @@ class IntelligentQuestionExtractionService:
             display_num = self._extract_display_number(q_text)
 
             # Build question ID: document_id:region_id
-            q_id = f"{document_id}:{q_node.region_id}"
+            q_id = f"Q{self._extract_display_number(q_text)}"
 
             # Find section for this question
             sec_title = section_for_region.get(q_node.region_id)
@@ -280,6 +311,10 @@ class IntelligentQuestionExtractionService:
                 bbox=_compute_bounding_box([region_map[rid] for rid in all_source_ids if rid in region_map]) or q_node.bbox,
                 order_index=order_counter,
                 section=sec_title,
+                parent_question_id=(
+                    f"Q{display_num.split('(', 1)[0]}"
+                    if "(" in display_num else None
+                ),
                 question_type=q_type,
                 source_region_ids=all_source_ids,
                 source_regions=all_source_regions,
@@ -322,12 +357,13 @@ class IntelligentQuestionExtractionService:
         # Record non-question rejections for audit
         for node_id, node in graph.nodes.items():
             if node.role in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER"):
+                reason_label = "administrative" if node.role in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION") else "section"
                 rejection_records.append(RejectionRecord(
                     region_id=node_id,
                     ocr_text=node.text[:60],
                     classification=node.role,
                     confidence=node.confidence,
-                    reason=f"Graph node classified as {node.role} — not a question.",
+                    reason=f"Administrative {node.role.lower()} content — not a question.",
                 ))
                 audit.rejected_count += 1
 
@@ -509,7 +545,7 @@ class IntelligentQuestionExtractionService:
             parent_num = parent_question.number
             display_num = f"{parent_num}({sub_label})"
 
-            sub_id = f"{document_id}:{child_id}"
+            sub_id = f"Q{display_num.replace(' ', '')}"
             sub_q = Question(
                 id=sub_id,
                 number=display_num,
@@ -617,6 +653,39 @@ class IntelligentQuestionExtractionService:
             if not txt:
                 continue
 
+            combined_sub_m = re.match(
+                r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.:]\s*(.*)$",
+                txt,
+                re.IGNORECASE,
+            )
+            if combined_sub_m:
+                main_num = combined_sub_m.group(1)
+                sub_label = combined_sub_m.group(2).lower()
+                body = combined_sub_m.group(3).strip()
+                q_id = f"Q{main_num}({sub_label})"
+
+                q_obj = Question(
+                    id=q_id,
+                    number=f"{main_num}({sub_label})",
+                    text=txt,
+                    page=reg.page,
+                    bbox=reg.bbox,
+                    order_index=order_counter,
+                    section=curr_section_title,
+                    parent_question_id=f"Q{main_num}",
+                    question_type="SUBQUESTION",
+                    source_region_ids=[reg.region_id],
+                    source_regions=[Region(page=reg.page, bbox=reg.bbox)],
+                    extraction_confidence=reg.confidence,
+                    verification_state=reg.verification_state,
+                )
+                extracted_questions.append(q_obj)
+                if reg.verification_state in ("UNCERTAIN", "CONFLICTED") or reg.confidence < 0.65:
+                    uncertain_candidates.append(q_obj)
+                    audit.uncertain_count += 1
+                order_counter += 1
+                continue
+
             main_m = MAIN_QUESTION_PREFIX_RE.match(txt)
             if main_m:
                 q_num_m = re.match(r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})", txt, re.IGNORECASE)
@@ -633,6 +702,9 @@ class IntelligentQuestionExtractionService:
                     verification_state=reg.verification_state,
                 )
                 extracted_questions.append(curr_question)
+                if reg.verification_state in ("UNCERTAIN", "CONFLICTED") or reg.confidence < 0.65:
+                    uncertain_candidates.append(curr_question)
+                    audit.uncertain_count += 1
                 order_counter += 1
                 continue
 

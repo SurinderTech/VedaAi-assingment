@@ -35,6 +35,9 @@ from app.models.schemas import (
     DocumentRegion,
     DocumentPage,
     DocumentUnderstandingResult,
+    DocumentStructureGraph,
+    GraphNode,
+    GraphEdge,
 )
 from app.services.intelligent_question_extraction_service import IntelligentQuestionExtractionService
 from app.services.question_extractor import extract_questions
@@ -70,6 +73,34 @@ def run_all_step11c_tests():
         assert len(res_f) == 1
         assert res_f[0].number == "1"
     print("[TEST 3 PASSED] Feature flag INTELLIGENT_EXTRACTION_ENABLED=False uses legacy path")
+
+    # -------------------------------------------------------------------------
+    # TEST 3B: Never force uncertain graph semantics into extraction
+    # -------------------------------------------------------------------------
+    ambiguous_graph = DocumentUnderstandingResult(
+        document_id="ambiguous_doc",
+        regions=[
+            DocumentRegion(region_id="q1", page=1, text="1. What is a machine learning model?", bbox=BBox(x=10, y=10, width=200, height=20), confidence=0.4, verification_state="UNCERTAIN", region_type="QUESTION"),
+            DocumentRegion(region_id="o1", page=1, text="A. classifier", bbox=BBox(x=20, y=35, width=120, height=18), confidence=0.5, verification_state="UNCERTAIN", region_type="OPTION"),
+        ],
+        relationships=[],
+        structure_graph=DocumentStructureGraph(
+            nodes={
+                "q1": GraphNode(region_id="q1", role="QUESTION", text="1. What is a machine learning model?", page=1, bbox=BBox(x=10, y=10, width=200, height=20), confidence=0.4, semantic_state="AMBIGUOUS"),
+                "o1": GraphNode(region_id="o1", role="OPTION", text="A. classifier", page=1, bbox=BBox(x=20, y=35, width=120, height=18), confidence=0.5, semantic_state="CONFIDENT"),
+            },
+            edges=[
+                GraphEdge(source_id="o1", target_id="q1", relationship="option_of", confidence=0.3, semantic_state="UNRESOLVED"),
+            ],
+        ),
+    )
+    ambig_res = service._extract_from_graph(
+        graph=ambiguous_graph.structure_graph,
+        doc_result=ambiguous_graph,
+        document_id="ambiguous_doc",
+    )
+    assert ambig_res.questions == []
+    print("[TEST 3B PASSED] Ambiguous graph semantics are not forced into extraction")
 
     # -------------------------------------------------------------------------
     # TEST 4: Safe Fallback on Exception in Step 11C

@@ -481,6 +481,9 @@ async def extract_questions(
             )
             if extraction_res.questions and len(extraction_res.questions) > 0:
                 return extraction_res.questions
+            if doc_understanding_result is not None and getattr(doc_understanding_result, "structure_graph", None):
+                print("[QuestionExtractor] Semantic graph produced no safe questions; preserving uncertainty instead of reparsing OCR.")
+                return []
             print("[QuestionExtractor] Step 11C returned zero questions, invoking safe legacy fallback.")
         except Exception as e:
             print(f"[QuestionExtractor] Step 11C exception ({e}), invoking safe legacy fallback.")

@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from app.core.config import settings
 from app.models.schemas import (
     Block,
+    BBox,
     DocumentRegion,
     DocumentUnderstandingResult,
     VisualVerificationResponse,
@@ -231,18 +232,25 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
 
         return f"""You are analyzing page {page_number} of {total_pages} from an academic document.
 
-TASK: Examine the attached page image AND the OCR text evidence below. Determine what this page contains and how its content is structured.
+    TASK: Examine the attached page image AND the OCR text evidence below. Determine what this page contains and how its content is structured.
 {context_info}
 IMPORTANT RULES:
+- Identify ALL meaningful visual structures on the page. Return one structure per semantically independent unit.
+- Keep a question, each answer option, each subquestion, each table, and each diagram as separate structures. Never put options inside a QUESTION structure's region_ids.
+- Use relationships to connect separate structures. A question may have no relationship when it is standalone.
+- Do not treat page furniture, publisher advertisements, watermarks, QR codes, page numbers, or document-end notices as question text or question continuations. Classify them as FOOTER, METADATA, or UNKNOWN.
 - A numbered item is NOT automatically a question. Consider the document context.
   "1. SECTION-A is COMPULSORY consisting of TEN questions..." is INSTRUCTION / SECTION_HEADER content.
   "2. SECTION-B contains FIVE questions..." is INSTRUCTION / SECTION_HEADER content.
   "3. SECTION-C contains THREE questions..." is INSTRUCTION / SECTION_HEADER content.
   "General Instructions: 1. Answer all questions" — these are INSTRUCTIONS, not questions.
-- Reference ONLY the supplied OCR region IDs. Do NOT invent new IDs.
-- Do NOT generate replacement text. The OCR text is the authoritative source.
+- Treat the page image as the authoritative source for visual structure.
+- OCR text and OCR geometry are supporting evidence for grounding, not the only source of structure.
+- A meaningful visual region may exist even if it is not already represented by an OCR block.
+- If a structure is visually discovered but lacks an exact OCR region, return its visual bbox and leave region_ids empty.
+- Do NOT invent textual content. Preserve exact OCR text when grounding, but do not rewrite it.
 - Keep reasoning string concise (max 6 words per entry) to fit response limits.
-- Group contiguous OCR text blocks for the same question into a single structure entry region_ids array.
+- If OCR blocks map cleanly to a structure, include their region_ids; otherwise use bbox-only visual discovery.
 
 OCR Evidence (ordered by reading position on page {page_number}):
 {ocr_evidence}
@@ -251,9 +259,9 @@ Respond in valid JSON:
 {{
   "page_purpose": "QUESTION_PAGE" | "COVER" | "INSTRUCTIONS" | "CONTINUATION" | "MIXED" | "ADMINISTRATIVE",
   "document_purpose": "EXAMINATION_PAPER" | "ASSIGNMENT" | "INSTRUCTIONS" | "UNKNOWN",
-  "structures": [
+    "structures": [
     {{
-      "region_ids": ["id1", "id2"],
+    "region_ids": ["id1"],
       "role": "QUESTION" | "OPTION" | "SUBQUESTION" | "SECTION_HEADER" | "INSTRUCTION" | "METADATA" | "HEADER" | "FOOTER" | "ADMINISTRATIVE" | "TABLE" | "DIAGRAM" | "CONTINUATION" | "UNKNOWN",
       "display_number": "1",
       "display_label": "Section A",
@@ -400,12 +408,28 @@ Respond in valid JSON:
             page_purpose = data.get("page_purpose", "UNKNOWN")
             document_purpose = data.get("document_purpose", "UNKNOWN")
 
-            # Parse structures — validate region IDs against real OCR blocks
+            # Parse structures — accept either OCR-grounded or bbox-only visual structures.
             structures: List[VLMStructureItem] = []
             for item in data.get("structures", []):
                 raw_ids = item.get("region_ids", [])
                 validated_ids = [rid for rid in raw_ids if rid in valid_ids]
-                if not validated_ids:
+
+                bbox_value = item.get("bbox")
+                parsed_bbox = None
+                if bbox_value is not None:
+                    try:
+                        if isinstance(bbox_value, (list, tuple)) and len(bbox_value) >= 4:
+                            x1, y1, x2, y2 = [float(v) for v in bbox_value[:4]]
+                            parsed_bbox = BBox(
+                                x=min(x1, x2),
+                                y=min(y1, y2),
+                                width=max(abs(x2 - x1), 0.0),
+                                height=max(abs(y2 - y1), 0.0),
+                            )
+                    except Exception:
+                        parsed_bbox = None
+
+                if not validated_ids and parsed_bbox is None:
                     continue
 
                 role = item.get("role", "UNKNOWN")
@@ -425,6 +449,7 @@ Respond in valid JSON:
 
                 structures.append(VLMStructureItem(
                     region_ids=validated_ids,
+                    bbox=parsed_bbox,
                     role=normalized_role,
                     display_number=item.get("display_number"),
                     display_label=item.get("display_label"),

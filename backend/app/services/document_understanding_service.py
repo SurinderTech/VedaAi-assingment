@@ -15,6 +15,7 @@ Preserves 100% of original OCR geometry, BBoxes, and text without alteration.
 """
 from __future__ import annotations
 import re
+import uuid
 from typing import List, Dict, Optional, Tuple, Any, Set
 
 from app.core.config import settings
@@ -311,6 +312,79 @@ class DocumentUnderstandingService:
 
         return context
 
+    def _bbox_area(self, bbox: BBox) -> float:
+        return max(0.0, float(bbox.width)) * max(0.0, float(bbox.height))
+
+    def _bbox_overlap_area(self, bbox_a: BBox, bbox_b: BBox) -> float:
+        x1 = max(float(bbox_a.x), float(bbox_b.x))
+        x2 = min(float(bbox_a.x + bbox_a.width), float(bbox_b.x + bbox_b.width))
+        y1 = max(float(bbox_a.y), float(bbox_b.y))
+        y2 = min(float(bbox_a.y + bbox_a.height), float(bbox_b.y + bbox_b.height))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        return (x2 - x1) * (y2 - y1)
+
+    def _ground_structure_to_ocr(
+        self,
+        structure: VLMStructureItem,
+        page_regions: List[DocumentRegion],
+        page_number: int,
+    ) -> Tuple[List[str], str, str]:
+        """Geometry-only grounding: map a VLM visual bbox to OCR regions without using regex or keywords."""
+        if not structure.bbox:
+            return [], "UNGROUNDED", ""
+
+        candidates: List[Tuple[float, DocumentRegion]] = []
+        visual_area = self._bbox_area(structure.bbox)
+        for reg in page_regions:
+            if reg.page != page_number:
+                continue
+            overlap = self._bbox_overlap_area(structure.bbox, reg.bbox)
+            if overlap <= 0:
+                continue
+
+            reg_area = self._bbox_area(reg.bbox)
+            fully_contained = (
+                reg.bbox.x >= structure.bbox.x and
+                reg.bbox.y >= structure.bbox.y and
+                reg.bbox.x + reg.bbox.width <= structure.bbox.x + structure.bbox.width and
+                reg.bbox.y + reg.bbox.height <= structure.bbox.y + structure.bbox.height
+            )
+            overlap_fraction = overlap / max(visual_area, 1.0)
+            reg_fraction = overlap / max(reg_area, 1.0)
+            y_overlap = max(0.0, min(structure.bbox.y + structure.bbox.height, reg.bbox.y + reg.bbox.height) - max(structure.bbox.y, reg.bbox.y))
+            y_span = max(structure.bbox.height, reg.bbox.height)
+            y_alignment = y_overlap / max(y_span, 1.0)
+            x_overlap = max(0.0, min(structure.bbox.x + structure.bbox.width, reg.bbox.x + reg.bbox.width) - max(structure.bbox.x, reg.bbox.x))
+            x_axis = max(structure.bbox.width, reg.bbox.width)
+            x_alignment = x_overlap / max(x_axis, 1.0)
+
+            score = 0.0
+            if fully_contained:
+                score += 0.65
+            score += min(0.50, overlap_fraction * 2.25)
+            score += min(0.40, reg_fraction * 1.4)
+            score += min(0.35, y_alignment * 1.25)
+            score += min(0.25, x_alignment * 1.0)
+
+            if score >= 0.15:
+                candidates.append((score, reg))
+
+        if not candidates:
+            return [], "UNGROUNDED", ""
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        top_score = candidates[0][0]
+        keep = [reg for score, reg in candidates if score >= max(0.2, top_score * 0.6)]
+        grounded_ids = [reg.region_id for reg in sorted(keep, key=lambda r: (r.page, r.bbox.y, r.bbox.x))]
+        status = "GROUNDED" if len(grounded_ids) >= 1 else "UNGROUNDED"
+        if len(grounded_ids) == 1 and top_score < 0.30:
+            status = "PARTIALLY_GROUNDED"
+        elif len(grounded_ids) > 1 and top_score < 0.40:
+            status = "PARTIALLY_GROUNDED"
+        grounded_text = " ".join(reg.text.strip() for reg in sorted(keep, key=lambda r: (r.bbox.y, r.bbox.x)) if reg.text and reg.text.strip())
+        return grounded_ids, status, grounded_text
+
     def _apply_vlm_page_understandings(
         self,
         vlm_understandings: List[VLMPageUnderstanding],
@@ -337,16 +411,150 @@ class DocumentUnderstandingService:
             vlm_assigned_ids: Set[str] = set()
 
             for struct in understanding.structures:
-                if not struct.region_ids:
+                if not struct.region_ids and not struct.bbox:
                     continue
 
-                head_id = struct.region_ids[0]
-                cont_ids = struct.region_ids[1:]
+                if struct.region_ids:
+                    head_id = struct.region_ids[0]
+                    cont_ids = struct.region_ids[1:]
+                    grounded_ids = list(struct.region_ids)
+                    grounding_status = "GROUNDED"
+                    grounded_text = " ".join(region_map.get(rid, DocumentRegion(region_id=rid, page=understanding.page_number, text="", bbox=BBox(x=0, y=0, width=0, height=0))).text.strip() for rid in grounded_ids if rid in region_map)
+                    
+                    # Populate grounding metadata
+                    struct.grounded_region_ids = grounded_ids
+                    struct.grounding_status = grounding_status
+                    struct.grounded_text = grounded_text
+                else:
+                    grounded_ids, grounding_status, grounded_text = self._ground_structure_to_ocr(
+                        structure=struct,
+                        page_regions=[r for r in all_regions if r.page == understanding.page_number],
+                        page_number=understanding.page_number,
+                    )
+                    if grounded_ids:
+                        head_id = f"vlm_visual_{understanding.page_number}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
+                        cont_ids = []
+                        synthetic_text = grounded_text if grounded_text else (struct.display_label or struct.display_number or struct.role)
+                        synthetic_region = DocumentRegion(
+                            region_id=head_id,
+                            page=understanding.page_number,
+                            text=synthetic_text,
+                            bbox=struct.bbox or BBox(x=0.0, y=0.0, width=0.0, height=0.0),
+                            region_type=struct.role,
+                            source="vlm_visual",
+                            confidence=max(0.0, min(1.0, float(struct.confidence))),
+                            evidence=[DocumentEvidence(
+                                signal_type="visual_vlm_verification",
+                                description=f"VLM visual structure: {struct.reasoning[:100]}",
+                                weight=0.9,
+                                score=struct.confidence,
+                            )],
+                            verification_state="VERIFIED",
+                            metadata={
+                                "grounded_region_ids": grounded_ids,
+                                "grounding_status": grounding_status,
+                                "grounded_text": grounded_text,
+                                "structure_source": understanding.structure_source,
+                            },
+                        )
+                        all_regions.append(synthetic_region)
+                        region_map[head_id] = synthetic_region
+                        vlm_assigned_ids.add(head_id)
+                        struct.grounded_region_ids = grounded_ids
+                        struct.grounding_status = grounding_status
+                        struct.grounded_text = grounded_text
+                        if struct.role != "UNKNOWN":
+                            synthetic_region.region_type = struct.role
+                        continue
+
+                    head_id = f"vlm_visual_{understanding.page_number}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
+                    cont_ids = []
+                    synthetic_text = struct.display_label or struct.display_number or struct.role
+                    synthetic_region = DocumentRegion(
+                        region_id=head_id,
+                        page=understanding.page_number,
+                        text=synthetic_text,
+                        bbox=struct.bbox or BBox(x=0.0, y=0.0, width=0.0, height=0.0),
+                        region_type=struct.role,
+                        source="vlm_visual",
+                        confidence=max(0.0, min(1.0, float(struct.confidence))),
+                        evidence=[DocumentEvidence(
+                            signal_type="visual_vlm_verification",
+                            description=f"VLM visual structure without OCR grounding: {struct.reasoning[:100]}",
+                            weight=0.9,
+                            score=struct.confidence,
+                        )],
+                        verification_state="UNVERIFIED",
+                        metadata={
+                            "grounded_region_ids": [],
+                            "grounding_status": "UNGROUNDED",
+                            "grounded_text": "",
+                            "structure_source": understanding.structure_source,
+                        },
+                    )
+                    all_regions.append(synthetic_region)
+                    region_map[head_id] = synthetic_region
+                    vlm_assigned_ids.add(head_id)
+                    struct.grounded_region_ids = []
+                    struct.grounding_status = "UNGROUNDED"
+                    struct.grounded_text = ""
+                    if struct.role != "UNKNOWN":
+                        synthetic_region.region_type = struct.role
+                    continue
 
                 # Process head region
                 if head_id in region_map:
                     reg = region_map[head_id]
                     vlm_assigned_ids.add(head_id)
+
+                    preserve_parser_role = False
+                    if reg.region_type == "SUBQUESTION" and struct.role == "QUESTION":
+                        preserve_parser_role = bool(re.match(
+                            r"^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[\.\:\-]?\s*[\(\[]?\s*[a-z]{1,2}\s*[\)\]\.:]",
+                            reg.text,
+                            re.IGNORECASE,
+                        ))
+                    elif reg.region_type == "OPTION" and struct.role == "QUESTION":
+                        preserve_parser_role = bool(re.match(
+                            r"^\s*[A-Da-d1-9i-zIVXLCDM]+\s*[\)\]\.:]",
+                            reg.text,
+                            re.IGNORECASE,
+                        ))
+
+                    if preserve_parser_role:
+                        reg.verification_state = "VERIFIED"
+                        reg.confidence = max(reg.confidence, min(1.0, float(struct.confidence) * 0.95))
+                        reg.evidence.append(DocumentEvidence(
+                            signal_type="visual_vlm_verification",
+                            description=f"Parser numbering pattern preserved over generic VLM QUESTION label: {struct.reasoning[:80]}",
+                            weight=0.8,
+                            score=float(struct.confidence),
+                        ))
+                        continue
+
+                    if cont_ids:
+                        preserved_cont_ids = []
+                        for cont_id in cont_ids:
+                            cont_reg = region_map.get(cont_id)
+                            if cont_reg and cont_reg.region_type in ("OPTION", "SUBQUESTION", "TABLE", "TABLE_CELL", "DIAGRAM", "FIGURE"):
+                                relation_type = "option_of" if cont_reg.region_type == "OPTION" else (
+                                    "subquestion_of" if cont_reg.region_type == "SUBQUESTION" else "belongs_to"
+                                )
+                                all_relationships.append(RegionRelationship(
+                                    source_region_id=cont_id,
+                                    target_region_id=head_id,
+                                    relationship_type=relation_type,
+                                    confidence=min(float(struct.confidence), cont_reg.confidence),
+                                    evidence=[DocumentEvidence(
+                                        signal_type="visual_vlm_verification",
+                                        description=f"Preserved independent {cont_reg.region_type.lower()} structure inside VLM group",
+                                        weight=0.9,
+                                        score=float(struct.confidence),
+                                    )],
+                                ))
+                            else:
+                                preserved_cont_ids.append(cont_id)
+                        cont_ids = preserved_cont_ids
 
                     vlm_hyp = StructureHypothesis(
                         region_id=head_id,
@@ -451,32 +659,62 @@ class DocumentUnderstandingService:
         It is built BEFORE extraction, not as an output report.
         """
         nodes: Dict[str, GraphNode] = {}
+        continuation_region_ids = {
+            rel.source_region_id
+            for rel in all_relationships
+            if rel.relationship_type == "continuation_of"
+            and next((r.page for r in all_regions if r.region_id == rel.source_region_id), 0)
+            > next((r.page for r in all_regions if r.region_id == rel.target_region_id), 0)
+        }
         for r in all_regions:
+            if r.classification_conflict:
+                semantic_state = "PARTIAL"
+            elif r.verification_state in ("UNCERTAIN", "UNVERIFIED") or r.confidence < 0.65:
+                semantic_state = "PARTIAL" if r.region_type != "UNKNOWN" else "UNKNOWN"
+            else:
+                semantic_state = "CONFIDENT"
             nodes[r.region_id] = GraphNode(
                 region_id=r.region_id,
-                role=r.region_type,
+                role="UNKNOWN" if r.region_id in continuation_region_ids and r.region_type == "QUESTION" else r.region_type,
                 text=r.text,
                 page=r.page,
                 bbox=r.bbox,
                 confidence=r.confidence,
+                semantic_state=semantic_state,
             )
 
         edges: List[GraphEdge] = []
         for rel in all_relationships:
             evidence_sources = [e.signal_type for e in rel.evidence] if rel.evidence else []
+            edge_state = "CONFIDENT" if rel.confidence >= 0.65 else "UNRESOLVED"
             edges.append(GraphEdge(
                 source_id=rel.source_region_id,
                 target_id=rel.target_region_id,
                 relationship=rel.relationship_type,
                 confidence=rel.confidence,
                 evidence_sources=evidence_sources,
+                semantic_state=edge_state,
             ))
+
+        graph_states = [node.semantic_state for node in nodes.values()]
+        graph_states.extend(edge.semantic_state for edge in edges)
+        if "CONFLICTING" in graph_states:
+            graph_state = "CONFLICTING"
+        elif "UNRESOLVED" in graph_states:
+            graph_state = "UNRESOLVED"
+        elif "AMBIGUOUS" in graph_states:
+            graph_state = "AMBIGUOUS"
+        elif "PARTIAL" in graph_states or "UNKNOWN" in graph_states:
+            graph_state = "PARTIAL"
+        else:
+            graph_state = "CONFIDENT"
 
         return DocumentStructureGraph(
             nodes=nodes,
             edges=edges,
             document_purpose=document_purpose,
             page_roles=page_roles,
+            graph_semantic_state=graph_state,
         )
 
     # Legacy method preserved for backward compatibility
@@ -570,7 +808,7 @@ class DocumentUnderstandingService:
         )
         subq_match = re.search(r"^\(?([a-z]|[ivxlcdm]+)\)[\.\:\s]+", text, re.IGNORECASE)
         interrogative_match = re.search(
-            r"\b(what|why|how|explain|describe|calculate|evaluate|find|prove|derive|compare|define|list|state|discuss|show|write|determine|solve|select|choose|identify|mark|indicate)\b",
+            r"\b(what|which|why|how|explain|describe|calculate|evaluate|find|prove|derive|compare|define|list|state|discuss|show|write|determine|solve|select|choose|identify|mark|indicate)\b",
             text, re.IGNORECASE,
         )
 
@@ -594,7 +832,7 @@ class DocumentUnderstandingService:
             ))
 
         opt_match = re.search(
-            r"^\(?[A-Da-d1-9i-zIVXLCDM]+\)[\.\:\s]+|^(?:Option|Choice)\s+[\(]?[A-Za-z0-9ivxlcdm]+\)?[\.\:\s]*",
+            r"^\s*[\(\[]?[A-Da-d1-9i-zIVXLCDM]+[\)\]\.\:](?:\s+|$)|^(?:Option|Choice)\s+[\(]?[A-Za-z0-9ivxlcdm]+\)?[\.\:\s]*",
             text, re.IGNORECASE,
         )
         if opt_match and not interrogative_match:
@@ -615,8 +853,10 @@ class DocumentUnderstandingService:
                 weight=0.5, score=0.9,
             ))
 
-        sec_match = re.search(
-            r"\b(?:SECTION|PART|GROUP|UNIT|CHAPTER)\s*[\-–\s]*[A-Z0-9IVX]+", text, re.IGNORECASE
+        sec_match = re.match(
+            r"^\s*(?:SECTION|PART|GROUP|UNIT|CHAPTER)\s*[\-–\s]*[A-Z0-9IVX]+(?:\s*[:\-]\s*.*)?$",
+            text,
+            re.IGNORECASE,
         )
         if sec_match:
             parser_ev.append(DocumentEvidence(
@@ -625,14 +865,14 @@ class DocumentUnderstandingService:
                 weight=0.5, score=0.95,
             ))
 
-        if sec_match and not interrogative_match:
-            parser_type = "SECTION_HEADER"; parser_conf = 0.95
-        elif inst_match and not interrogative_match:
+        if inst_match and not interrogative_match:
             parser_type = "INSTRUCTION"; parser_conf = 0.90
-        elif opt_match and not interrogative_match:
-            parser_type = "OPTION"; parser_conf = 0.88
+        elif sec_match and not interrogative_match:
+            parser_type = "SECTION_HEADER"; parser_conf = 0.95
         elif q_num_match and interrogative_match:
             parser_type = "QUESTION"; parser_conf = 0.92
+        elif opt_match and not interrogative_match:
+            parser_type = "OPTION"; parser_conf = 0.88
         elif q_num_match:
             parser_type = "QUESTION"; parser_conf = 0.80
         elif subq_match:
@@ -657,7 +897,12 @@ class DocumentUnderstandingService:
         rel_top = bbox.y / page_height if page_height > 0 else 0
         rel_bottom = (bbox.y + bbox.height) / page_height if page_height > 0 else 0
 
-        if rel_top < 0.06:
+        has_structural_prefix = bool(re.match(
+            r"^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[\.\):\-]|[\(\[]?[A-Da-d1-9i-zIVXLCDM]+[\)\]\.:]\s*",
+            text,
+            re.IGNORECASE,
+        ))
+        if rel_top < 0.06 and not text.endswith((".", "?", "!")) and not has_structural_prefix:
             layout_ev.append(DocumentEvidence(
                 signal_type="page_position",
                 description=f"Positioned near top margin (rel_y={rel_top:.3f})",
@@ -691,7 +936,7 @@ class DocumentUnderstandingService:
             ))
             layout_type = "TABLE"; layout_conf = 0.88
 
-        if layout_type != "UNKNOWN":
+        if layout_type != "UNKNOWN" and parser_type not in ("QUESTION", "SUBQUESTION", "OPTION"):
             hypotheses.append(StructureHypothesis(
                 region_id=reg.region_id,
                 hypothesized_type=layout_type,
@@ -789,7 +1034,7 @@ class DocumentUnderstandingService:
                     ))
                 else:
                     current_question_id = reg.region_id
-            elif reg.region_type in ("UNKNOWN", "INSTRUCTION") and current_question_id and not re.search(r"^\s*(?:SECTION|PART|GROUP|Table|Figure)\b", reg.text, re.IGNORECASE):
+            elif reg.region_type == "UNKNOWN" and current_question_id and not re.search(r"^\s*(?:SECTION|PART|GROUP|Table|Figure)\b", reg.text, re.IGNORECASE):
                 rels.append(RegionRelationship(
                     source_region_id=reg.region_id,
                     target_region_id=current_question_id,
@@ -802,10 +1047,25 @@ class DocumentUnderstandingService:
                     rels.append(RegionRelationship(
                         source_region_id=reg.region_id,
                         target_region_id=current_question_id,
-                        relationship_type=rel_t,
+                        relationship_type="contains" if reg.region_type in ("DIAGRAM", "TABLE", "TABLE_CELL") else rel_t,
                         confidence=0.90,
                     ))
+                    if reg.region_type in ("OPTION", "SUBQUESTION"):
+                        rels.append(RegionRelationship(
+                            source_region_id=reg.region_id,
+                            target_region_id=current_question_id,
+                            relationship_type="contains",
+                            confidence=0.90,
+                        ))
                     reg.parent_region_id = current_question_id
+                    parent_region = next((r for r in regions if r.region_id == current_question_id), None)
+                    if parent_region is not None and reg.region_id not in parent_region.child_region_ids:
+                        parent_region.child_region_ids.append(reg.region_id)
+
+            if reg.region_type == "DIAGRAM" and current_question_id:
+                parent_region = next((r for r in regions if r.region_id == current_question_id), None)
+                if parent_region is not None and reg.region_id not in parent_region.child_region_ids:
+                    parent_region.child_region_ids.append(reg.region_id)
 
         return rels
 

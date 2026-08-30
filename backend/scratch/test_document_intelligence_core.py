@@ -121,6 +121,44 @@ class TestDocumentIntelligenceCore(unittest.TestCase):
         self.assertEqual(rels[0].target_region_id, "r91")
         print("[TEST 4 PASSED] Strict structural VLM output validation verified.")
 
+    def test_04b_visual_structure_with_bbox_without_ocr_region(self):
+        """Validates that the VLM may identify a semantic visual structure using bbox-only geometry when no OCR region exists."""
+        provider = MultimodalDocumentVisionProvider(api_key="mock_key")
+        blocks = [
+            Block(id="b1", text="SECTION A", confidence=0.99, bbox=BBox(x=50, y=50, width=200, height=20), page=1),
+            Block(id="b2", text="1. Write briefly:", confidence=0.99, bbox=BBox(x=80, y=120, width=220, height=20), page=1),
+        ]
+        raw_vlm_json = json.dumps({
+            "page_purpose": "QUESTION_PAGE",
+            "document_purpose": "EXAMINATION_PAPER",
+            "structures": [
+                {
+                    "role": "QUESTION",
+                    "display_number": "1",
+                    "display_label": "1",
+                    "bbox": [80, 120, 520, 200],
+                    "reasoning": "Visual question region spanning the question text block and its subparts.",
+                    "confidence": 0.95,
+                }
+            ],
+            "relationships": []
+        })
+        understanding = provider._parse_page_understanding(
+            response_text=raw_vlm_json,
+            page_number=1,
+            ocr_blocks=blocks,
+            page_b64_sent=True,
+            vlm_meta={"provider": "gemini", "model": "gemini-2.5-flash", "finish_reason": "STOP"},
+        )
+
+        self.assertEqual(len(understanding.structures), 1)
+        self.assertEqual(understanding.structures[0].role, "QUESTION")
+        self.assertEqual(understanding.structures[0].bbox.x, 80.0)
+        self.assertEqual(understanding.structures[0].bbox.y, 120.0)
+        self.assertEqual(understanding.structures[0].bbox.width, 440.0)
+        self.assertEqual(understanding.structures[0].bbox.height, 80.0)
+        print("[TEST 4B PASSED] Visual VLM bbox-only structure preservation verified.")
+
     def test_05_stable_document_scoped_question_identity(self):
         """Validates that internal question IDs use doc_id:region_id formatting with 0 duplicate collisions."""
         blocks = [
