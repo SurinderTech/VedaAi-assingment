@@ -5,7 +5,7 @@ import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { Region } from "@/types/assessment";
-import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, RotateCcw, Eye, CheckCircle2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, RotateCcw, Eye } from "lucide-react";
 
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
@@ -56,8 +56,8 @@ export default function AnswerSheetViewer({
       if (r.bbox.x + r.bbox.width > maxX) maxX = r.bbox.x + r.bbox.width;
       if (r.bbox.y + r.bbox.height > maxY) maxY = r.bbox.y + r.bbox.height;
     }
-    const padX = 6;
-    const padY = 4;
+    const padX = 10;
+    const padY = 8;
     return {
       x: Math.max(0, minX - padX),
       y: Math.max(0, minY - padY),
@@ -184,7 +184,7 @@ export default function AnswerSheetViewer({
       </div>
 
       {/* Canvas / Image Display */}
-      <div className="flex-1 overflow-auto scrollbar-thin flex justify-center py-6 px-12 relative">
+      <div className="flex-1 overflow-auto scrollbar-thin flex justify-center py-8 px-16 relative">
         <div ref={containerRef} className="relative inline-block shadow-2xl rounded-xl bg-white border border-slate-300">
           {isPdf ? (
             <Document
@@ -215,46 +215,32 @@ export default function AnswerSheetViewer({
             />
           )}
 
-          {/* Precision Disjoint Sub-Region Bounding Box Highlights */}
-          {renderedSize && regionsOnPage.map((r, idx) => {
-            const padX = 4;
-            const padY = 3;
-            const rx = Math.max(0, r.bbox.x - padX) * scaleX;
-            const ry = Math.max(0, r.bbox.y - padY) * scaleY;
-            const rw = (r.bbox.width + padX * 2) * scaleX;
-            const rh = (r.bbox.height + padY * 2) * scaleY;
-
-            return (
-              <div
-                key={`reg_${idx}_${r.page}`}
-                className="absolute border-2 border-emerald-500 bg-emerald-400/20 rounded-xl transition-all duration-300 shadow-[0_0_18px_rgba(16,185,129,0.35)] ring-2 ring-emerald-400/30 pointer-events-none z-20"
-                style={{
-                  left: rx,
-                  top: ry,
-                  width: rw,
-                  height: rh,
-                }}
-              >
-                {/* Corner Accent Indicators */}
-                <div className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
-                <div className="absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
-                <div className="absolute -bottom-1 -left-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
-                <div className="absolute -bottom-1 -right-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white shadow-xs" />
-              </div>
-            );
-          })}
-
-          {/* Question Anchor Badge placed cleanly outside to the left of the answer text */}
+          {/* Single Unified Answer Bounding Box & Left-Margin Question Badge (Image 2 style) */}
           {renderedSize && mergedBounds && (
             <div
-              className="absolute z-30 bg-emerald-600 text-white text-xs font-bold px-2.5 py-1 rounded-lg shadow-xl flex items-center gap-1.5 whitespace-nowrap pointer-events-none transition-all duration-300 -translate-x-full border border-emerald-400/40"
+              className="absolute border-2 border-emerald-500 bg-emerald-500/10 rounded-2xl transition-all duration-300 pointer-events-none z-20 shadow-[0_0_20px_rgba(16,185,129,0.18)] ring-1 ring-emerald-400/30"
               style={{
-                left: Math.max(4, (mergedBounds.x * scaleX) - 8),
-                top: Math.max(4, mergedBounds.y * scaleY),
+                left: mergedBounds.x * scaleX,
+                top: mergedBounds.y * scaleY,
+                width: mergedBounds.width * scaleX,
+                height: mergedBounds.height * scaleY,
               }}
             >
-              <CheckCircle2 size={13} className="text-emerald-200" />
-              <span>Q{questionNumber || "Matched"}</span>
+              {/* Question Badge sitting cleanly in the left margin / empty space outside answer text */}
+              <div
+                className="absolute top-0 -left-2.5 -translate-x-full z-30 flex items-center justify-center bg-emerald-600 text-white text-xs md:text-sm font-bold px-2.5 py-0.5 rounded-lg shadow-md border border-emerald-400/40 select-none whitespace-nowrap"
+              >
+                <span>
+                  {(() => {
+                    const qStr = (questionNumber || "").trim();
+                    if (!qStr) return "Q";
+                    if (qStr.toLowerCase() === "unmatched") return "Unmatched";
+                    if (/^\d/.test(qStr)) return `Q${qStr}`;
+                    if (/^q[\.\s]?/i.test(qStr)) return qStr.replace(/^q[\.\s]*/i, "Q");
+                    return qStr.startsWith("Q") ? qStr : `Q${qStr}`;
+                  })()}
+                </span>
+              </div>
             </div>
           )}
 

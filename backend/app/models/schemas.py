@@ -88,6 +88,12 @@ class Question(BaseModel):
     extraction_confidence: float = 1.0
     verification_state: str = "UNVERIFIED"
     evidence_refs: List[str] = []
+    # Nested subquestions (e.g. Q3(i), Q3(ii)) — stored here, NOT in flat question list
+    subquestions: Optional[List["Question"]] = None
+
+
+# Resolve forward reference for subquestions: Optional[List["Question"]]
+Question.model_rebuild()
 
 
 PageClassification = Literal[

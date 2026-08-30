@@ -419,10 +419,20 @@ class DocumentUnderstandingService:
                     cont_ids = struct.region_ids[1:]
                     grounded_ids = list(struct.region_ids)
                     grounding_status = "GROUNDED"
-                    grounded_text = " ".join(region_map.get(rid, DocumentRegion(region_id=rid, page=page_num_u, text="", bbox=BBox(x=0, y=0, width=0, height=0))).text.strip() for rid in grounded_ids if rid in region_map)
+                    grounded_text = " ".join(
+                        region_map[rid].text.strip()
+                        for rid in grounded_ids
+                        if rid in region_map and region_map[rid].text.strip()
+                    )
                     struct.grounded_region_ids = grounded_ids
                     struct.grounding_status = grounding_status
                     struct.grounded_text = grounded_text
+                    # FIX 9: Update head region text with merged grounded_text when
+                    # VLM supplies explicit multi-block region_ids (e.g. OPTION: ["A.", "Ethane"])
+                    # Without this the head node only carries the label-block text ("A.")
+                    # even after the OPTION merge in document_understanding_service.
+                    if cont_ids and grounded_text and head_id in region_map:
+                        region_map[head_id].text = grounded_text
                 else:
                     grounded_ids, grounding_status, grounded_text = self._ground_structure_to_ocr(
                         structure=struct,
@@ -516,21 +526,34 @@ class DocumentUnderstandingService:
                         continue
                     vlm_assigned_ids.add(cont_id)
                     cont_reg = region_map[cont_id]
-                    cont_reg.region_type = "UNKNOWN"
-                    cont_reg.verification_state = "VERIFIED"
                     cont_reg.parent_region_id = head_id
-                    all_relationships.append(RegionRelationship(
-                        source_region_id=cont_id,
-                        target_region_id=head_id,
-                        relationship_type="continuation_of",
-                        confidence=struct.confidence,
-                        evidence=[DocumentEvidence(
-                            signal_type="visual_vlm_verification",
-                            description=f"Grounded evidence continuation of {head_id}",
-                            weight=0.9,
-                            score=struct.confidence,
-                        )],
-                    ))
+
+                    if struct.role == "OPTION" and head_id in region_map:
+                        # FIX: For OPTION structures, merge cont_id text INTO the head
+                        # region text directly so the option body is not lost.
+                        # e.g. head='A.' cont='Ethane' → head.text becomes 'A. Ethane'
+                        head_reg = region_map[head_id]
+                        cont_text = cont_reg.text.strip()
+                        if cont_text and cont_text not in head_reg.text:
+                            head_reg.text = f"{head_reg.text.strip()} {cont_text}".strip()
+                        # Mark cont region as UNKNOWN (absorbed into head)
+                        cont_reg.region_type = "UNKNOWN"
+                        cont_reg.verification_state = "VERIFIED"
+                    else:
+                        cont_reg.region_type = "UNKNOWN"
+                        cont_reg.verification_state = "VERIFIED"
+                        all_relationships.append(RegionRelationship(
+                            source_region_id=cont_id,
+                            target_region_id=head_id,
+                            relationship_type="continuation_of",
+                            confidence=struct.confidence,
+                            evidence=[DocumentEvidence(
+                                signal_type="visual_vlm_verification",
+                                description=f"Grounded evidence continuation of {head_id}",
+                                weight=0.9,
+                                score=struct.confidence,
+                            )],
+                        ))
 
             # Apply VLM explicit relationships
             for rel in understanding.relationships:
@@ -671,15 +694,31 @@ class DocumentUnderstandingService:
         # Semantic roles that must NOT be treated as continuations of a prior question
         _SEMANTIC_BOUNDARY_ROLES = {"OPTION", "SUBQUESTION", "QUESTION", "SECTION_HEADER"}
 
-        # FIX 1: Prune stale continuation edges that violate VLM-assigned boundaries
+        # FIX 1 + FIX 8: Prune stale continuation edges:
+        #  (a) source has a semantic VLM role — already handled (OPTION→QUESTION etc.)
+        #  (b) UNKNOWN source points TO a semantic-role target — this is the loophole.
+        #      Deterministic UNKNOWN continuation_of edges that point to a QUESTION/OPTION
+        #      are not VLM-confirmed; they must be dropped when the target is semantically assigned.
         pruned_rels: List[RegionRelationship] = []
         pruned_count = 0
         for rel in all_relationships:
             if rel.relationship_type == "continuation_of":
                 src_role = region_final_role.get(rel.source_region_id, "UNKNOWN")
+                tgt_role = region_final_role.get(rel.target_region_id, "UNKNOWN")
+                # (a) source has semantic role — always prune
                 if src_role in _SEMANTIC_BOUNDARY_ROLES:
                     pruned_count += 1
-                    continue  # Drop this stale edge
+                    continue
+                # (b) UNKNOWN source → semantic target: prune unless the edge came from VLM
+                #     (VLM edges have evidence with signal_type="visual_vlm_verification")
+                if src_role == "UNKNOWN" and tgt_role in _SEMANTIC_BOUNDARY_ROLES:
+                    vlm_confirmed = any(
+                        getattr(ev, "signal_type", "") == "visual_vlm_verification"
+                        for ev in (rel.evidence or [])
+                    )
+                    if not vlm_confirmed:
+                        pruned_count += 1
+                        continue
             pruned_rels.append(rel)
         if pruned_count > 0:
             print(
@@ -1030,7 +1069,6 @@ class DocumentUnderstandingService:
 
         sorted_regs = sorted(regions, key=lambda r: (r.bbox.y, r.bbox.x))
         current_section_id: Optional[str] = None
-        current_question_id: Optional[str] = None
 
         for idx, reg in enumerate(sorted_regs):
             prev_reg = sorted_regs[idx - 1] if idx > 0 else None
@@ -1059,21 +1097,6 @@ class DocumentUnderstandingService:
                     relationship_type="section_member",
                     confidence=0.95,
                 ))
-
-            # Track active question anchor
-            if reg.region_type == "QUESTION":
-                current_question_id = reg.region_id
-            elif reg.region_type == "UNKNOWN" and current_question_id and prev_reg is not None:
-                # Add continuation_of ONLY when immediately adjacent multi-line text without sentence boundary
-                prev_txt = prev_reg.text.strip()
-                vert_gap = reg.bbox.y - (prev_reg.bbox.y + prev_reg.bbox.height)
-                if vert_gap < 25.0 and prev_txt and prev_txt[-1] not in (".", "?", "!", ":", ";"):
-                    rels.append(RegionRelationship(
-                        source_region_id=reg.region_id,
-                        target_region_id=current_question_id,
-                        relationship_type="continuation_of",
-                        confidence=0.80,
-                    ))
 
         return rels
 

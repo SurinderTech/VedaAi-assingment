@@ -179,6 +179,12 @@ class IntelligentQuestionExtractionService:
         SECTION_HEADER nodes → section containers
         """
         region_map = {r.region_id: r for r in doc_result.regions}
+        # Spatial index: page → sorted list of DocumentRegions (for option body fallback)
+        page_regions_by_page: Dict[int, List[DocumentRegion]] = {}
+        for r in doc_result.regions:
+            page_regions_by_page.setdefault(r.page, []).append(r)
+        for pg in page_regions_by_page:
+            page_regions_by_page[pg].sort(key=lambda r: (r.bbox.y, r.bbox.x))
         audit = ExtractionAudit(candidate_count=len(graph.nodes))
 
         if graph.graph_semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
@@ -264,6 +270,7 @@ class IntelligentQuestionExtractionService:
         # Track seen display_numbers and (page, y_approx) to reject exact duplicates
         seen_display_numbers: Dict[str, Tuple[str, float]] = {}  # display_num → (region_id, confidence)
         seen_spatial_keys: set = set()  # (page, round(y/10)*10) for spatial dedup
+        rejected_region_ids: set = set()  # region_ids retroactively rejected by higher-conf duplicate
 
         for q_node in question_nodes:
             if q_node.semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
@@ -289,14 +296,41 @@ class IntelligentQuestionExtractionService:
             q_text = q_node.text.strip()
             display_num = self._extract_display_number(q_text)
 
-            # Fix 2: Document-scoped deduplication guard
-            # If the same display number was already extracted with higher confidence,
-            # reject this duplicate candidate.
-            if display_num and display_num not in (str(uuid.uuid4())[:6],):  # skip uuid fallbacks
+            # --- FRAGMENT GUARD: Reject roman-numeral / letter-only subquestion markers ---
+            # Patterns like (i), (ii), (iii), (iv), [i], [a], [b] that appear as
+            # standalone QUESTION nodes are subquestion index markers, not real questions.
+            # They have no question body and must not be emitted as separate questions.
+            _fragment_re = re.compile(
+                r'^\s*[\(\[]?\s*(?:i{1,4}v?|vi{0,3}|ix|x|[a-d]|[ivxlcdm]{1,4})\s*[\)\]\.:]?\s*$',
+                re.IGNORECASE
+            )
+            if _fragment_re.match(q_text) and len(q_text.strip()) <= 8:
+                audit.rejected_count += 1
+                print(
+                    f"[IntelligentExtraction] Fragment guard: rejected lone subquestion marker "
+                    f"'{q_text}' (region={q_node.region_id}) — not a real question."
+                )
+                continue
+
+            # Also reject pure number/label nodes with no body text
+            # e.g. node text is literally "1" or "Q2" with nothing after
+            _bare_label_re = re.compile(r'^\s*(?:Q\.?)?\d{1,3}\.?\s*$', re.IGNORECASE)
+            if _bare_label_re.match(q_text):
+                audit.rejected_count += 1
+                print(
+                    f"[IntelligentExtraction] Fragment guard: rejected bare question label "
+                    f"'{q_text}' (region={q_node.region_id}) — label-only node."
+                )
+                continue
+
+            # Deduplication: reject same display_number with lower confidence
+            _is_uuid_fallback = len(display_num) == 6 and display_num.replace('-', '').isalnum()
+            if display_num and not _is_uuid_fallback:
                 prior = seen_display_numbers.get(display_num)
                 if prior is not None:
                     prior_region_id, prior_conf = prior
                     if q_node.confidence <= prior_conf:
+                        # New node is worse — reject it
                         audit.duplicate_rejected += 1
                         print(
                             f"[IntelligentExtraction] Fix-2: Duplicate QUESTION node '{display_num}' "
@@ -305,8 +339,8 @@ class IntelligentQuestionExtractionService:
                         )
                         continue
                     else:
-                        # New one has higher confidence — retroactively mark prior as duplicate
-                        # (we can't remove it from extracted_questions easily, so just log)
+                        # New node is better — retroactively reject the prior one
+                        rejected_region_ids.add(prior_region_id)
                         audit.duplicate_rejected += 1
                         print(
                             f"[IntelligentExtraction] Fix-2: Replacing lower-confidence QUESTION '{display_num}' "
@@ -315,7 +349,6 @@ class IntelligentQuestionExtractionService:
                 seen_display_numbers[display_num] = (q_node.region_id, q_node.confidence)
 
             # Spatial deduplication: reject if very close to an already-extracted question
-            # (same page, y-coordinate within ±5px) — catches OCR double-detection
             spatial_key = (q_node.page, round(q_node.bbox.y / 5.0))
             if spatial_key in seen_spatial_keys:
                 audit.duplicate_rejected += 1
@@ -382,6 +415,7 @@ class IntelligentQuestionExtractionService:
                 children_of=children_of,
                 graph_nodes=graph.nodes,
                 region_map=region_map,
+                page_regions_by_page=page_regions_by_page,
             )
             if option_count > 0:
                 q_obj.question_type = "MCQ"
@@ -405,6 +439,13 @@ class IntelligentQuestionExtractionService:
 
             extracted_questions.append(q_obj)
             order_counter += 1
+
+        # FIX 5: Remove any entries that were retroactively rejected by a higher-confidence duplicate
+        if rejected_region_ids:
+            extracted_questions = [
+                q for q in extracted_questions
+                if not (q.source_region_ids and q.source_region_ids[0] in rejected_region_ids)
+            ]
 
         # Record non-question rejections for audit
         for node_id, node in graph.nodes.items():
@@ -532,8 +573,17 @@ class IntelligentQuestionExtractionService:
         children_of: Dict[str, List[Tuple[str, str, float]]],
         graph_nodes: Dict[str, GraphNode],
         region_map: Dict[str, DocumentRegion],
+        page_regions_by_page: Optional[Dict[int, List["DocumentRegion"]]] = None,
     ) -> int:
-        """Attaches MCQ options to a question from graph edges."""
+        """
+        Attaches MCQ options to a question from graph edges.
+
+        Three-layer option text recovery (fixes 'A B C D label-only' bug):
+          1. Head text — what the OPTION GraphNode carries directly.
+             (May be pre-merged by document_understanding_service if multi-block.)
+          2. Continuation chain — continuation_of children in the graph.
+          3. Spatial scan — same-row right-adjacent blocks when still label-only.
+        """
         option_count = 0
 
         for child_id, rel_type, conf in children_of.get(question_node_id, []):
@@ -545,28 +595,78 @@ class IntelligentQuestionExtractionService:
                 continue
 
             region = region_map.get(child_id)
-            opt_text = child_node.text.strip()
 
-            # Extract option label
+            # Layer 1: head text (may already contain merged body from doc_understanding_service)
+            head_text = child_node.text.strip()
+
+            # Layer 2: collect continuation children from graph
+            continuation_parts: list = []
+            for cont_id, cont_rel, _ in children_of.get(child_id, []):
+                if cont_rel == "continuation_of":
+                    cont_node = graph_nodes.get(cont_id)
+                    if cont_node and cont_node.text.strip():
+                        continuation_parts.append(
+                            (cont_node.bbox.y if cont_node.bbox else 0, cont_node.text.strip())
+                        )
+            continuation_parts.sort(key=lambda t: t[0])
+            cont_body = " ".join(p[1] for p in continuation_parts)
+
+            if cont_body and cont_body not in head_text:
+                opt_text = f"{head_text} {cont_body}".strip()
+            else:
+                opt_text = head_text
+
+            # Layer 3: spatial fallback if still looks like bare label
+            _bare_label = re.compile(r'^\s*[\(\[]?\s*[A-Da-d1-4]\s*[\)\]\.:]?\s*$')
+            if _bare_label.match(opt_text) and child_node.bbox and page_regions_by_page:
+                page_regs = page_regions_by_page.get(child_node.page, [])
+                label_y = child_node.bbox.y
+                label_x_right = child_node.bbox.x + child_node.bbox.width
+                label_height = max(child_node.bbox.height, 12.0)
+                # Same-row blocks that are to the right of this label block
+                row_candidates = sorted(
+                    [
+                        r for r in page_regs
+                        if r.region_id != child_id
+                        and abs(r.bbox.y - label_y) <= label_height * 1.5
+                        and r.bbox.x >= label_x_right - 5
+                        and r.region_type not in ("QUESTION", "OPTION", "SECTION_HEADER", "HEADER", "FOOTER")
+                        and r.text.strip()
+                    ],
+                    key=lambda r: r.bbox.x,
+                )
+                if row_candidates:
+                    spatial_body = " ".join(r.text.strip() for r in row_candidates[:3])
+                    opt_text = f"{opt_text} {spatial_body}".strip()
+                    print(
+                        f"[IntelligentExtraction] Spatial fallback: option '{child_id}' label-only; "
+                        f"merged body '{spatial_body[:50]}'"
+                    )
+
+            # Parse label and body
             opt_m = OPTION_PREFIX_RE.match(opt_text)
-            label = opt_m.group(1).upper() if opt_m else chr(65 + option_count)  # A, B, C, D
+            label = opt_m.group(1).upper() if opt_m else chr(65 + option_count)
             text_val = opt_m.group(2).strip() if opt_m else opt_text
 
+            # Last resort: if text_val still empty, use cont_body
+            if not text_val and cont_body:
+                text_val = cont_body
+
             opt_id = f"opt_{question.id}_{label}_{uuid.uuid4().hex[:4]}"
+            full_opt_text = f"{label}. {text_val}" if text_val else opt_text
             extracted_opt = ExtractedOption(
                 option_id=opt_id,
                 question_id=question.id,
                 label=label,
-                text=opt_text,  # Full OCR text preserved
+                text=full_opt_text,
                 source_region_ids=[child_id],
                 source_regions=[Region(page=child_node.page, bbox=child_node.bbox)],
                 extraction_confidence=child_node.confidence,
                 verification_state=region.verification_state if region else "UNVERIFIED",
             )
             question.extracted_options.append(extracted_opt)
-            question.options.append(f"{label}. {text_val}")
+            question.options.append(full_opt_text)
             option_count += 1
-            audit_count = getattr(question, '_opt_audit_count', 0)
 
         return option_count
 
@@ -578,11 +678,20 @@ class IntelligentQuestionExtractionService:
         graph_nodes: Dict[str, GraphNode],
         region_map: Dict[str, DocumentRegion],
         document_id: str,
-        extracted_questions: List[Question],
+        extracted_questions: List[Question],  # kept in signature for compatibility — NOT appended to
         order_counter_ref: List[int],
         sec_title: Optional[str],
     ) -> None:
-        """Attaches subquestions to a parent question from graph edges."""
+        """
+        Attaches subquestions as CHILDREN of their parent question.
+
+        FIX (57→61 inflation): Previously appended sub_q to extracted_questions,
+        which caused subquestions to be counted, graded, and scored as top-level
+        questions. This inflated 57 QUESTION nodes into 61 graded questions.
+
+        Subquestions now live in parent_question.subquestions ONLY.
+        They are never added to the flat extracted_questions list.
+        """
         for child_id, rel_type, conf in children_of.get(question_node_id, []):
             if rel_type != "subquestion_of":
                 continue
@@ -616,8 +725,16 @@ class IntelligentQuestionExtractionService:
                 extraction_confidence=child_node.confidence,
                 verification_state=region.verification_state if region else "UNVERIFIED",
             )
-            extracted_questions.append(sub_q)
+
+            # Attach to parent — NOT to the flat top-level list
+            if not hasattr(parent_question, 'subquestions') or parent_question.subquestions is None:
+                parent_question.subquestions = []
+            parent_question.subquestions.append(sub_q)
             order_counter_ref[0] += 1
+            print(
+                f"[IntelligentExtraction] Subquestion '{display_num}' attached to parent '{parent_question.number}' "
+                f"(NOT in top-level list)."
+            )
 
     # ================================================================
     # FALLBACK: Region-based extraction (when graph has no QUESTION nodes)
