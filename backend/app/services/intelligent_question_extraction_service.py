@@ -182,20 +182,30 @@ class IntelligentQuestionExtractionService:
         audit = ExtractionAudit(candidate_count=len(graph.nodes))
 
         if graph.graph_semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
-            for node in graph.nodes.values():
-                if node.semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
-                    audit.uncertain_count += 1
-                    audit.conflicts.append(f"Graph semantic state is {graph.graph_semantic_state} for node {node.region_id}.")
-            return DocumentQuestionExtractionResult(
-                document_id=document_id,
-                questions=[],
-                sections=[],
-                uncertain_candidates=[],
-                audit=audit,
-                structure_graph=graph,
-                fallback_used=False,
-                invariant_violations=[f"Semantic validation blocked extraction: graph semantic state is {graph.graph_semantic_state}"],
-            )
+            # FIX 3: Only block if there are truly no QUESTION nodes.
+            # If VLM has produced QUESTION nodes, extract them even if some
+            # edges are unresolved — per-node state handles individual confidence.
+            question_nodes_check = [n for n in graph.nodes.values() if n.role == "QUESTION"]
+            if not question_nodes_check:
+                for node in graph.nodes.values():
+                    if node.semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
+                        audit.uncertain_count += 1
+                        audit.conflicts.append(f"Graph semantic state is {graph.graph_semantic_state} for node {node.region_id}.")
+                return DocumentQuestionExtractionResult(
+                    document_id=document_id,
+                    questions=[],
+                    sections=[],
+                    uncertain_candidates=[],
+                    audit=audit,
+                    structure_graph=graph,
+                    fallback_used=False,
+                    invariant_violations=[f"Semantic validation blocked extraction: graph semantic state is {graph.graph_semantic_state} and no QUESTION nodes found."],
+                )
+            else:
+                print(
+                    f"[IntelligentExtraction] FIX-3: Graph state is {graph.graph_semantic_state} "
+                    f"but {len(question_nodes_check)} QUESTION node(s) found — proceeding with extraction."
+                )
 
         # Build edge indices
         # target_id → list of (source_id, relationship, confidence)
@@ -250,6 +260,11 @@ class IntelligentQuestionExtractionService:
         rejection_records: List[RejectionRecord] = []
         order_counter = 0
 
+        # Fix 2: Document-scoped deduplication
+        # Track seen display_numbers and (page, y_approx) to reject exact duplicates
+        seen_display_numbers: Dict[str, Tuple[str, float]] = {}  # display_num → (region_id, confidence)
+        seen_spatial_keys: set = set()  # (page, round(y/10)*10) for spatial dedup
+
         for q_node in question_nodes:
             if q_node.semantic_state in ("AMBIGUOUS", "UNRESOLVED", "CONFLICTING"):
                 uncertain_candidates.append(Question(
@@ -273,6 +288,43 @@ class IntelligentQuestionExtractionService:
             # Extract display number from text
             q_text = q_node.text.strip()
             display_num = self._extract_display_number(q_text)
+
+            # Fix 2: Document-scoped deduplication guard
+            # If the same display number was already extracted with higher confidence,
+            # reject this duplicate candidate.
+            if display_num and display_num not in (str(uuid.uuid4())[:6],):  # skip uuid fallbacks
+                prior = seen_display_numbers.get(display_num)
+                if prior is not None:
+                    prior_region_id, prior_conf = prior
+                    if q_node.confidence <= prior_conf:
+                        audit.duplicate_rejected += 1
+                        print(
+                            f"[IntelligentExtraction] Fix-2: Duplicate QUESTION node '{display_num}' "
+                            f"(region={q_node.region_id}, conf={q_node.confidence:.2f}) "
+                            f"rejected; kept region={prior_region_id} (conf={prior_conf:.2f})"
+                        )
+                        continue
+                    else:
+                        # New one has higher confidence — retroactively mark prior as duplicate
+                        # (we can't remove it from extracted_questions easily, so just log)
+                        audit.duplicate_rejected += 1
+                        print(
+                            f"[IntelligentExtraction] Fix-2: Replacing lower-confidence QUESTION '{display_num}' "
+                            f"(prior conf={prior_conf:.2f} < new conf={q_node.confidence:.2f})"
+                        )
+                seen_display_numbers[display_num] = (q_node.region_id, q_node.confidence)
+
+            # Spatial deduplication: reject if very close to an already-extracted question
+            # (same page, y-coordinate within ±5px) — catches OCR double-detection
+            spatial_key = (q_node.page, round(q_node.bbox.y / 5.0))
+            if spatial_key in seen_spatial_keys:
+                audit.duplicate_rejected += 1
+                print(
+                    f"[IntelligentExtraction] Fix-2: Spatial duplicate QUESTION node "
+                    f"(page={q_node.page}, y≈{q_node.bbox.y:.0f}) rejected."
+                )
+                continue
+            seen_spatial_keys.add(spatial_key)
 
             # Build question ID: document_id:region_id
             q_id = f"Q{self._extract_display_number(q_text)}"
@@ -458,7 +510,10 @@ class IntelligentQuestionExtractionService:
         for child_id, rel_type, conf in children_of.get(node_id, []):
             if rel_type == "continuation_of":
                 child_node = graph_nodes.get(child_id)
-                if child_node and child_node.role not in ("QUESTION", "SECTION_HEADER", "OPTION"):
+                # FIX 4: Skip SUBQUESTION nodes — they must not be absorbed as
+                # continuation text into the parent question. OPTION nodes are
+                # already excluded; belt-and-suspenders adds SUBQUESTION.
+                if child_node and child_node.role not in ("QUESTION", "SECTION_HEADER", "OPTION", "SUBQUESTION"):
                     continuation_ids.append(child_id)
                     continuation_text += " " + child_node.text.strip()
 

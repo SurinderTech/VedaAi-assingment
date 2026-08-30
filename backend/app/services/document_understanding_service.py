@@ -345,10 +345,10 @@ class DocumentUnderstandingService:
 
             reg_area = self._bbox_area(reg.bbox)
             fully_contained = (
-                reg.bbox.x >= structure.bbox.x and
-                reg.bbox.y >= structure.bbox.y and
-                reg.bbox.x + reg.bbox.width <= structure.bbox.x + structure.bbox.width and
-                reg.bbox.y + reg.bbox.height <= structure.bbox.y + structure.bbox.height
+                reg.bbox.x >= structure.bbox.x - 2.0 and
+                reg.bbox.y >= structure.bbox.y - 2.0 and
+                reg.bbox.x + reg.bbox.width <= structure.bbox.x + structure.bbox.width + 2.0 and
+                reg.bbox.y + reg.bbox.height <= structure.bbox.y + structure.bbox.height + 2.0
             )
             overlap_fraction = overlap / max(visual_area, 1.0)
             reg_fraction = overlap / max(reg_area, 1.0)
@@ -361,7 +361,7 @@ class DocumentUnderstandingService:
 
             score = 0.0
             if fully_contained:
-                score += 0.65
+                score += 0.70
             score += min(0.50, overlap_fraction * 2.25)
             score += min(0.40, reg_fraction * 1.4)
             score += min(0.35, y_alignment * 1.25)
@@ -375,14 +375,15 @@ class DocumentUnderstandingService:
 
         candidates.sort(key=lambda item: item[0], reverse=True)
         top_score = candidates[0][0]
-        keep = [reg for score, reg in candidates if score >= max(0.2, top_score * 0.6)]
-        grounded_ids = [reg.region_id for reg in sorted(keep, key=lambda r: (r.page, r.bbox.y, r.bbox.x))]
+        keep = [reg for score, reg in candidates if score >= max(0.2, top_score * 0.5)]
+        grounded_sorted = sorted(keep, key=lambda r: (r.bbox.y, r.bbox.x))
+        grounded_ids = [reg.region_id for reg in grounded_sorted]
         status = "GROUNDED" if len(grounded_ids) >= 1 else "UNGROUNDED"
         if len(grounded_ids) == 1 and top_score < 0.30:
             status = "PARTIALLY_GROUNDED"
         elif len(grounded_ids) > 1 and top_score < 0.40:
             status = "PARTIALLY_GROUNDED"
-        grounded_text = " ".join(reg.text.strip() for reg in sorted(keep, key=lambda r: (r.bbox.y, r.bbox.x)) if reg.text and reg.text.strip())
+        grounded_text = " ".join(reg.text.strip() for reg in grounded_sorted if reg.text and reg.text.strip())
         return grounded_ids, status, grounded_text
 
     def _apply_vlm_page_understandings(
@@ -395,11 +396,9 @@ class DocumentUnderstandingService:
         """
         Applies VLM page understanding as the PRIMARY intelligence source.
 
-        The VLM's structural analysis OVERRIDES deterministic hypotheses
-        when the VLM has sufficient confidence.
-
-        Deterministic analysis remains as a fallback evidence source
-        for regions the VLM didn't address.
+        The VLM's structural analysis is authoritative for layout and semantics.
+        OCR/native text provides exact textual evidence.
+        Geometry connects visual structures to OCR blocks.
         """
         region_map = {r.region_id: r for r in all_regions}
 
@@ -407,7 +406,8 @@ class DocumentUnderstandingService:
             if not understanding.structures:
                 continue
 
-            # Apply VLM structural decisions to regions
+            page_num_u = understanding.page_number
+            page_regions = [r for r in all_regions if r.page == page_num_u]
             vlm_assigned_ids: Set[str] = set()
 
             for struct in understanding.structures:
@@ -419,25 +419,32 @@ class DocumentUnderstandingService:
                     cont_ids = struct.region_ids[1:]
                     grounded_ids = list(struct.region_ids)
                     grounding_status = "GROUNDED"
-                    grounded_text = " ".join(region_map.get(rid, DocumentRegion(region_id=rid, page=understanding.page_number, text="", bbox=BBox(x=0, y=0, width=0, height=0))).text.strip() for rid in grounded_ids if rid in region_map)
-                    
-                    # Populate grounding metadata
+                    grounded_text = " ".join(region_map.get(rid, DocumentRegion(region_id=rid, page=page_num_u, text="", bbox=BBox(x=0, y=0, width=0, height=0))).text.strip() for rid in grounded_ids if rid in region_map)
                     struct.grounded_region_ids = grounded_ids
                     struct.grounding_status = grounding_status
                     struct.grounded_text = grounded_text
                 else:
                     grounded_ids, grounding_status, grounded_text = self._ground_structure_to_ocr(
                         structure=struct,
-                        page_regions=[r for r in all_regions if r.page == understanding.page_number],
-                        page_number=understanding.page_number,
+                        page_regions=page_regions,
+                        page_number=page_num_u,
                     )
+                    struct.grounded_region_ids = grounded_ids
+                    struct.grounding_status = grounding_status
+                    struct.grounded_text = grounded_text
+
                     if grounded_ids:
-                        head_id = f"vlm_visual_{understanding.page_number}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
+                        head_id = grounded_ids[0]
+                        cont_ids = grounded_ids[1:]
+                        if head_id in region_map:
+                            region_map[head_id].text = grounded_text
+                    else:
+                        head_id = f"vlm_visual_{page_num_u}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
                         cont_ids = []
                         synthetic_text = grounded_text if grounded_text else (struct.display_label or struct.display_number or struct.role)
                         synthetic_region = DocumentRegion(
                             region_id=head_id,
-                            page=understanding.page_number,
+                            page=page_num_u,
                             text=synthetic_text,
                             bbox=struct.bbox or BBox(x=0.0, y=0.0, width=0.0, height=0.0),
                             region_type=struct.role,
@@ -445,7 +452,7 @@ class DocumentUnderstandingService:
                             confidence=max(0.0, min(1.0, float(struct.confidence))),
                             evidence=[DocumentEvidence(
                                 signal_type="visual_vlm_verification",
-                                description=f"VLM visual structure: {struct.reasoning[:100]}",
+                                description=f"VLM visual structure: role={struct.role}",
                                 weight=0.9,
                                 score=struct.confidence,
                             )],
@@ -460,101 +467,14 @@ class DocumentUnderstandingService:
                         all_regions.append(synthetic_region)
                         region_map[head_id] = synthetic_region
                         vlm_assigned_ids.add(head_id)
-                        struct.grounded_region_ids = grounded_ids
-                        struct.grounding_status = grounding_status
-                        struct.grounded_text = grounded_text
                         if struct.role != "UNKNOWN":
                             synthetic_region.region_type = struct.role
                         continue
-
-                    head_id = f"vlm_visual_{understanding.page_number}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
-                    cont_ids = []
-                    synthetic_text = struct.display_label or struct.display_number or struct.role
-                    synthetic_region = DocumentRegion(
-                        region_id=head_id,
-                        page=understanding.page_number,
-                        text=synthetic_text,
-                        bbox=struct.bbox or BBox(x=0.0, y=0.0, width=0.0, height=0.0),
-                        region_type=struct.role,
-                        source="vlm_visual",
-                        confidence=max(0.0, min(1.0, float(struct.confidence))),
-                        evidence=[DocumentEvidence(
-                            signal_type="visual_vlm_verification",
-                            description=f"VLM visual structure without OCR grounding: {struct.reasoning[:100]}",
-                            weight=0.9,
-                            score=struct.confidence,
-                        )],
-                        verification_state="UNVERIFIED",
-                        metadata={
-                            "grounded_region_ids": [],
-                            "grounding_status": "UNGROUNDED",
-                            "grounded_text": "",
-                            "structure_source": understanding.structure_source,
-                        },
-                    )
-                    all_regions.append(synthetic_region)
-                    region_map[head_id] = synthetic_region
-                    vlm_assigned_ids.add(head_id)
-                    struct.grounded_region_ids = []
-                    struct.grounding_status = "UNGROUNDED"
-                    struct.grounded_text = ""
-                    if struct.role != "UNKNOWN":
-                        synthetic_region.region_type = struct.role
-                    continue
 
                 # Process head region
                 if head_id in region_map:
                     reg = region_map[head_id]
                     vlm_assigned_ids.add(head_id)
-
-                    preserve_parser_role = False
-                    if reg.region_type == "SUBQUESTION" and struct.role == "QUESTION":
-                        preserve_parser_role = bool(re.match(
-                            r"^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[\.\:\-]?\s*[\(\[]?\s*[a-z]{1,2}\s*[\)\]\.:]",
-                            reg.text,
-                            re.IGNORECASE,
-                        ))
-                    elif reg.region_type == "OPTION" and struct.role == "QUESTION":
-                        preserve_parser_role = bool(re.match(
-                            r"^\s*[A-Da-d1-9i-zIVXLCDM]+\s*[\)\]\.:]",
-                            reg.text,
-                            re.IGNORECASE,
-                        ))
-
-                    if preserve_parser_role:
-                        reg.verification_state = "VERIFIED"
-                        reg.confidence = max(reg.confidence, min(1.0, float(struct.confidence) * 0.95))
-                        reg.evidence.append(DocumentEvidence(
-                            signal_type="visual_vlm_verification",
-                            description=f"Parser numbering pattern preserved over generic VLM QUESTION label: {struct.reasoning[:80]}",
-                            weight=0.8,
-                            score=float(struct.confidence),
-                        ))
-                        continue
-
-                    if cont_ids:
-                        preserved_cont_ids = []
-                        for cont_id in cont_ids:
-                            cont_reg = region_map.get(cont_id)
-                            if cont_reg and cont_reg.region_type in ("OPTION", "SUBQUESTION", "TABLE", "TABLE_CELL", "DIAGRAM", "FIGURE"):
-                                relation_type = "option_of" if cont_reg.region_type == "OPTION" else (
-                                    "subquestion_of" if cont_reg.region_type == "SUBQUESTION" else "belongs_to"
-                                )
-                                all_relationships.append(RegionRelationship(
-                                    source_region_id=cont_id,
-                                    target_region_id=head_id,
-                                    relationship_type=relation_type,
-                                    confidence=min(float(struct.confidence), cont_reg.confidence),
-                                    evidence=[DocumentEvidence(
-                                        signal_type="visual_vlm_verification",
-                                        description=f"Preserved independent {cont_reg.region_type.lower()} structure inside VLM group",
-                                        weight=0.9,
-                                        score=float(struct.confidence),
-                                    )],
-                                ))
-                            else:
-                                preserved_cont_ids.append(cont_id)
-                        cont_ids = preserved_cont_ids
 
                     vlm_hyp = StructureHypothesis(
                         region_id=head_id,
@@ -563,7 +483,7 @@ class DocumentUnderstandingService:
                         source="vlm_page_understanding",
                         evidence=[DocumentEvidence(
                             signal_type="visual_vlm_verification",
-                            description=f"VLM page understanding: {struct.reasoning}",
+                            description=f"VLM page understanding: role={struct.role}",
                             weight=0.9,
                             score=struct.confidence,
                         )],
@@ -575,14 +495,8 @@ class DocumentUnderstandingService:
                     reg.vlm_hypothesis = vlm_hyp
 
                     if struct.confidence >= 0.60 and struct.role != "UNKNOWN":
-
-                        det_agrees = any(
-                            h.hypothesized_type == struct.role
-                            for h in reg.conflicting_hypotheses
-                            if h.source != "vlm_page_understanding"
-                        )
                         reg.region_type = struct.role
-                        reg.confidence = min(1.0, struct.confidence + 0.05) if det_agrees else struct.confidence
+                        reg.confidence = struct.confidence
                         reg.verification_state = "VERIFIED"
                         reg.classification_conflict = False
                     else:
@@ -591,22 +505,20 @@ class DocumentUnderstandingService:
 
                     reg.evidence.append(DocumentEvidence(
                         signal_type="visual_vlm_verification",
-                        description=f"VLM: {struct.reasoning[:100]}",
+                        description=f"VLM visual role: {struct.role}",
                         weight=0.9,
                         score=struct.confidence,
                     ))
 
-                # Process trailing continuation regions in multi-region structure
+                # Process multi-block grounded continuation regions
                 for cont_id in cont_ids:
                     if cont_id not in region_map:
                         continue
                     vlm_assigned_ids.add(cont_id)
                     cont_reg = region_map[cont_id]
-                    # Continuation regions stay non-QUESTION so they don't spawn duplicate questions
                     cont_reg.region_type = "UNKNOWN"
                     cont_reg.verification_state = "VERIFIED"
                     cont_reg.parent_region_id = head_id
-                    # Add continuation edge
                     all_relationships.append(RegionRelationship(
                         source_region_id=cont_id,
                         target_region_id=head_id,
@@ -614,18 +526,17 @@ class DocumentUnderstandingService:
                         confidence=struct.confidence,
                         evidence=[DocumentEvidence(
                             signal_type="visual_vlm_verification",
-                            description=f"Multi-region structure continuation of {head_id}",
+                            description=f"Grounded evidence continuation of {head_id}",
                             weight=0.9,
                             score=struct.confidence,
                         )],
                     ))
 
-            # Apply VLM relationships
+            # Apply VLM explicit relationships
             for rel in understanding.relationships:
                 for src_id in rel.source_ids:
                     for tgt_id in rel.target_ids:
                         if src_id in region_map and tgt_id in region_map:
-                            # Check for duplicates
                             existing_key = (src_id, tgt_id, rel.relationship_type)
                             already_exists = any(
                                 (r.source_region_id, r.target_region_id, r.relationship_type) == existing_key
@@ -645,6 +556,97 @@ class DocumentUnderstandingService:
                                     )],
                                 ))
 
+            # SEMANTIC COMPLETENESS ENFORCEMENT (Authoritative VLM Boundary)
+            is_complete = (understanding.semantic_completeness == "COMPLETE")
+            is_partial = (understanding.semantic_completeness == "PARTIAL")
+            is_ambiguous = (understanding.semantic_completeness == "AMBIGUOUS")
+            is_failed = (understanding.semantic_completeness == "FAILED")
+
+            if is_complete:
+                # When VLM page observation is COMPLETE, VLM structural roles are authoritative.
+                # Any OCR region on this page not assigned to a VLM structure must NOT independently
+                # remain QUESTION, OPTION, or SUBQUESTION promoted by deterministic regex heuristics.
+                demoted_count = 0
+                for r in page_regions:
+                    if r.region_id not in vlm_assigned_ids:
+                        if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
+                            r.region_type = "UNKNOWN"
+                            r.verification_state = "UNVERIFIED"
+                            r.confidence = min(r.confidence, 0.40)
+                            r.classification_conflict = False
+                            demoted_count += 1
+                if demoted_count > 0:
+                    print(f"[DocUnderstanding] Page {page_num_u}: VLM COMPLETE — demoted {demoted_count} ungrounded OCR fragment(s) to UNKNOWN evidence.")
+
+            elif is_ambiguous:
+                # STOP but sparse coverage: VLM output exists but may be incomplete.
+                # Do NOT fully demote — instead mark ungrounded regions as UNCERTAIN.
+                # This prevents ghost questions while preserving legitimate ungrounded content.
+                uncertain_count = 0
+                for r in page_regions:
+                    if r.region_id not in vlm_assigned_ids:
+                        if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
+                            # Short fragments (word/phrase) are very likely noise — demote fully
+                            text_stripped = r.text.strip()
+                            if len(text_stripped) < 15:
+                                r.region_type = "UNKNOWN"
+                                r.confidence = min(r.confidence, 0.35)
+                                r.verification_state = "UNVERIFIED"
+                            else:
+                                # Longer fragments could be legitimate — mark uncertain
+                                r.verification_state = "UNCERTAIN"
+                                r.confidence = min(r.confidence, 0.55)
+                            uncertain_count += 1
+                if uncertain_count > 0:
+                    print(f"[DocUnderstanding] Page {page_num_u}: VLM AMBIGUOUS — {uncertain_count} ungrounded OCR fragment(s) marked UNCERTAIN.")
+
+            elif is_partial:
+                # When VLM page observation is PARTIAL (MAX_TOKENS), mark ungrounded regions as UNCERTAIN
+                # and prevent single-word / short fragments from spawning standalone QUESTION nodes.
+                for r in page_regions:
+                    if r.region_id not in vlm_assigned_ids:
+                        r.verification_state = "UNCERTAIN"
+                        text_stripped = r.text.strip()
+                        if len(text_stripped) < 25 and not re.search(r"^\s*(?:Q\d+|\d+[\.\)])", text_stripped, re.IGNORECASE):
+                            if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
+                                r.region_type = "UNKNOWN"
+                                r.confidence = min(r.confidence, 0.40)
+
+            elif is_failed:
+                # VLM produced 0 structures — treat all deterministic roles as uncertain
+                for r in page_regions:
+                    if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
+                        r.verification_state = "UNCERTAIN"
+                        r.confidence = min(r.confidence, 0.60)
+                print(f"[DocUnderstanding] Page {page_num_u}: VLM FAILED — all deterministic roles marked UNCERTAIN.")
+
+            # Option linking: Ensure grounded OPTION regions link to nearest visual QUESTION
+            existing_option_sources: Set[str] = {
+                r.source_region_id
+                for r in all_relationships
+                if r.relationship_type == "option_of"
+            }
+            sorted_page_regs = sorted(page_regions, key=lambda r: (r.bbox.y, r.bbox.x))
+            last_q: Optional[DocumentRegion] = None
+            for preg in sorted_page_regs:
+                if preg.region_type == "QUESTION":
+                    last_q = preg
+                elif preg.region_type == "OPTION" and preg.region_id not in existing_option_sources:
+                    if last_q is not None:
+                        all_relationships.append(RegionRelationship(
+                            source_region_id=preg.region_id,
+                            target_region_id=last_q.region_id,
+                            relationship_type="option_of",
+                            confidence=0.90,
+                            evidence=[DocumentEvidence(
+                                signal_type="visual_vlm_verification",
+                                description="Option linked to nearest preceding QUESTION",
+                                weight=0.9,
+                                score=0.90,
+                            )],
+                        ))
+                        existing_option_sources.add(preg.region_id)
+
     def _build_structure_graph(
         self,
         all_regions: List[DocumentRegion],
@@ -657,7 +659,35 @@ class DocumentUnderstandingService:
 
         This graph is the PRIMARY input for question extraction.
         It is built BEFORE extraction, not as an output report.
+
+        FIX 1: Stale pre-VLM continuation_of edges whose source node has been
+        assigned a semantic VLM role (OPTION, SUBQUESTION, QUESTION) are pruned
+        here. This prevents OCR-proximity edges from overriding VLM semantic
+        boundaries and collapsing distinct semantic units.
         """
+        # Build a role-by-region-id lookup from the final region state
+        region_final_role: Dict[str, str] = {r.region_id: r.region_type for r in all_regions}
+
+        # Semantic roles that must NOT be treated as continuations of a prior question
+        _SEMANTIC_BOUNDARY_ROLES = {"OPTION", "SUBQUESTION", "QUESTION", "SECTION_HEADER"}
+
+        # FIX 1: Prune stale continuation edges that violate VLM-assigned boundaries
+        pruned_rels: List[RegionRelationship] = []
+        pruned_count = 0
+        for rel in all_relationships:
+            if rel.relationship_type == "continuation_of":
+                src_role = region_final_role.get(rel.source_region_id, "UNKNOWN")
+                if src_role in _SEMANTIC_BOUNDARY_ROLES:
+                    pruned_count += 1
+                    continue  # Drop this stale edge
+            pruned_rels.append(rel)
+        if pruned_count > 0:
+            print(
+                f"[DocUnderstanding] FIX-1: Pruned {pruned_count} stale continuation_of edge(s) "
+                f"whose source has a semantic VLM role (OPTION/SUBQUESTION/QUESTION/SECTION_HEADER)."
+            )
+        all_relationships = pruned_rels
+
         nodes: Dict[str, GraphNode] = {}
         continuation_region_ids = {
             rel.source_region_id
@@ -990,7 +1020,10 @@ class DocumentUnderstandingService:
     def _extract_intra_page_relationships(
         self, regions: List[DocumentRegion]
     ) -> List[RegionRelationship]:
-        """Extracts spatial, hierarchical, and reading order relationships on a page."""
+        """
+        Extracts spatial reading-order relationships and section memberships on a page.
+        Semantic relationships (option_of, subquestion_of, continuation_of) are governed by VLM authority.
+        """
         rels: List[RegionRelationship] = []
         if not regions:
             return rels
@@ -1000,8 +1033,10 @@ class DocumentUnderstandingService:
         current_question_id: Optional[str] = None
 
         for idx, reg in enumerate(sorted_regs):
-            if idx > 0:
-                prev_reg = sorted_regs[idx - 1]
+            prev_reg = sorted_regs[idx - 1] if idx > 0 else None
+
+            # Spatial reading order: follows
+            if prev_reg is not None:
                 rels.append(RegionRelationship(
                     source_region_id=reg.region_id,
                     target_region_id=prev_reg.region_id,
@@ -1014,6 +1049,7 @@ class DocumentUnderstandingService:
                     )],
                 ))
 
+            # Section membership
             if reg.region_type == "SECTION_HEADER" or re.search(r"^\s*(?:SECTION|PART|GROUP)\s+[A-Z0-9]", reg.text, re.IGNORECASE):
                 current_section_id = reg.region_id
             elif current_section_id and reg.region_id != current_section_id:
@@ -1024,48 +1060,20 @@ class DocumentUnderstandingService:
                     confidence=0.95,
                 ))
 
+            # Track active question anchor
             if reg.region_type == "QUESTION":
-                if current_question_id and not re.search(r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?\d{1,3}\s*[\.\):\-]", reg.text, re.IGNORECASE) and not re.search(r"^\s*\(\s*[a-z0-9]+\s*\)", reg.text, re.IGNORECASE):
+                current_question_id = reg.region_id
+            elif reg.region_type == "UNKNOWN" and current_question_id and prev_reg is not None:
+                # Add continuation_of ONLY when immediately adjacent multi-line text without sentence boundary
+                prev_txt = prev_reg.text.strip()
+                vert_gap = reg.bbox.y - (prev_reg.bbox.y + prev_reg.bbox.height)
+                if vert_gap < 25.0 and prev_txt and prev_txt[-1] not in (".", "?", "!", ":", ";"):
                     rels.append(RegionRelationship(
                         source_region_id=reg.region_id,
                         target_region_id=current_question_id,
                         relationship_type="continuation_of",
-                        confidence=0.85,
+                        confidence=0.80,
                     ))
-                else:
-                    current_question_id = reg.region_id
-            elif reg.region_type == "UNKNOWN" and current_question_id and not re.search(r"^\s*(?:SECTION|PART|GROUP|Table|Figure)\b", reg.text, re.IGNORECASE):
-                rels.append(RegionRelationship(
-                    source_region_id=reg.region_id,
-                    target_region_id=current_question_id,
-                    relationship_type="continuation_of",
-                    confidence=0.80,
-                ))
-            elif reg.region_type in ("OPTION", "SUBQUESTION", "TABLE", "DIAGRAM", "TABLE_CELL"):
-                rel_t = "option_of" if reg.region_type == "OPTION" else ("subquestion_of" if reg.region_type == "SUBQUESTION" else "belongs_to")
-                if current_question_id:
-                    rels.append(RegionRelationship(
-                        source_region_id=reg.region_id,
-                        target_region_id=current_question_id,
-                        relationship_type="contains" if reg.region_type in ("DIAGRAM", "TABLE", "TABLE_CELL") else rel_t,
-                        confidence=0.90,
-                    ))
-                    if reg.region_type in ("OPTION", "SUBQUESTION"):
-                        rels.append(RegionRelationship(
-                            source_region_id=reg.region_id,
-                            target_region_id=current_question_id,
-                            relationship_type="contains",
-                            confidence=0.90,
-                        ))
-                    reg.parent_region_id = current_question_id
-                    parent_region = next((r for r in regions if r.region_id == current_question_id), None)
-                    if parent_region is not None and reg.region_id not in parent_region.child_region_ids:
-                        parent_region.child_region_ids.append(reg.region_id)
-
-            if reg.region_type == "DIAGRAM" and current_question_id:
-                parent_region = next((r for r in regions if r.region_id == current_question_id), None)
-                if parent_region is not None and reg.region_id not in parent_region.child_region_ids:
-                    parent_region.child_region_ids.append(reg.region_id)
 
         return rels
 
@@ -1088,6 +1096,12 @@ class DocumentUnderstandingService:
 
             last_text = last_q.text.strip()
             first_text = first_reg.text.strip()
+
+            # Fix 4: Cross-page continuation must NOT be created if the first region of
+            # the next page already has a distinct semantic role (QUESTION, OPTION, etc.)
+            # That would absorb it as question continuation and destroy its own identity.
+            if first_reg.region_type in ("QUESTION", "OPTION", "SUBQUESTION", "SECTION_HEADER", "INSTRUCTION", "HEADER", "FOOTER", "METADATA"):
+                continue
 
             if last_text and (not last_text[-1] in (".", "?", "!", ":", ";") or not re.search(r"^\s*(?:SECTION|PART|Q\d+|\d+\.)", first_text, re.IGNORECASE)):
                 cross_rels.append(RegionRelationship(

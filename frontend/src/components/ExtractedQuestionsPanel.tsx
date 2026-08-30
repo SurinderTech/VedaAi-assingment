@@ -337,8 +337,28 @@ export default function ExtractedQuestionsPanel({
                         {q.question_text || "Question prompt text"}
                       </p>
 
+                      {/* MCQ Inline Options Preview (collapsed) — Fix 5 */}
+                      {q.options && q.options.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-0.5">
+                          {q.options.slice(0, 4).map((opt, idx) => (
+                            <span
+                              key={idx}
+                              className="text-[10px] font-mono bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded-md leading-tight"
+                            >
+                              {opt.length > 20 ? opt.slice(0, 20) + "…" : opt}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
                       {/* Needs Review or Overridden Badges */}
                       <div className="flex items-center gap-1.5 flex-wrap">
+                        {/* Question type badge */}
+                        {q.question_type && q.question_type !== "UNKNOWN" && (
+                          <span className="text-[10px] font-bold px-2 py-0.2 rounded-md bg-sky-50 text-sky-700 border border-sky-200">
+                            {q.question_type === "MCQ" ? "MCQ" : q.question_type}
+                          </span>
+                        )}
                         {isOverridden && (
                           <span className="text-[10px] font-bold px-2 py-0.2 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200 flex items-center gap-1">
                             <PenTool size={10} /> Overridden
@@ -416,6 +436,59 @@ export default function ExtractedQuestionsPanel({
                         )}
                       </div>
                     </div>
+
+                    {/* MCQ Options Block (Expanded) — Fix 5 */}
+                    {q.extracted_options && q.extracted_options.length > 0 ? (
+                      <div className="space-y-1.5">
+                        <div className="font-bold text-slate-800 text-[11px] flex items-center gap-1.5">
+                          <BookOpen size={13} className="text-blue-500" />
+                          MCQ Options ({q.extracted_options.length})
+                        </div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {q.extracted_options.map((opt, idx) => (
+                            <div
+                              key={opt.option_id || idx}
+                              className="flex items-start gap-2 p-2 bg-white border border-slate-200 rounded-xl"
+                            >
+                              <span className="h-5 w-5 rounded-md bg-slate-800 text-white text-[10px] font-black flex items-center justify-center shrink-0">
+                                {opt.label || String.fromCharCode(65 + idx)}
+                              </span>
+                              <span className="text-[11px] text-slate-700 leading-snug font-medium">
+                                {opt.full_text || opt.text || ""}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : q.options && q.options.length > 0 ? (
+                      <div className="space-y-1.5">
+                        <div className="font-bold text-slate-800 text-[11px] flex items-center gap-1.5">
+                          <BookOpen size={13} className="text-blue-500" />
+                          MCQ Options ({q.options.length})
+                        </div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {q.options.map((opt, idx) => {
+                            // Parse "A. Text" or "A) Text" format
+                            const m = opt.match(/^\s*([A-Da-d])[.)\s]+(.*)$/);
+                            const label = m ? m[1].toUpperCase() : String.fromCharCode(65 + idx);
+                            const text = m ? m[2].trim() : opt;
+                            return (
+                              <div
+                                key={idx}
+                                className="flex items-start gap-2 p-2 bg-white border border-slate-200 rounded-xl"
+                              >
+                                <span className="h-5 w-5 rounded-md bg-slate-800 text-white text-[10px] font-black flex items-center justify-center shrink-0">
+                                  {label}
+                                </span>
+                                <span className="text-[11px] text-slate-700 leading-snug font-medium">
+                                  {text}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ) : null}
 
                     {/* Rubric Criteria Evaluation */}
                     {q.criterion_results && q.criterion_results.length > 0 && (

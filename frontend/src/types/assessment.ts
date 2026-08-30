@@ -107,6 +107,16 @@ export interface AssessmentRevision {
   snapshot_file?: string | null;
 }
 
+// Fix 5: Structured option type for MCQ rendering
+export interface ExtractedOption {
+  option_id: string;
+  label: string;
+  text: string;
+  full_text: string;
+  source_region_ids: string[];
+  confidence: number;
+}
+
 export interface StructuredQuestionResult {
   question_id: string;
   question_number: string;
@@ -130,6 +140,15 @@ export interface StructuredQuestionResult {
   escalation_reason?: string | null;
   review_status: ReviewStatus;
   teacher_review?: TeacherReview | null;
+  // Fix 5: Structured semantic data preserved through API
+  options?: string[];                         // flat option strings ["A. Ethane", ...]
+  extracted_options?: ExtractedOption[];       // structured objects with label/text/confidence
+  question_type?: string;                     // MCQ, SHORT_ANSWER, LONG_ANSWER, SUBQUESTION
+  parent_question_id?: string | null;
+  page_number?: number;
+  semantic_state?: string;
+  source_region_ids?: string[];
+  extraction_confidence?: number;
 }
 
 export interface StructuredAssessmentResult {

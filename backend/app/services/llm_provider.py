@@ -29,6 +29,9 @@ OPENROUTER_FREE_MODELS = [
     "dots-studio/dots-3-note-preview:free",
     "nvidia/nemotron-3.5-lightning:free",
     "poolside/laguna-s-2.1:free",
+    "nousresearch/deephermes-3-llama-3-1-8b:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
     "openrouter/free",
 ]
 
@@ -186,11 +189,17 @@ async def _call_gemini(
 
 
 OPENROUTER_VISION_MODELS = [
+    # Primary free vision models (multimodal capable)
     "google/gemini-2.0-flash-exp:free",
     "google/gemini-flash-1.5:free",
     "qwen/qwen-2-vl-72b-instruct:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "meta-llama/llama-3.2-90b-vision-instruct:free",
     "meta-llama/llama-3.2-11b-vision-instruct:free",
     "mistralai/pixtral-12b:free",
+    "mistralai/pixtral-large-2411:free",
+    "microsoft/phi-4-multimodal-instruct:free",
+    "deepseek/deepseek-vl2:free",
 ]
 
 

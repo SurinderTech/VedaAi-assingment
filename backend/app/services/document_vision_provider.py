@@ -125,6 +125,8 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
         total_pages: int,
         page_context: Optional[Dict[str, Any]] = None,
         force_vlm: bool = False,
+        _depth: int = 0,
+        _y_offset: float = 0.0,
     ) -> VLMPageUnderstanding:
         """
         The VLM BRAIN: sends the actual page image + complete OCR evidence
@@ -143,6 +145,7 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                 document_purpose="UNKNOWN",
                 structure_source="DETERMINISTIC_FALLBACK",
                 vlm_result="NOT_CONFIGURED",
+                semantic_completeness="UNKNOWN",
             )
 
         # Build the page understanding prompt with COMPLETE OCR evidence
@@ -182,6 +185,7 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                 vlm_provider=vlm_meta.get("provider", "gemini"),
                 vlm_result="FAILED",
                 finish_reason=vlm_meta.get("finish_reason", "N/A"),
+                semantic_completeness="UNKNOWN",
                 retry_count=vlm_meta.get("retry_count", 0),
                 fallback_provider=vlm_meta.get("fallback_provider", "N/A"),
                 structures_produced=0,
@@ -197,6 +201,69 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
             vlm_meta=vlm_meta,
         )
 
+        # Visual decomposition retry on MAX_TOKENS
+        if understanding.semantic_completeness == "PARTIAL" and _depth == 0 and page_image is not None and img_meta.get("dimensions"):
+            w, h = img_meta["dimensions"]
+            if h > 100:
+                print(f"[VLM] Page {page_number}: MAX_TOKENS observed. Executing vision-first vertical decomposition retry...")
+                try:
+                    from PIL import Image
+                    if isinstance(page_image, bytes):
+                        pil_img = Image.open(io.BytesIO(page_image))
+                    elif hasattr(page_image, "crop"):
+                        pil_img = page_image
+                    else:
+                        pil_img = None
+
+                    if pil_img is not None:
+                        mid_y = h / 2.0
+                        top_img = pil_img.crop((0, 0, int(w), int(mid_y)))
+                        bot_img = pil_img.crop((0, int(mid_y), int(w), int(h)))
+
+                        top_blocks = [b for b in ocr_blocks if b.bbox.y + b.bbox.height / 2.0 <= mid_y]
+                        bot_blocks_orig = [b for b in ocr_blocks if b.bbox.y + b.bbox.height / 2.0 > mid_y]
+                        # Shift bottom blocks coordinates relative to top of bottom crop for OCR prompt matching
+                        bot_blocks_shifted = [
+                            Block(
+                                id=b.id,
+                                page=b.page,
+                                text=b.text,
+                                bbox=BBox(x=b.bbox.x, y=max(0.0, b.bbox.y - mid_y), width=b.bbox.width, height=b.bbox.height),
+                                confidence=b.confidence,
+                                source=b.source,
+                            )
+                            for b in bot_blocks_orig
+                        ]
+
+                        top_und = self.understand_page(
+                            top_img, top_blocks, page_number, total_pages, page_context=page_context, _depth=1
+                        )
+                        bot_und = self.understand_page(
+                            bot_img, bot_blocks_shifted, page_number, total_pages, page_context=page_context, _depth=1, _y_offset=mid_y
+                        )
+
+                        # Shift bottom structures y-coordinates back to full-page coordinates
+                        for s in bot_und.structures:
+                            if s.bbox:
+                                s.bbox = BBox(x=s.bbox.x, y=s.bbox.y + mid_y, width=s.bbox.width, height=s.bbox.height)
+
+                        combined_structures = top_und.structures + bot_und.structures
+                        combined_relationships = top_und.relationships + bot_und.relationships
+
+                        if combined_structures:
+                            both_complete = (top_und.finish_reason == "STOP" and bot_und.finish_reason == "STOP")
+                            understanding.structures = combined_structures
+                            understanding.relationships = combined_relationships
+                            understanding.structures_produced = len(combined_structures)
+                            understanding.relationships_produced = len(combined_relationships)
+                            understanding.finish_reason = "STOP" if both_complete else "PARTIAL"
+                            understanding.semantic_completeness = "COMPLETE" if both_complete else "PARTIAL"
+                            understanding.vlm_result = "SUCCESS"
+                            understanding.structure_source = "VLM_DECOMPOSED_SUCCESS" if both_complete else "VLM_DECOMPOSED_PARTIAL"
+                            print(f"[VLM] Page {page_number}: Visual decomposition completed: {len(combined_structures)} structures, {len(combined_relationships)} relationships (completeness={understanding.semantic_completeness}).")
+                except Exception as e_decomp:
+                    print(f"[VLM] Page {page_number}: Visual decomposition exception: {e_decomp}")
+
         return understanding
 
     def _build_page_understanding_prompt(
@@ -207,18 +274,18 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
         page_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Builds the page-level document understanding prompt.
+        Builds a compact page-level document understanding prompt.
 
-        The VLM is asked to UNDERSTAND the document, not verify pre-existing hypotheses.
-        Full OCR text is provided — NOT truncated.
+        The VLM is asked to UNDERSTAND the document visually.
+        The prompt emphasizes that the page image is authoritative for layout and structure,
+        and OCR blocks are supporting textual evidence.
+        Output format is compact semantic geometry (role, bbox/ids, confidence, relationships).
         """
-        # Build complete OCR evidence with IDs and bounding boxes
+        # Build complete OCR evidence with IDs and bounding boxes in compact form
         ocr_evidence_lines = []
         for b in ocr_blocks:
             ocr_evidence_lines.append(
-                f'  {{"id": "{b.id}", "text": {json.dumps(b.text)}, '
-                f'"bbox": [{round(b.bbox.x,1)}, {round(b.bbox.y,1)}, {round(b.bbox.width,1)}, {round(b.bbox.height,1)}], '
-                f'"source": "{b.source or "ocr"}"}}'
+                f'  {{"id": "{b.id}", "bbox": [{round(b.bbox.x,1)}, {round(b.bbox.y,1)}, {round(b.bbox.width,1)}, {round(b.bbox.height,1)}], "text": {json.dumps(b.text)}}}'
             )
 
         ocr_evidence = "[\n" + ",\n".join(ocr_evidence_lines) + "\n]"
@@ -230,51 +297,39 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
             if page_context.get("next_page_summary"):
                 context_info += f"\nNext page context: {page_context['next_page_summary']}"
 
-        return f"""You are analyzing page {page_number} of {total_pages} from an academic document.
+        return f"""You are analyzing page {page_number} of {total_pages} from a document.
 
-    TASK: Examine the attached page image AND the OCR text evidence below. Determine what this page contains and how its content is structured.
+TASK: Examine the page image (authoritative for visual structure) and the OCR text evidence below. Identify all meaningful visual structures and their semantic relationships.
 {context_info}
-IMPORTANT RULES:
-- Identify ALL meaningful visual structures on the page. Return one structure per semantically independent unit.
-- Keep a question, each answer option, each subquestion, each table, and each diagram as separate structures. Never put options inside a QUESTION structure's region_ids.
-- Use relationships to connect separate structures. A question may have no relationship when it is standalone.
-- Do not treat page furniture, publisher advertisements, watermarks, QR codes, page numbers, or document-end notices as question text or question continuations. Classify them as FOOTER, METADATA, or UNKNOWN.
-- A numbered item is NOT automatically a question. Consider the document context.
-  "1. SECTION-A is COMPULSORY consisting of TEN questions..." is INSTRUCTION / SECTION_HEADER content.
-  "2. SECTION-B contains FIVE questions..." is INSTRUCTION / SECTION_HEADER content.
-  "3. SECTION-C contains THREE questions..." is INSTRUCTION / SECTION_HEADER content.
-  "General Instructions: 1. Answer all questions" — these are INSTRUCTIONS, not questions.
-- Treat the page image as the authoritative source for visual structure.
-- OCR text and OCR geometry are supporting evidence for grounding, not the only source of structure.
-- A meaningful visual region may exist even if it is not already represented by an OCR block.
-- If a structure is visually discovered but lacks an exact OCR region, return its visual bbox and leave region_ids empty.
-- Do NOT invent textual content. Preserve exact OCR text when grounding, but do not rewrite it.
-- Keep reasoning string concise (max 6 words per entry) to fit response limits.
-- If OCR blocks map cleanly to a structure, include their region_ids; otherwise use bbox-only visual discovery.
+RULES:
+1. Treat the page image as authoritative for visual layout, columns, reading order, and entity boundaries.
+2. Identify each distinct semantic unit separately: QUESTION, SUBQUESTION, OPTION, SECTION_HEADER, INSTRUCTION, TABLE, DIAGRAM, HEADER, FOOTER, METADATA, UNKNOWN.
+3. Keep questions and their options/subquestions as SEPARATE structures. Connect them using relationships (e.g. "option_of", "subquestion_of").
+4. If an entity maps to OCR blocks, include their "region_ids". If it is visual or spans multiple blocks, include its visual "bbox": [x1, y1, x2, y2].
+5. Do NOT repeat long text in the output; the OCR evidence provides the exact text.
 
-OCR Evidence (ordered by reading position on page {page_number}):
+OCR Evidence (page {page_number}):
 {ocr_evidence}
 
-Respond in valid JSON:
+Return strictly valid JSON in this compact format:
 {{
   "page_purpose": "QUESTION_PAGE" | "COVER" | "INSTRUCTIONS" | "CONTINUATION" | "MIXED" | "ADMINISTRATIVE",
-  "document_purpose": "EXAMINATION_PAPER" | "ASSIGNMENT" | "INSTRUCTIONS" | "UNKNOWN",
-    "structures": [
+  "document_purpose": "EXAMINATION_PAPER" | "ASSIGNMENT" | "INSTRUCTIONS" | "REPORT" | "UNKNOWN",
+  "structures": [
     {{
-    "region_ids": ["id1"],
-      "role": "QUESTION" | "OPTION" | "SUBQUESTION" | "SECTION_HEADER" | "INSTRUCTION" | "METADATA" | "HEADER" | "FOOTER" | "ADMINISTRATIVE" | "TABLE" | "DIAGRAM" | "CONTINUATION" | "UNKNOWN",
+      "role": "QUESTION" | "OPTION" | "SUBQUESTION" | "SECTION_HEADER" | "INSTRUCTION" | "METADATA" | "HEADER" | "FOOTER" | "TABLE" | "DIAGRAM" | "UNKNOWN",
+      "region_ids": ["id1"],
+      "bbox": [x1, y1, x2, y2],
       "display_number": "1",
-      "display_label": "Section A",
-      "reasoning": "Why this content has this role in the document context",
       "confidence": 0.95
     }}
   ],
   "relationships": [
     {{
-      "source_ids": ["id3"],
-      "target_ids": ["id1"],
-      "type": "option_of" | "subquestion_of" | "section_member" | "continuation_of" | "belongs_to" | "follows",
-      "confidence": 0.9
+      "source_ids": ["id_option"],
+      "target_ids": ["id_question"],
+      "type": "option_of" | "subquestion_of" | "section_member" | "continuation_of" | "belongs_to",
+      "confidence": 0.95
     }}
   ]
 }}"""
@@ -395,9 +450,10 @@ Respond in valid JSON:
         page_b64_sent: bool,
         vlm_meta: Optional[Dict[str, Any]] = None,
     ) -> VLMPageUnderstanding:
-        """Parses VLM JSON response into structured VLMPageUnderstanding, validating region IDs."""
+        """Parses VLM JSON response into structured VLMPageUnderstanding, validating region IDs and bounding boxes."""
         valid_ids = {b.id for b in ocr_blocks}
         meta = vlm_meta or {}
+        raw_finish_reason = meta.get("finish_reason", "STOP")
 
         try:
             from app.services.llm_provider import extract_json_payload
@@ -408,10 +464,10 @@ Respond in valid JSON:
             page_purpose = data.get("page_purpose", "UNKNOWN")
             document_purpose = data.get("document_purpose", "UNKNOWN")
 
-            # Parse structures — accept either OCR-grounded or bbox-only visual structures.
+            # Parse structures — accept both verbose and compact keys
             structures: List[VLMStructureItem] = []
             for item in data.get("structures", []):
-                raw_ids = item.get("region_ids", [])
+                raw_ids = item.get("region_ids", item.get("ids", []))
                 validated_ids = [rid for rid in raw_ids if rid in valid_ids]
 
                 bbox_value = item.get("bbox")
@@ -451,17 +507,24 @@ Respond in valid JSON:
                     region_ids=validated_ids,
                     bbox=parsed_bbox,
                     role=normalized_role,
-                    display_number=item.get("display_number"),
+                    display_number=item.get("display_number", item.get("num")),
                     display_label=item.get("display_label"),
                     reasoning=str(item.get("reasoning", "")),
-                    confidence=float(item.get("confidence", 0.5)),
+                    confidence=float(item.get("confidence", item.get("conf", 0.90))),
                 ))
 
-            # Parse relationships — validate all referenced IDs
+            # Parse relationships — validate all referenced IDs (accept compact src/tgt keys)
             relationships: List[VLMRelationshipItem] = []
             for rel in data.get("relationships", []):
-                src_ids = [rid for rid in rel.get("source_ids", []) if rid in valid_ids]
-                tgt_ids = [rid for rid in rel.get("target_ids", []) if rid in valid_ids]
+                src_raw = rel.get("source_ids", rel.get("src", []))
+                tgt_raw = rel.get("target_ids", rel.get("tgt", []))
+                if isinstance(src_raw, str):
+                    src_raw = [src_raw]
+                if isinstance(tgt_raw, str):
+                    tgt_raw = [tgt_raw]
+
+                src_ids = [rid for rid in src_raw if rid in valid_ids]
+                tgt_ids = [rid for rid in tgt_raw if rid in valid_ids]
                 if not src_ids or not tgt_ids:
                     continue
 
@@ -478,10 +541,16 @@ Respond in valid JSON:
                     source_ids=src_ids,
                     target_ids=tgt_ids,
                     relationship_type=rel_type,
-                    confidence=float(rel.get("confidence", 0.5)),
+                    confidence=float(rel.get("confidence", rel.get("conf", 0.90))),
                 ))
 
             struct_source = meta.get("structure_source", "VLM_SUCCESS") if structures else "DETERMINISTIC_FALLBACK"
+            completeness = self._compute_semantic_completeness(
+                finish_reason=raw_finish_reason,
+                structures=structures,
+                ocr_blocks=ocr_blocks,
+                image_dimensions=meta.get("image_dimensions"),
+            )
 
             return VLMPageUnderstanding(
                 page_number=page_number,
@@ -501,7 +570,8 @@ Respond in valid JSON:
                 structure_source=struct_source,
                 vlm_provider=meta.get("provider", "gemini"),
                 vlm_result="SUCCESS" if structures else "VLM_NO_STRUCTURES",
-                finish_reason=meta.get("finish_reason", "STOP"),
+                finish_reason=raw_finish_reason,
+                semantic_completeness=completeness,
                 retry_count=meta.get("retry_count", 0),
                 fallback_provider=meta.get("fallback_provider", "N/A"),
                 structures_produced=len(structures),
@@ -524,94 +594,88 @@ Respond in valid JSON:
                 structure_source="DETERMINISTIC_FALLBACK",
                 vlm_provider=meta.get("provider", "gemini"),
                 vlm_result="FAILED",
-                finish_reason=meta.get("finish_reason", "N/A"),
+                finish_reason=raw_finish_reason,
+                semantic_completeness="UNKNOWN",
                 retry_count=meta.get("retry_count", 0),
                 fallback_provider=meta.get("fallback_provider", "N/A"),
                 structures_produced=0,
                 relationships_produced=0,
             )
 
+    def _compute_semantic_completeness(
+        self,
+        finish_reason: str,
+        structures: List,
+        ocr_blocks: List[Block],
+        image_dimensions: Optional[Any] = None,
+    ) -> str:
+        """
+        Real semantic completeness scorer — Fix 1.
 
-            # Parse structures — validate region IDs against real OCR blocks
-            structures: List[VLMStructureItem] = []
-            for item in data.get("structures", []):
-                raw_ids = item.get("region_ids", [])
-                # Only keep IDs that exist in the real OCR block set
-                validated_ids = [rid for rid in raw_ids if rid in valid_ids]
-                if not validated_ids:
-                    # VLM referenced unknown IDs — skip this structure entirely
-                    continue
+        Does NOT blindly treat finishReason==STOP as COMPLETE.
+        A VLM can stop generating having only covered part of a page.
 
-                role = item.get("role", "UNKNOWN")
-                # Normalize role to valid DocumentRegionType
-                role_map = {
-                    "ADMINISTRATIVE": "INSTRUCTION",
-                    "CONTINUATION": "UNKNOWN",  # Handled via relationships
-                }
-                normalized_role = role_map.get(role, role)
+        States:
+          COMPLETE  — STOP + good coverage evidence
+          PARTIAL   — MAX_TOKENS (truncated output)
+          AMBIGUOUS — STOP but sparse/questionable coverage
+          FAILED    — 0 structures produced
+        """
+        # MAX_TOKENS always means partial — output was cut off
+        if finish_reason in ("MAX_TOKENS", "LENGTH", "RECITATION"):
+            return "PARTIAL"
 
-                valid_roles = {
-                    "HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER",
-                    "QUESTION", "SUBQUESTION", "OPTION", "TABLE", "TABLE_CELL",
-                    "DIAGRAM", "FIGURE", "ANSWER_SPACE", "UNKNOWN",
-                }
-                if normalized_role not in valid_roles:
-                    normalized_role = "UNKNOWN"
+        # No structures produced → failed understanding
+        if not structures:
+            return "FAILED"
 
-                structures.append(VLMStructureItem(
-                    region_ids=validated_ids,
-                    role=normalized_role,
-                    display_number=item.get("display_number"),
-                    display_label=item.get("display_label"),
-                    reasoning=str(item.get("reasoning", "")),
-                    confidence=float(item.get("confidence", 0.5)),
-                ))
+        # STOP + structures: evaluate actual coverage quality
+        if finish_reason in ("STOP", "stop", "", "N/A"):
+            total_ocr = len(ocr_blocks)
+            n_structures = len(structures)
 
-            # Parse relationships — validate all referenced IDs
-            relationships: List[VLMRelationshipItem] = []
-            for rel in data.get("relationships", []):
-                src_ids = [rid for rid in rel.get("source_ids", []) if rid in valid_ids]
-                tgt_ids = [rid for rid in rel.get("target_ids", []) if rid in valid_ids]
-                if not src_ids or not tgt_ids:
-                    continue
+            # Check 1: Structure count relative to OCR block count
+            # If VLM only identified 1-2 structures on a page with 30+ OCR blocks,
+            # that is suspicious. A reasonable threshold: at least 10% coverage or
+            # at least 3 structures for a substantial page.
+            if total_ocr > 15 and n_structures < 2:
+                print(
+                    f"[VLM] SemanticCoverage: STOP but only {n_structures} structure(s) "
+                    f"for {total_ocr} OCR blocks → AMBIGUOUS"
+                )
+                return "AMBIGUOUS"
 
-                valid_rel_types = {
-                    "follows", "contains", "belongs_to", "continuation_of",
-                    "option_of", "subquestion_of", "section_member",
-                    "associated_visual",
-                }
-                rel_type = rel.get("type", rel.get("relationship_type", "belongs_to"))
-                if rel_type not in valid_rel_types:
-                    rel_type = "belongs_to"
+            # Check 2: Count unique OCR block IDs referenced by VLM structures
+            referenced_ids: set = set()
+            for s in structures:
+                for rid in getattr(s, "region_ids", []):
+                    referenced_ids.add(rid)
+                for rid in getattr(s, "grounded_region_ids", []):
+                    referenced_ids.add(rid)
 
-                relationships.append(VLMRelationshipItem(
-                    source_ids=src_ids,
-                    target_ids=tgt_ids,
-                    relationship_type=rel_type,
-                    confidence=float(rel.get("confidence", 0.5)),
-                ))
+            if total_ocr > 0:
+                coverage_ratio = len(referenced_ids) / total_ocr
+                # A ratio below 10% on a page with >10 blocks suggests sparse VLM scan
+                if total_ocr > 10 and coverage_ratio < 0.08 and n_structures < max(3, total_ocr // 10):
+                    print(
+                        f"[VLM] SemanticCoverage: STOP but coverage_ratio={coverage_ratio:.2f} "
+                        f"({len(referenced_ids)}/{total_ocr} blocks referenced) → AMBIGUOUS"
+                    )
+                    return "AMBIGUOUS"
 
-            return VLMPageUnderstanding(
-                page_number=page_number,
-                page_purpose=page_purpose,
-                document_purpose=document_purpose,
-                structures=structures,
-                relationships=relationships,
-                raw_response=response_text[:2000],
-                vlm_model=self.model_name,
-                image_sent=page_b64_sent,
-                ocr_blocks_sent=len(ocr_blocks),
-            )
+            # Check 3: Validate that structures have at least some valid bboxes or region_ids
+            valid_structures = [
+                s for s in structures
+                if (getattr(s, "region_ids", []) or getattr(s, "grounded_region_ids", []) or getattr(s, "bbox", None))
+            ]
+            if len(valid_structures) == 0:
+                return "AMBIGUOUS"
 
-        except Exception as e:
-            print(f"[VLM] Page {page_number}: Parse error: {e}")
-            return VLMPageUnderstanding(
-                page_number=page_number,
-                raw_response=response_text[:500],
-                image_sent=page_b64_sent,
-                ocr_blocks_sent=len(ocr_blocks),
-                vlm_model=self.model_name,
-            )
+            # All checks passed: STOP + reasonable coverage
+            return "COMPLETE"
+
+        # Other finish reasons (SAFETY, UNKNOWN, etc.) → treat as ambiguous
+        return "AMBIGUOUS"
 
     # ================================================================
     # LEGACY — Region Verification (backward compatibility)

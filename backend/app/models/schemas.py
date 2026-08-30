@@ -446,6 +446,16 @@ class StructuredQuestionResult(BaseModel):
     escalation_reason: Optional[str] = None
     review_status: ReviewStatus = "NOT_REQUIRED"
     teacher_review: Optional[TeacherReview] = None
+    # VLM-extracted MCQ options preserved end-to-end from document understanding
+    options: List[str] = []
+    # Fix 5: Full structured semantic data preserved through API
+    question_type: str = "UNKNOWN"  # MCQ, SHORT_ANSWER, LONG_ANSWER, SUBQUESTION, etc.
+    parent_question_id: Optional[str] = None
+    page_number: int = 0
+    semantic_state: str = "UNKNOWN"  # CONFIDENT, PARTIAL, AMBIGUOUS, UNKNOWN
+    source_region_ids: List[str] = []  # Provenance: region IDs from document graph
+    extraction_confidence: float = 1.0
+    extracted_options: List[Dict[str, Any]] = []  # Structured options with label/text/confidence
 
 
 class StructuredAssessmentResult(BaseModel):
@@ -866,6 +876,7 @@ class ExtractionAudit(BaseModel):
     section_count: int = 0
     multi_region_question_count: int = 0
     multi_page_question_count: int = 0
+    duplicate_rejected: int = 0  # Fix 2: tracks document-scoped duplicate QUESTION nodes
     conflicts: List[str] = []
     rejection_reasons: List[RejectionRecord] = []
     invariant_violations: List[str] = []
@@ -922,6 +933,7 @@ class VLMPageUnderstanding(BaseModel):
     vlm_provider: str = "N/A"
     vlm_result: str = "NOT_ATTEMPTED"
     finish_reason: str = "N/A"
+    semantic_completeness: str = "UNKNOWN"  # COMPLETE | PARTIAL | UNKNOWN
     retry_count: int = 0
     fallback_provider: str = "N/A"
     structures_produced: int = 0

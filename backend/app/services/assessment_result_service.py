@@ -99,6 +99,19 @@ def build_structured_assessment_result(
             
         rev_status: ReviewStatus = "PENDING_REVIEW" if needs_rev else "NOT_REQUIRED"
         
+        # Fix 5: Build structured options from extracted_options if available
+        structured_opts: list = []
+        if hasattr(q_res, "extracted_options") and q_res.extracted_options:
+            for eo in q_res.extracted_options:
+                structured_opts.append({
+                    "option_id": getattr(eo, "option_id", ""),
+                    "label": getattr(eo, "label", ""),
+                    "text": getattr(eo, "text", ""),
+                    "full_text": getattr(eo, "text", ""),
+                    "source_region_ids": getattr(eo, "source_region_ids", []),
+                    "confidence": getattr(eo, "extraction_confidence", 1.0),
+                })
+        
         # Build Local Evidence Feedback
         struct_q_pre = StructuredQuestionResult(
             question_id=q_res.id,
@@ -122,6 +135,16 @@ def build_structured_assessment_result(
             grading_provenance=eval_method,
             escalation_reason=g_details.escalation_reason if g_details else None,
             review_status=rev_status,
+            # Preserve VLM-extracted MCQ options end-to-end
+            options=q_res.options if q_res.options else [],
+            # Fix 5: Full semantic structure preserved through API
+            question_type=getattr(q_res, "question_type", "UNKNOWN") or "UNKNOWN",
+            parent_question_id=getattr(q_res, "parent_question_id", None),
+            page_number=getattr(q_res, "page", 0),
+            semantic_state=getattr(q_res, "verification_state", "UNKNOWN") or "UNKNOWN",
+            source_region_ids=getattr(q_res, "source_region_ids", []) or [],
+            extraction_confidence=getattr(q_res, "extraction_confidence", 1.0),
+            extracted_options=structured_opts,
         )
         
         fb_dict = generate_question_evidence_feedback(struct_q_pre)
