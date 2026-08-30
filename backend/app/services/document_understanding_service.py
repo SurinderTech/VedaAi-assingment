@@ -403,14 +403,11 @@ class DocumentUnderstandingService:
         region_map = {r.region_id: r for r in all_regions}
 
         for understanding in vlm_understandings:
-            if not understanding.structures:
-                continue
-
             page_num_u = understanding.page_number
             page_regions = [r for r in all_regions if r.page == page_num_u]
             vlm_assigned_ids: Set[str] = set()
 
-            for struct in understanding.structures:
+            for struct in (understanding.structures or []):
                 if not struct.region_ids and not struct.bbox:
                     continue
 
@@ -588,7 +585,7 @@ class DocumentUnderstandingService:
             if is_complete:
                 # When VLM page observation is COMPLETE, VLM structural roles are authoritative.
                 # Any OCR region on this page not assigned to a VLM structure must NOT independently
-                # remain QUESTION, OPTION, or SUBQUESTION promoted by deterministic regex heuristics.
+                # remain QUESTION, OPTION, or SUBQUESTION from deterministic regex heuristics.
                 demoted_count = 0
                 for r in page_regions:
                     if r.region_id not in vlm_assigned_ids:
@@ -602,45 +599,41 @@ class DocumentUnderstandingService:
                     print(f"[DocUnderstanding] Page {page_num_u}: VLM COMPLETE — demoted {demoted_count} ungrounded OCR fragment(s) to UNKNOWN evidence.")
 
             elif is_ambiguous:
-                # STOP but sparse coverage: VLM output exists but may be incomplete.
-                # Do NOT fully demote — instead mark ungrounded regions as UNCERTAIN.
-                # This prevents ghost questions while preserving legitimate ungrounded content.
+                # AMBIGUOUS: VLM output exists but has sparse coverage (<8% of blocks).
+                # Mark ungrounded deterministic roles as UNCERTAIN so they are not treated
+                # as authoritative, but preserve them as candidate evidence without arbitrary length cuts.
                 uncertain_count = 0
                 for r in page_regions:
                     if r.region_id not in vlm_assigned_ids:
                         if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
-                            # Short fragments (word/phrase) are very likely noise — demote fully
-                            text_stripped = r.text.strip()
-                            if len(text_stripped) < 15:
-                                r.region_type = "UNKNOWN"
-                                r.confidence = min(r.confidence, 0.35)
-                                r.verification_state = "UNVERIFIED"
-                            else:
-                                # Longer fragments could be legitimate — mark uncertain
-                                r.verification_state = "UNCERTAIN"
-                                r.confidence = min(r.confidence, 0.55)
+                            r.verification_state = "UNCERTAIN"
+                            r.uncertainty = max(r.uncertainty, 0.50)
+                            r.confidence = min(r.confidence, 0.55)
                             uncertain_count += 1
                 if uncertain_count > 0:
-                    print(f"[DocUnderstanding] Page {page_num_u}: VLM AMBIGUOUS — {uncertain_count} ungrounded OCR fragment(s) marked UNCERTAIN.")
+                    print(f"[DocUnderstanding] Page {page_num_u}: VLM AMBIGUOUS — {uncertain_count} ungrounded OCR region(s) marked UNCERTAIN.")
 
             elif is_partial:
-                # When VLM page observation is PARTIAL (MAX_TOKENS), mark ungrounded regions as UNCERTAIN
-                # and prevent single-word / short fragments from spawning standalone QUESTION nodes.
+                # PARTIAL: VLM response hit MAX_TOKENS / truncated before completion.
+                # Mark ungrounded deterministic regions as UNCERTAIN.
+                uncertain_count = 0
                 for r in page_regions:
                     if r.region_id not in vlm_assigned_ids:
-                        r.verification_state = "UNCERTAIN"
-                        text_stripped = r.text.strip()
-                        if len(text_stripped) < 25 and not re.search(r"^\s*(?:Q\d+|\d+[\.\)])", text_stripped, re.IGNORECASE):
-                            if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
-                                r.region_type = "UNKNOWN"
-                                r.confidence = min(r.confidence, 0.40)
+                        if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
+                            r.verification_state = "UNCERTAIN"
+                            r.uncertainty = max(r.uncertainty, 0.50)
+                            r.confidence = min(r.confidence, 0.55)
+                            uncertain_count += 1
+                if uncertain_count > 0:
+                    print(f"[DocUnderstanding] Page {page_num_u}: VLM PARTIAL — {uncertain_count} ungrounded OCR region(s) marked UNCERTAIN.")
 
             elif is_failed:
-                # VLM produced 0 structures — treat all deterministic roles as uncertain
+                # FAILED: VLM produced 0 structures — preserve deterministic roles as UNCERTAIN evidence.
                 for r in page_regions:
                     if r.region_type in ("QUESTION", "OPTION", "SUBQUESTION"):
                         r.verification_state = "UNCERTAIN"
-                        r.confidence = min(r.confidence, 0.60)
+                        r.uncertainty = max(r.uncertainty, 0.50)
+                        r.confidence = min(r.confidence, 0.50)
                 print(f"[DocUnderstanding] Page {page_num_u}: VLM FAILED — all deterministic roles marked UNCERTAIN.")
 
             # Option linking: Ensure grounded OPTION regions link to nearest visual QUESTION
@@ -875,7 +868,12 @@ class DocumentUnderstandingService:
         q_num_match = re.search(
             r"^(?:Q(?:uestion)?[\s\.\\:]*)?\d+[\.\)\:\s]+", text, re.IGNORECASE
         )
-        subq_match = re.search(r"^\(?([a-z]|[ivxlcdm]+)\)[\.\:\s]+", text, re.IGNORECASE)
+        subq_match = re.search(
+            r"^\s*[\(\[]\s*(?:[ivxlcdm]{1,5}|[a-z]{1,2})\s*[\)\]][\.\:\s]+", text
+        )
+        subq_roman_match = re.search(
+            r"^\s*[\(\[]\s*[ivxlcdm]{1,5}\s*[\)\]][\.\:\s]+", text, re.IGNORECASE
+        )
         interrogative_match = re.search(
             r"\b(what|which|why|how|explain|describe|calculate|evaluate|find|prove|derive|compare|define|list|state|discuss|show|write|determine|solve|select|choose|identify|mark|indicate)\b",
             text, re.IGNORECASE,
@@ -887,13 +885,16 @@ class DocumentUnderstandingService:
                 description=f"Matched primary question numbering pattern '{q_num_match.group(0).strip()}'",
                 weight=0.4, score=0.9,
             ))
-        if subq_match and not q_num_match:
+        if (subq_match or subq_roman_match) and not q_num_match:
+            matched_str = (subq_match or subq_roman_match).group(0).strip()
             parser_ev.append(DocumentEvidence(
                 signal_type="numbering_pattern",
-                description=f"Matched subquestion numbering pattern '{subq_match.group(0).strip()}'",
+                description=f"Matched subquestion numbering pattern '{matched_str}'",
                 weight=0.4, score=0.85,
             ))
         if interrogative_match:
+            # FIX #1: Interrogative vocabulary is recorded as WEAK supporting evidence only.
+            # It must NEVER promote an isolated OCR fragment to a QUESTION node by itself.
             parser_ev.append(DocumentEvidence(
                 signal_type="question_interrogative",
                 description=f"Contains question keyword '{interrogative_match.group(1)}'",
@@ -901,10 +902,10 @@ class DocumentUnderstandingService:
             ))
 
         opt_match = re.search(
-            r"^\s*[\(\[]?[A-Da-d1-9i-zIVXLCDM]+[\)\]\.\:](?:\s+|$)|^(?:Option|Choice)\s+[\(]?[A-Za-z0-9ivxlcdm]+\)?[\.\:\s]*",
+            r"^\s*(?:[\(\[]\s*[A-E1-4]\s*[\)\]]|[A-Ea-e1-4]\s*[\.\:])(?:\s+|$)|^(?:Option|Choice)\s+[\(]?[A-Za-z0-9ivxlcdm]+\)?[\.\:\s]*",
             text, re.IGNORECASE,
         )
-        if opt_match and not interrogative_match:
+        if opt_match and not (subq_roman_match or subq_match):
             parser_ev.append(DocumentEvidence(
                 signal_type="option_formatting",
                 description=f"Matched option pattern '{opt_match.group(0).strip()}'",
@@ -934,20 +935,24 @@ class DocumentUnderstandingService:
                 weight=0.5, score=0.95,
             ))
 
-        if inst_match and not interrogative_match:
+        # Structural priority resolution:
+        # Strong structural evidence (numbers, option prefixes, section headers, instructions)
+        # assigns a deterministic hypothesis.
+        # Interrogative keywords boost confidence when structural numbering exists,
+        # but NEVER independently promote unnumbered/fragment text to QUESTION.
+        if inst_match:
             parser_type = "INSTRUCTION"; parser_conf = 0.90
-        elif sec_match and not interrogative_match:
+        elif sec_match:
             parser_type = "SECTION_HEADER"; parser_conf = 0.95
         elif q_num_match and interrogative_match:
             parser_type = "QUESTION"; parser_conf = 0.92
-        elif opt_match and not interrogative_match:
-            parser_type = "OPTION"; parser_conf = 0.88
         elif q_num_match:
             parser_type = "QUESTION"; parser_conf = 0.80
-        elif subq_match:
+        elif subq_roman_match or subq_match:
             parser_type = "SUBQUESTION"; parser_conf = 0.82
-        elif interrogative_match:
-            parser_type = "QUESTION"; parser_conf = 0.70
+        elif opt_match:
+            parser_type = "OPTION"; parser_conf = 0.88
+        # NOTE: interrogative_match without structural numbering remains UNKNOWN.
 
         if parser_type != "UNKNOWN":
             hypotheses.append(StructureHypothesis(

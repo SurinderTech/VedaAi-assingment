@@ -19,7 +19,7 @@ from app.services.intelligent_question_extraction_service import IntelligentQues
 
 def main():
     # Use actual test PDF
-    pdf_path = Path("/Users/surin/VedaAi-assingment/backend/scratch/test_corpus/multi_page_paper.pdf")
+    pdf_path = Path(__file__).parent / "test_corpus" / "multi_page_paper.pdf"
     
     if not pdf_path.exists():
         print(f"✗ PDF not found: {pdf_path}")
