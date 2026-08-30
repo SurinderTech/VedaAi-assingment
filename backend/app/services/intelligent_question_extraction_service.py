@@ -383,10 +383,10 @@ class IntelligentQuestionExtractionService:
                         all_source_ids.append(cont_id)
                         all_source_regions.append(Region(page=cont_node.page, bbox=cont_node.bbox))
 
-            # Determine question type
+            # Determine initial question type — deferred to after option attachment (FIX 3).
+            # Setting SHORT_ANSWER as default; MCQ is upgraded by _attach_options;
+            # LONG_ANSWER is set post-attachment only if no options found and text is very long.
             q_type = "SHORT_ANSWER"
-            if len(full_text) > 120 or "explain" in full_text.lower() or "discuss" in full_text.lower():
-                q_type = "LONG_ANSWER"
 
             q_obj = Question(
                 id=q_id,
@@ -419,6 +419,11 @@ class IntelligentQuestionExtractionService:
             )
             if option_count > 0:
                 q_obj.question_type = "MCQ"
+            else:
+                # FIX 3: Post-classification — only upgrade to LONG_ANSWER when no options found
+                # and text is substantially long (threshold raised to avoid penalising MCQ stems).
+                if len(q_obj.text) > 200:
+                    q_obj.question_type = "LONG_ANSWER"
 
             # Find and attach SUBQUESTIONS
             self._attach_subquestions(
@@ -447,16 +452,25 @@ class IntelligentQuestionExtractionService:
                 if not (q.source_region_ids and q.source_region_ids[0] in rejected_region_ids)
             ]
 
-        # Record non-question rejections for audit
+        # Record non-question rejections for audit — preserving all semantic visual structures
+        _AUDIT_NON_QUESTION_ROLES = {
+            "HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER",
+            "TABLE", "DIAGRAM", "FIGURE", "CAPTION", "FORM_FIELD",
+            "PARAGRAPH", "ANSWER_REGION", "HANDWRITING", "SIGNATURE", "LIST",
+        }
         for node_id, node in graph.nodes.items():
-            if node.role in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER"):
-                reason_label = "administrative" if node.role in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION") else "section"
+            if node.role in _AUDIT_NON_QUESTION_ROLES:
+                reason_label = (
+                    "administrative" if node.role in ("HEADER", "FOOTER", "METADATA", "INSTRUCTION")
+                    else "section" if node.role == "SECTION_HEADER"
+                    else "visual-structure"
+                )
                 rejection_records.append(RejectionRecord(
                     region_id=node_id,
                     ocr_text=node.text[:60],
                     classification=node.role,
                     confidence=node.confidence,
-                    reason=f"Administrative {node.role.lower()} content — not a question.",
+                    reason=f"{reason_label.capitalize()} {node.role.lower()} content — not a question.",
                 ))
                 audit.rejected_count += 1
 
@@ -585,19 +599,32 @@ class IntelligentQuestionExtractionService:
           3. Spatial scan — same-row right-adjacent blocks when still label-only.
         """
         option_count = 0
+        # FIX 2: Structural-boundary guard instead of strict OPTION role check.
+        # VLM-confirmed option_of edges target option nodes whose GraphNode role may be
+        # UNKNOWN (demoted by COMPLETE pass or decomposition), so reject only nodes that
+        # are unambiguously a different semantic entity (QUESTION, SECTION_HEADER, HEADER, FOOTER).
+        _OPTION_EXCLUSION_ROLES = {"QUESTION", "SECTION_HEADER", "HEADER", "FOOTER"}
+        # Track seen normalized option bodies for text-level deduplication
+        seen_option_bodies: set = set()
 
         for child_id, rel_type, conf in children_of.get(question_node_id, []):
             if rel_type != "option_of":
                 continue
 
             child_node = graph_nodes.get(child_id)
-            if not child_node or child_node.role != "OPTION":
+            if not child_node or child_node.role in _OPTION_EXCLUSION_ROLES:
                 continue
 
             region = region_map.get(child_id)
 
-            # Layer 1: head text (may already contain merged body from doc_understanding_service)
-            head_text = child_node.text.strip()
+            # FIX 2 refinement: If the node role is UNKNOWN and it is already a consumed
+            # constituent of another semantic entity (parent_region_id is set by the grounding
+            # pass), skip it — its text has already been merged into the parent entity.
+            if child_node.role == "UNKNOWN" and region and getattr(region, "parent_region_id", None):
+                continue
+
+            # Layer 1: head text (prefer grounded region text from doc_understanding_service)
+            head_text = (region.text if region and region.text.strip() else child_node.text).strip()
 
             # Layer 2: collect continuation children from graph
             continuation_parts: list = []
@@ -623,20 +650,20 @@ class IntelligentQuestionExtractionService:
                 label_y = child_node.bbox.y
                 label_x_right = child_node.bbox.x + child_node.bbox.width
                 label_height = max(child_node.bbox.height, 12.0)
-                # Same-row blocks that are to the right of this label block
+                # Same-row blocks that are immediately to the right within the same column
                 row_candidates = sorted(
                     [
                         r for r in page_regs
                         if r.region_id != child_id
-                        and abs(r.bbox.y - label_y) <= label_height * 1.5
-                        and r.bbox.x >= label_x_right - 5
+                        and abs(r.bbox.y - label_y) <= label_height * 1.2
+                        and label_x_right - 5 <= r.bbox.x <= label_x_right + 300.0
                         and r.region_type not in ("QUESTION", "OPTION", "SECTION_HEADER", "HEADER", "FOOTER")
                         and r.text.strip()
                     ],
                     key=lambda r: r.bbox.x,
                 )
                 if row_candidates:
-                    spatial_body = " ".join(r.text.strip() for r in row_candidates[:3])
+                    spatial_body = " ".join(r.text.strip() for r in row_candidates[:2])
                     opt_text = f"{opt_text} {spatial_body}".strip()
                     print(
                         f"[IntelligentExtraction] Spatial fallback: option '{child_id}' label-only; "
@@ -651,6 +678,14 @@ class IntelligentQuestionExtractionService:
             # Last resort: if text_val still empty, use cont_body
             if not text_val and cont_body:
                 text_val = cont_body
+
+            # Text-level deduplication: skip if the same option body already added
+            # (can occur when decomposition crops produce the same option structure twice)
+            _norm_body = text_val.lower().strip()
+            if _norm_body and _norm_body in seen_option_bodies:
+                continue
+            if _norm_body:
+                seen_option_bodies.add(_norm_body)
 
             opt_id = f"opt_{question.id}_{label}_{uuid.uuid4().hex[:4]}"
             full_opt_text = f"{label}. {text_val}" if text_val else opt_text

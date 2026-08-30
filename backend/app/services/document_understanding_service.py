@@ -340,15 +340,23 @@ class DocumentUnderstandingService:
             if reg.page != page_number:
                 continue
             overlap = self._bbox_overlap_area(structure.bbox, reg.bbox)
-            if overlap <= 0:
+            reg_area = self._bbox_area(reg.bbox)
+
+            center_x = reg.bbox.x + reg.bbox.width / 2.0
+            center_y = reg.bbox.y + reg.bbox.height / 2.0
+            in_expanded_bbox = (
+                structure.bbox.x - 15.0 <= center_x <= structure.bbox.x + structure.bbox.width + 15.0 and
+                structure.bbox.y - 15.0 <= center_y <= structure.bbox.y + structure.bbox.height + 15.0
+            )
+
+            if overlap <= 0 and not in_expanded_bbox:
                 continue
 
-            reg_area = self._bbox_area(reg.bbox)
             fully_contained = (
-                reg.bbox.x >= structure.bbox.x - 2.0 and
-                reg.bbox.y >= structure.bbox.y - 2.0 and
-                reg.bbox.x + reg.bbox.width <= structure.bbox.x + structure.bbox.width + 2.0 and
-                reg.bbox.y + reg.bbox.height <= structure.bbox.y + structure.bbox.height + 2.0
+                reg.bbox.x >= structure.bbox.x - 5.0 and
+                reg.bbox.y >= structure.bbox.y - 5.0 and
+                reg.bbox.x + reg.bbox.width <= structure.bbox.x + structure.bbox.width + 5.0 and
+                reg.bbox.y + reg.bbox.height <= structure.bbox.height + structure.bbox.y + 5.0
             )
             overlap_fraction = overlap / max(visual_area, 1.0)
             reg_fraction = overlap / max(reg_area, 1.0)
@@ -362,6 +370,8 @@ class DocumentUnderstandingService:
             score = 0.0
             if fully_contained:
                 score += 0.70
+            elif in_expanded_bbox:
+                score += 0.50
             score += min(0.50, overlap_fraction * 2.25)
             score += min(0.40, reg_fraction * 1.4)
             score += min(0.35, y_alignment * 1.25)
@@ -407,14 +417,40 @@ class DocumentUnderstandingService:
             page_regions = [r for r in all_regions if r.page == page_num_u]
             vlm_assigned_ids: Set[str] = set()
 
+            # FIX 1: Pre-collect every VLM structure's designated head region ID.
+            # This prevents a structure's cont_ids from absorbing another structure's head
+            # (which would make that other structure ungroundable and disappear from the graph).
+            all_vlm_head_ids: Set[str] = set()
+            for _s in (understanding.structures or []):
+                if _s.region_ids:
+                    all_vlm_head_ids.add(_s.region_ids[0])
+
             for struct in (understanding.structures or []):
                 if not struct.region_ids and not struct.bbox:
                     continue
 
-                if struct.region_ids:
+                head_id = None
+                cont_ids = []
+                grounded_ids = []
+                grounding_status = "UNGROUNDED"
+                grounded_text = ""
+
+                # Check if explicit region_ids are valid and unassigned
+                if struct.region_ids and struct.region_ids[0] not in vlm_assigned_ids:
                     head_id = struct.region_ids[0]
-                    cont_ids = struct.region_ids[1:]
-                    grounded_ids = list(struct.region_ids)
+                    # Filter cont_ids:
+                    #   (a) not already assigned to another structure
+                    #   (b) not another structure's head ID (FIX 1 — protects distinct entities)
+                    #   (c) spatially proximate to this structure's head
+                    max_y_span = max(struct.bbox.height, 150.0) if struct.bbox else 200.0
+                    head_y = region_map[head_id].bbox.y if head_id in region_map else (struct.bbox.y if struct.bbox else 0.0)
+                    cont_ids = [
+                        rid for rid in struct.region_ids[1:]
+                        if rid not in vlm_assigned_ids
+                        and rid not in all_vlm_head_ids  # FIX 1: never absorb another entity's head
+                        and (rid not in region_map or abs(region_map[rid].bbox.y - head_y) <= max_y_span)
+                    ]
+                    grounded_ids = [head_id] + cont_ids
                     grounding_status = "GROUNDED"
                     grounded_text = " ".join(
                         region_map[rid].text.strip()
@@ -424,16 +460,14 @@ class DocumentUnderstandingService:
                     struct.grounded_region_ids = grounded_ids
                     struct.grounding_status = grounding_status
                     struct.grounded_text = grounded_text
-                    # FIX 9: Update head region text with merged grounded_text when
-                    # VLM supplies explicit multi-block region_ids (e.g. OPTION: ["A.", "Ethane"])
-                    # Without this the head node only carries the label-block text ("A.")
-                    # even after the OPTION merge in document_understanding_service.
                     if cont_ids and grounded_text and head_id in region_map:
                         region_map[head_id].text = grounded_text
-                else:
+                elif struct.bbox:
+                    # Ground to unassigned page regions
+                    unassigned_page_regions = [r for r in page_regions if r.region_id not in vlm_assigned_ids]
                     grounded_ids, grounding_status, grounded_text = self._ground_structure_to_ocr(
                         structure=struct,
-                        page_regions=page_regions,
+                        page_regions=unassigned_page_regions,
                         page_number=page_num_u,
                     )
                     struct.grounded_region_ids = grounded_ids
@@ -443,7 +477,7 @@ class DocumentUnderstandingService:
                     if grounded_ids:
                         head_id = grounded_ids[0]
                         cont_ids = grounded_ids[1:]
-                        if head_id in region_map:
+                        if head_id in region_map and grounded_text:
                             region_map[head_id].text = grounded_text
                     else:
                         head_id = f"vlm_visual_{page_num_u}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
@@ -477,6 +511,8 @@ class DocumentUnderstandingService:
                         if struct.role != "UNKNOWN":
                             synthetic_region.region_type = struct.role
                         continue
+                else:
+                    continue
 
                 # Process head region
                 if head_id in region_map:
@@ -525,38 +561,69 @@ class DocumentUnderstandingService:
                     cont_reg = region_map[cont_id]
                     cont_reg.parent_region_id = head_id
 
-                    if struct.role == "OPTION" and head_id in region_map:
-                        # FIX: For OPTION structures, merge cont_id text INTO the head
-                        # region text directly so the option body is not lost.
-                        # e.g. head='A.' cont='Ethane' → head.text becomes 'A. Ethane'
-                        head_reg = region_map[head_id]
-                        cont_text = cont_reg.text.strip()
-                        if cont_text and cont_text not in head_reg.text:
-                            head_reg.text = f"{head_reg.text.strip()} {cont_text}".strip()
-                        # Mark cont region as UNKNOWN (absorbed into head)
-                        cont_reg.region_type = "UNKNOWN"
-                        cont_reg.verification_state = "VERIFIED"
-                    else:
-                        cont_reg.region_type = "UNKNOWN"
-                        cont_reg.verification_state = "VERIFIED"
-                        all_relationships.append(RegionRelationship(
-                            source_region_id=cont_id,
-                            target_region_id=head_id,
-                            relationship_type="continuation_of",
-                            confidence=struct.confidence,
-                            evidence=[DocumentEvidence(
-                                signal_type="visual_vlm_verification",
-                                description=f"Grounded evidence continuation of {head_id}",
-                                weight=0.9,
-                                score=struct.confidence,
-                            )],
-                        ))
+                    # Mark cont region as UNKNOWN (consumed constituent owned by head entity)
+                    cont_reg.region_type = "UNKNOWN"
+                    cont_reg.verification_state = "VERIFIED"
 
-            # Apply VLM explicit relationships
-            for rel in understanding.relationships:
-                for src_id in rel.source_ids:
+            # Apply VLM explicit relationships.
+            # RELATIONSHIP HEAD RULE: The VLM frequently lists multiple OCR block IDs in
+            # source_ids — the first is the entity head; the rest are inline OCR constituents
+            # (individual word tokens that make up the option/subquestion text).
+            # Only the HEAD ID should generate a relationship edge. The constituent IDs must
+            # have their text merged into the head's grounded text and get parent_region_id set
+            # (so the parent_region_id guard in _attach_options filters them as absorbed).
+            opt_relationships: Dict[str, Tuple[str, float, float]] = {}  # src_id -> (best_tgt_id, conf, dist)
+
+            for rel in (understanding.relationships or []):
+                if not rel.source_ids:
+                    continue
+
+                # The FIRST source_id is the authoritative relationship head.
+                rel_head_id = rel.source_ids[0]
+                rel_constituent_ids = rel.source_ids[1:]
+
+                # Merge constituent text into head and mark them as absorbed.
+                if rel_constituent_ids and rel_head_id in region_map:
+                    head_reg = region_map[rel_head_id]
+                    constituent_texts: list = []
+                    for cid in rel_constituent_ids:
+                        if cid not in region_map:
+                            continue
+                        c_reg = region_map[cid]
+                        # Only merge if not already owned by another entity
+                        if not getattr(c_reg, "parent_region_id", None):
+                            c_reg.parent_region_id = rel_head_id
+                            if c_reg.text.strip():
+                                constituent_texts.append(c_reg.text.strip())
+                    # Append constituent text to head if not already present
+                    if constituent_texts:
+                        extra = " ".join(constituent_texts)
+                        if extra not in head_reg.text:
+                            head_reg.text = (head_reg.text.strip() + " " + extra).strip()
+
+                src_id = rel_head_id
+                if src_id not in region_map:
+                    continue
+                src_reg = region_map[src_id]
+
+                if rel.relationship_type == "option_of":
+                    for tid in rel.target_ids:
+                        if tid in region_map and region_map[tid].region_type == "QUESTION":
+                            tgt_reg = region_map[tid]
+                            # FIX 4: Option's parent question must precede it vertically.
+                            # Prefer minimum absolute vertical distance (geometry-correct
+                            # for multi-column / interleaved layouts).
+                            if tgt_reg.bbox.y <= src_reg.bbox.y + 25.0:
+                                new_dist = abs(src_reg.bbox.y - tgt_reg.bbox.y)
+                                if src_id not in opt_relationships:
+                                    opt_relationships[src_id] = (tid, rel.confidence, new_dist)
+                                else:
+                                    cur_tid, cur_conf, cur_dist = opt_relationships[src_id]
+                                    if new_dist < cur_dist:
+                                        opt_relationships[src_id] = (tid, max(cur_conf, rel.confidence), new_dist)
+                else:
                     for tgt_id in rel.target_ids:
-                        if src_id in region_map and tgt_id in region_map:
+                        if tgt_id in region_map:
                             existing_key = (src_id, tgt_id, rel.relationship_type)
                             already_exists = any(
                                 (r.source_region_id, r.target_region_id, r.relationship_type) == existing_key
@@ -575,6 +642,26 @@ class DocumentUnderstandingService:
                                         score=rel.confidence,
                                     )],
                                 ))
+
+            for src_id, (tgt_id, conf, _dist) in opt_relationships.items():
+                existing_key = (src_id, tgt_id, "option_of")
+                already_exists = any(
+                    (r.source_region_id, r.target_region_id, r.relationship_type) == existing_key
+                    for r in all_relationships
+                )
+                if not already_exists:
+                    all_relationships.append(RegionRelationship(
+                        source_region_id=src_id,
+                        target_region_id=tgt_id,
+                        relationship_type="option_of",
+                        confidence=conf,
+                        evidence=[DocumentEvidence(
+                            signal_type="visual_vlm_verification",
+                            description="VLM relationship: option_of",
+                            weight=0.9,
+                            score=conf,
+                        )],
+                    ))
 
             # SEMANTIC COMPLETENESS ENFORCEMENT (Authoritative VLM Boundary)
             is_complete = (understanding.semantic_completeness == "COMPLETE")

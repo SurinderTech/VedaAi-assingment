@@ -242,13 +242,12 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                             bot_img, bot_blocks_shifted, page_number, total_pages, page_context=page_context, _depth=1, _y_offset=mid_y
                         )
 
-                        # Shift bottom structures y-coordinates back to full-page coordinates
-                        for s in bot_und.structures:
-                            if s.bbox:
-                                s.bbox = BBox(x=s.bbox.x, y=s.bbox.y + mid_y, width=s.bbox.width, height=s.bbox.height)
-
-                        combined_structures = top_und.structures + bot_und.structures
-                        combined_relationships = top_und.relationships + bot_und.relationships
+                        # BUG #2 FIX: Reconcile structures and relationships across decomposition boundary
+                        combined_structures, combined_relationships = self._reconcile_decomposed_page_understanding(
+                            top_und=top_und,
+                            bot_und=bot_und,
+                            mid_y=mid_y,
+                        )
 
                         if combined_structures:
                             both_complete = (top_und.finish_reason == "STOP" and bot_und.finish_reason == "STOP")
@@ -265,6 +264,187 @@ class MultimodalDocumentVisionProvider(DocumentVisionProvider):
                     print(f"[VLM] Page {page_number}: Visual decomposition exception: {e_decomp}")
 
         return understanding
+
+    def _reconcile_decomposed_page_understanding(
+        self,
+        top_und: VLMPageUnderstanding,
+        bot_und: VLMPageUnderstanding,
+        mid_y: float,
+    ) -> Tuple[List[VLMStructureItem], List[VLMRelationshipItem]]:
+        """
+        Reconciles visual decomposition results across crop boundaries (BUG #2 FIX).
+        1. Preserves geometry of every structure (bot structures shifted by mid_y).
+        2. Merges structures representing the same visual entity across the split line
+           using geometric continuity, bounding box proximity, and OCR evidence.
+        3. Assigns a canonical structure ID and builds an ID remapping table.
+        4. Remaps all relationships from provisional bottom-crop IDs to canonical IDs.
+        5. Deduplicates equivalent structures and relationships while eliminating self-loops.
+        """
+        # Step 1: Shift bottom structure bounding boxes to full-page coordinates
+        for s in bot_und.structures:
+            if s.bbox:
+                s.bbox = BBox(x=s.bbox.x, y=s.bbox.y + mid_y, width=s.bbox.width, height=s.bbox.height)
+
+        id_remap: Dict[str, str] = {}
+        merged_bot_indices = set()
+        # Collect region IDs belonging to child structures in bot_und (options, subquestions)
+        child_bot_rids = set()
+        for s in bot_und.structures:
+            if s.role in ("OPTION", "SUBQUESTION"):
+                child_bot_rids.update(s.region_ids)
+
+        bot_merged_to_canonical: Dict[int, str] = {}
+        canonical_top_structures = list(top_und.structures)
+
+        # Step 2: Cross-boundary entity matching
+        for i_top, s_top in enumerate(canonical_top_structures):
+            for i_bot, s_bot in enumerate(bot_und.structures):
+                if i_bot in merged_bot_indices:
+                    continue
+                if s_top.role != s_bot.role or s_top.role == "UNKNOWN":
+                    continue
+
+                # Incompatible explicit metadata guard
+                if s_top.display_number and s_bot.display_number and s_top.display_number != s_bot.display_number:
+                    continue
+                if s_top.display_label and s_bot.display_label and s_top.display_label != s_bot.display_label:
+                    continue
+
+                # Both structures MUST physically lie at the decomposition split line mid_y
+                if not (s_top.bbox and s_bot.bbox):
+                    continue
+
+                top_margin = max(s_top.bbox.height * 2.5, 80.0)
+                bot_margin = max(s_bot.bbox.height * 2.5, 80.0)
+
+                s_top_in_boundary = (s_top.bbox.y < mid_y and (s_top.bbox.y + s_top.bbox.height) >= mid_y - top_margin)
+                s_bot_in_boundary = (s_bot.bbox.y <= mid_y + bot_margin and (s_bot.bbox.y + s_bot.bbox.height) > mid_y)
+
+                if not (s_top_in_boundary and s_bot_in_boundary):
+                    continue
+
+                # Condition A: Shared OCR region IDs at boundary
+                shared_ids = set(s_top.region_ids) & set(s_bot.region_ids)
+                has_shared_ids = bool(shared_ids)
+
+                # Condition B: Geometric continuity across split line mid_y
+                gap_y = max(0.0, s_bot.bbox.y - (s_top.bbox.y + s_top.bbox.height))
+                max_allowed_gap = max(s_top.bbox.height * 2.0, s_bot.bbox.height * 2.0, 75.0)
+
+                # Horizontal proximity (within same column / page band)
+                h_distance = max(
+                    0.0,
+                    max(s_top.bbox.x, s_bot.bbox.x)
+                    - min(s_top.bbox.x + s_top.bbox.width, s_bot.bbox.x + s_bot.bbox.width)
+                )
+                max_allowed_h_dist = 600.0  # Document column boundary
+
+                has_geom_match = (gap_y <= max_allowed_gap and h_distance <= max_allowed_h_dist)
+
+                if has_shared_ids or has_geom_match:
+                    # Match found! Merge s_bot into canonical s_top
+                    merged_bot_indices.add(i_bot)
+
+                    # Merge bounding boxes
+                    if s_top.bbox and s_bot.bbox:
+                        min_x = min(s_top.bbox.x, s_bot.bbox.x)
+                        min_y = min(s_top.bbox.y, s_bot.bbox.y)
+                        max_x = max(s_top.bbox.x + s_top.bbox.width, s_bot.bbox.x + s_bot.bbox.width)
+                        max_y = max(s_top.bbox.y + s_top.bbox.height, s_bot.bbox.y + s_bot.bbox.height)
+                        s_top.bbox = BBox(x=min_x, y=min_y, width=max_x - min_x, height=max_y - min_y)
+                    elif s_bot.bbox:
+                        s_top.bbox = s_bot.bbox
+
+                    # Merge region IDs preserving order, excluding child structure IDs
+                    combined_rids = list(s_top.region_ids)
+                    for rid in s_bot.region_ids:
+                        if rid not in combined_rids and (s_top.role not in ("QUESTION", "SECTION_HEADER", "INSTRUCTION") or rid not in child_bot_rids):
+                            combined_rids.append(rid)
+                    s_top.region_ids = combined_rids
+
+                    # Canonical target ID for relationships
+                    canonical_id = s_top.region_ids[0] if s_top.region_ids else None
+                    if canonical_id:
+                        bot_merged_to_canonical[i_bot] = canonical_id
+
+                    s_top.confidence = max(s_top.confidence, s_bot.confidence)
+                    if not s_top.display_number and s_bot.display_number:
+                        s_top.display_number = s_bot.display_number
+                    if not s_top.display_label and s_bot.display_label:
+                        s_top.display_label = s_bot.display_label
+                    if not s_top.reasoning and s_bot.reasoning:
+                        s_top.reasoning = s_bot.reasoning
+
+        # Step 3: Combine structures (unmerged bot structures added)
+        unmerged_bot_structures = [
+            s for i, s in enumerate(bot_und.structures)
+            if i not in merged_bot_indices
+        ]
+        combined_structures = canonical_top_structures + unmerged_bot_structures
+
+        # Build ID remapping table protecting unmerged bottom structures
+        unmerged_bot_rids = set()
+        for s in unmerged_bot_structures:
+            unmerged_bot_rids.update(s.region_ids)
+
+        for i_bot, canonical_id in bot_merged_to_canonical.items():
+            s_bot = bot_und.structures[i_bot]
+            for bot_rid in s_bot.region_ids:
+                if bot_rid not in unmerged_bot_rids:
+                    id_remap[bot_rid] = canonical_id
+
+        # Step 4: Re-map relationships and attach orphan boundary options to boundary question
+        top_questions = [s for s in canonical_top_structures if s.role == "QUESTION" and s.bbox]
+        top_boundary_q = max(top_questions, key=lambda s: s.bbox.y) if top_questions else None
+        top_boundary_qid = top_boundary_q.region_ids[0] if (top_boundary_q and top_boundary_q.region_ids) else None
+
+        bot_questions = [s for s in unmerged_bot_structures if s.role == "QUESTION" and s.bbox]
+        first_bot_q = min(bot_questions, key=lambda s: s.bbox.y) if bot_questions else None
+        first_bot_qy = first_bot_q.bbox.y if first_bot_q else (mid_y + 9999.0)
+
+        # For any OPTION/SUBQUESTION in unmerged_bot_structures located above first_bot_qy:
+        # connect to top_boundary_qid if it does not already have an option_of relationship
+        if top_boundary_qid:
+            for s in unmerged_bot_structures:
+                if s.role in ("OPTION", "SUBQUESTION") and s.bbox and s.bbox.y < first_bot_qy and s.region_ids:
+                    s_rid = s.region_ids[0]
+                    rel_type = "option_of" if s.role == "OPTION" else "subquestion_of"
+                    bot_und.relationships.append(VLMRelationshipItem(
+                        source_ids=[s_rid],
+                        target_ids=[top_boundary_qid],
+                        relationship_type=rel_type,
+                        confidence=s.confidence,
+                    ))
+
+        combined_raw_relationships = top_und.relationships + bot_und.relationships
+        reconciled_relationships: List[VLMRelationshipItem] = []
+        seen_rel_keys = set()
+
+        for rel in combined_raw_relationships:
+            new_src_ids = [id_remap.get(sid, sid) for sid in rel.source_ids]
+            new_tgt_ids = [id_remap.get(tid, tid) for tid in rel.target_ids]
+
+            # Drop self-referencing loops created by merging
+            if set(new_src_ids) == set(new_tgt_ids):
+                continue
+
+            rel_key = (
+                tuple(sorted(new_src_ids)),
+                tuple(sorted(new_tgt_ids)),
+                rel.relationship_type,
+            )
+            if rel_key in seen_rel_keys:
+                continue
+            seen_rel_keys.add(rel_key)
+
+            reconciled_relationships.append(VLMRelationshipItem(
+                source_ids=new_src_ids,
+                target_ids=new_tgt_ids,
+                relationship_type=rel.relationship_type,
+                confidence=rel.confidence,
+            ))
+
+        return combined_structures, reconciled_relationships
 
     def _build_page_understanding_prompt(
         self,
@@ -303,33 +483,35 @@ TASK: Examine the page image (authoritative for visual structure) and the OCR te
 {context_info}
 RULES:
 1. Treat the page image as authoritative for visual layout, columns, reading order, and entity boundaries.
-2. Identify each distinct semantic unit separately: QUESTION, SUBQUESTION, OPTION, SECTION_HEADER, INSTRUCTION, TABLE, DIAGRAM, HEADER, FOOTER, METADATA, UNKNOWN.
+2. Identify each distinct semantic unit separately. Use the role vocabulary: QUESTION, SUBQUESTION, OPTION, SECTION_HEADER, INSTRUCTION, TABLE, DIAGRAM, FIGURE, CAPTION, ANSWER_REGION, HANDWRITING, FORM_FIELD, PARAGRAPH, LIST, HEADER, FOOTER, METADATA, SIGNATURE, UNKNOWN.
 3. Keep questions and their options/subquestions as SEPARATE structures. Connect them using relationships (e.g. "option_of", "subquestion_of").
-4. If an entity maps to OCR blocks, include their "region_ids". If it is visual or spans multiple blocks, include its visual "bbox": [x1, y1, x2, y2].
-5. Do NOT repeat long text in the output; the OCR evidence provides the exact text.
+4. If an entity maps to OCR blocks, include their "ids". If it is visual or spans multiple blocks, include its visual "bbox": [x1, y1, x2, y2].
+5. For multi-column documents: respect column boundaries when assigning options to questions. Options always belong to the most recently seen question IN THE SAME COLUMN.
+6. For answer sheets: use ANSWER_REGION for written answer areas, HANDWRITING for handwritten text, SIGNATURE for signatures.
+7. For figures/diagrams: use FIGURE or DIAGRAM and link to their caption with a "caption_of" relationship.
+8. Do NOT repeat long text in the output; the OCR evidence provides the exact text.
+9. An OPTION region belongs to exactly ONE QUESTION. Never assign the same option to multiple questions.
 
 OCR Evidence (page {page_number}):
 {ocr_evidence}
 
 Return strictly valid JSON in this compact format:
 {{
-  "page_purpose": "QUESTION_PAGE" | "COVER" | "INSTRUCTIONS" | "CONTINUATION" | "MIXED" | "ADMINISTRATIVE",
-  "document_purpose": "EXAMINATION_PAPER" | "ASSIGNMENT" | "INSTRUCTIONS" | "REPORT" | "UNKNOWN",
+  "page_purpose": "QUESTION_PAGE" | "ANSWER_SHEET" | "COVER" | "INSTRUCTIONS" | "CONTINUATION" | "MIXED" | "ADMINISTRATIVE",
+  "document_purpose": "EXAMINATION_PAPER" | "ANSWER_SHEET" | "ASSIGNMENT" | "FORM" | "INVOICE" | "REPORT" | "INSTRUCTIONS" | "UNKNOWN",
   "structures": [
     {{
-      "role": "QUESTION" | "OPTION" | "SUBQUESTION" | "SECTION_HEADER" | "INSTRUCTION" | "METADATA" | "HEADER" | "FOOTER" | "TABLE" | "DIAGRAM" | "UNKNOWN",
-      "region_ids": ["id1"],
+      "role": "QUESTION" | "OPTION" | "SUBQUESTION" | "SECTION_HEADER" | "INSTRUCTION" | "METADATA" | "HEADER" | "FOOTER" | "TABLE" | "DIAGRAM" | "FIGURE" | "CAPTION" | "ANSWER_REGION" | "HANDWRITING" | "FORM_FIELD" | "PARAGRAPH" | "LIST" | "SIGNATURE" | "UNKNOWN",
+      "ids": ["id1"],
       "bbox": [x1, y1, x2, y2],
-      "display_number": "1",
-      "confidence": 0.95
+      "conf": 0.95
     }}
   ],
   "relationships": [
     {{
-      "source_ids": ["id_option"],
-      "target_ids": ["id_question"],
-      "type": "option_of" | "subquestion_of" | "section_member" | "continuation_of" | "belongs_to",
-      "confidence": 0.95
+      "src": ["id_option"],
+      "tgt": ["id_question"],
+      "type": "option_of" | "subquestion_of" | "section_member" | "continuation_of" | "belongs_to" | "caption_of" | "answer_to"
     }}
   ]
 }}"""
@@ -513,8 +695,14 @@ Return strictly valid JSON in this compact format:
                     confidence=float(item.get("confidence", item.get("conf", 0.90))),
                 ))
 
+            # Build structure lookup by region_id
+            struct_by_rid = {}
+            for s in structures:
+                for rid in s.region_ids:
+                    struct_by_rid[rid] = s
+
             # Parse relationships — validate all referenced IDs (accept compact src/tgt keys)
-            relationships: List[VLMRelationshipItem] = []
+            raw_relationships: List[VLMRelationshipItem] = []
             for rel in data.get("relationships", []):
                 src_raw = rel.get("source_ids", rel.get("src", []))
                 tgt_raw = rel.get("target_ids", rel.get("tgt", []))
@@ -537,12 +725,53 @@ Return strictly valid JSON in this compact format:
                 if rel_type not in valid_rel_types:
                     rel_type = "belongs_to"
 
-                relationships.append(VLMRelationshipItem(
-                    source_ids=src_ids,
-                    target_ids=tgt_ids,
-                    relationship_type=rel_type,
-                    confidence=float(rel.get("confidence", rel.get("conf", 0.90))),
-                ))
+                # Spatial validity: for option_of and subquestion_of, target question MUST exist and precede source option vertically
+                if rel_type in ("option_of", "subquestion_of"):
+                    src_struct = struct_by_rid.get(src_ids[0])
+                    valid_tgts = []
+                    for tid in tgt_ids:
+                        tgt_struct = struct_by_rid.get(tid)
+                        if tgt_struct and tgt_struct.role == "QUESTION":
+                            if src_struct and src_struct.bbox and tgt_struct.bbox:
+                                if tgt_struct.bbox.y <= src_struct.bbox.y + 25.0:
+                                    valid_tgts.append(tid)
+                            else:
+                                valid_tgts.append(tid)
+                    tgt_ids = valid_tgts
+                    if not tgt_ids:
+                        continue
+
+                for tgt_id in tgt_ids:
+                    raw_relationships.append(VLMRelationshipItem(
+                        source_ids=src_ids,
+                        target_ids=[tgt_id],
+                        relationship_type=rel_type,
+                        confidence=float(rel.get("confidence", rel.get("conf", 0.90))),
+                    ))
+
+            # Deduplicate and pick single best target for option_of / subquestion_of
+            relationships: List[VLMRelationshipItem] = []
+            best_opt_targets: Dict[Tuple[str, str], VLMRelationshipItem] = {}
+
+            for rel in raw_relationships:
+                src_id = rel.source_ids[0]
+                if rel.relationship_type in ("option_of", "subquestion_of"):
+                    key = (src_id, rel.relationship_type)
+                    if key not in best_opt_targets:
+                        best_opt_targets[key] = rel
+                    else:
+                        # Pick the target question with closest preceding vertical position
+                        cur_tgt = best_opt_targets[key].target_ids[0]
+                        new_tgt = rel.target_ids[0]
+                        cur_s = struct_by_rid.get(cur_tgt)
+                        new_s = struct_by_rid.get(new_tgt)
+                        if cur_s and new_s and cur_s.bbox and new_s.bbox:
+                            if new_s.bbox.y > cur_s.bbox.y:
+                                best_opt_targets[key] = rel
+                else:
+                    relationships.append(rel)
+
+            relationships.extend(best_opt_targets.values())
 
             struct_source = meta.get("structure_source", "VLM_SUCCESS") if structures else "DETERMINISTIC_FALLBACK"
             completeness = self._compute_semantic_completeness(
