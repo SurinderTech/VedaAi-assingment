@@ -4,12 +4,15 @@ Storage with disk persistence so server reloads do not wipe assessment states.
 from __future__ import annotations
 import json
 import os
-import tempfile
 import hashlib
 from typing import Dict, Optional, List, Tuple
 from app.models.schemas import AssessmentResult, AssessmentStatus
 
-UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "vedaai_uploads")
+UPLOAD_DIR = os.environ.get(
+    "VEDAAI_UPLOAD_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "vedaai_uploads")
+)
+UPLOAD_DIR = os.path.abspath(UPLOAD_DIR)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 STORE_FILE = os.path.join(UPLOAD_DIR, "store_metadata.json")
 SNAPSHOT_DIR = os.path.join(UPLOAD_DIR, "snapshots")
