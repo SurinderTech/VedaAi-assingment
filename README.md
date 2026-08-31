@@ -158,7 +158,7 @@ The system is specifically designed to avoid treating every piece of extracted t
 
 <p align="center">
       <h1>Results<h1>
-  <img src="" width="48%">
+  <img src="Screenshot (717).png" width="48%">
   <img src="" width="48%">
 </p>
 
