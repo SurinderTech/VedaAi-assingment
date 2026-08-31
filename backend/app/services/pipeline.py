@@ -22,7 +22,7 @@ async def run_pipeline(assessment_id: str) -> None:
     try:
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_questions",
-            message="Reading question paper", progress=0.15))
+            message="📄 Reading question paper (OCR + AI vision)...", progress=0.10))
         qp_res = await asyncio.to_thread(
             process_document, files["question_paper"], files["question_paper_ext"], False
         )
@@ -32,6 +32,10 @@ async def run_pipeline(assessment_id: str) -> None:
         qp_images = qp_res[3] if len(qp_res) > 3 else None
         page_sizes_dict = {i + 1: [float(w), float(h)] for i, (w, h) in enumerate(qp_sizes)} if qp_sizes else None
 
+        store.set_status(assessment_id, AssessmentStatus(
+            assessment_id=assessment_id, state="extracting_questions",
+            message=f"🧠 AI analyzing {qp_pages} page(s) of question paper — this takes ~{qp_pages * 8}s...", progress=0.20))
+
         from app.services.document_understanding_service import DocumentUnderstandingService
         doc_understanding_res = await asyncio.to_thread(
             DocumentUnderstandingService().process_document,
@@ -40,6 +44,10 @@ async def run_pipeline(assessment_id: str) -> None:
             page_sizes_dict,
             qp_images,
         )
+
+        store.set_status(assessment_id, AssessmentStatus(
+            assessment_id=assessment_id, state="extracting_questions",
+            message="🔍 Extracting questions from document structure...", progress=0.40))
         questions = await extract_questions(qp_blocks, doc_understanding_result=doc_understanding_res, page_sizes=page_sizes_dict)
 
 

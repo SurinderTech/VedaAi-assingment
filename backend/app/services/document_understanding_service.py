@@ -143,9 +143,14 @@ class DocumentUnderstandingService:
         )
 
         if vlm_enabled and vlm_page_mode and isinstance(self.vision_provider, MultimodalDocumentVisionProvider):
-            print(f"[DocUnderstanding] VLM Page Intelligence: Processing {total_pages} page(s)")
+            MAX_VLM_PAGES = 6  # Cap: beyond 6 pages, det. analysis only (saves ~10s per skipped page)
+            pages_for_vlm = [p for p in doc_pages if p.page_number <= MAX_VLM_PAGES]
+            skipped = total_pages - len(pages_for_vlm)
+            if skipped > 0:
+                print(f"[DocUnderstanding] VLM capped at {MAX_VLM_PAGES} pages — skipping {skipped} page(s)")
+            print(f"[DocUnderstanding] VLM Page Intelligence: Processing {len(pages_for_vlm)}/{total_pages} page(s)")
 
-            for page_obj in doc_pages:
+            for page_obj in pages_for_vlm:
                 page_num = page_obj.page_number
                 page_blocks = pages_dict.get(page_num, [])
 

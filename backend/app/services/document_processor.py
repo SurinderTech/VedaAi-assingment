@@ -191,7 +191,7 @@ def _render_pdf_pages(path: str) -> List[Image.Image]:
         pdf = pdfium.PdfDocument(path)
         images = []
         for page in pdf:
-            bitmap = page.render(scale=200 / 72)
+            bitmap = page.render(scale=150 / 72)  # 150 DPI: good quality, 44% smaller than 200 DPI
             pil_image = bitmap.to_pil()
             images.append(pil_image)
         if images:
