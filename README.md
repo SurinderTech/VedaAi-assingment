@@ -135,20 +135,24 @@ flowchart TD
 ## ✨ What VedaAI Can Understand
 ## 📄 Question Paper Understanding
 
+
+
 VedaAI is designed to understand complex question-paper layouts containing:
 
+
+
 Structure	Examples
-❓ Questions	Regular questions
-📝 MCQs	Questions + multiple options
-🔹 Options	A / B / C / D
-🔢 Subquestions	11(a), 11(b), (i), (ii)
-📚 Sections	Section A, B, C...
-📌 Instructions	General examination instructions
-📊 Tables	Structured tabular information
-🖼️ Diagrams	Visual question content
-📐 Multi-column layouts	Two-column / mixed layouts
-📄 Multi-page questions	Questions spanning pages
-🧩 Mixed content	Text + figures + tables
+❓ Questions	Regular questions<br>
+📝 MCQs	Questions + multiple options<br>
+🔹 Options	A / B / C / D<br>
+🔢 Subquestions	11(a), 11(b), (i), (ii)<br>
+📚 Sections	Section A, B, C...<br>
+📌 Instructions	General examination instructions<br>
+📊 Tables	Structured tabular information<br>
+🖼️ Diagrams	Visual question content<br>
+📐 Multi-column layouts	Two-column / mixed layouts<br>
+📄 Multi-page questions	Questions spanning pages<br>
+🧩 Mixed content	Text + figures + tables<br>
 
 The system is specifically designed to avoid treating every piece of extracted text as a question.
 
