@@ -150,20 +150,12 @@ class DocumentUnderstandingService:
                 print(f"[DocUnderstanding] VLM capped at {MAX_VLM_PAGES} pages — skipping {skipped} page(s)")
             print(f"[DocUnderstanding] VLM Page Intelligence: Processing {len(pages_for_vlm)}/{total_pages} page(s)")
 
-            for page_obj in pages_for_vlm:
+            def _process_single_page_vlm(page_obj: DocumentPage) -> VLMPageUnderstanding:
                 page_num = page_obj.page_number
                 page_blocks = pages_dict.get(page_num, [])
-
-                # Get page image
-                page_img = None
-                if page_images and page_num in page_images:
-                    page_img = page_images[page_num]
-
-                # Build page context from neighboring pages
+                page_img = page_images.get(page_num) if page_images else None
                 page_context = self._build_page_context(page_num, pages_dict, total_pages)
-
-                # VLM understands this page
-                understanding = self.vision_provider.understand_page(
+                return self.vision_provider.understand_page(
                     page_image=page_img,
                     ocr_blocks=page_blocks,
                     page_number=page_num,
@@ -172,6 +164,14 @@ class DocumentUnderstandingService:
                     force_vlm=force_vlm_verification,
                 )
 
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(len(pages_for_vlm), 6)) as executor:
+                parallel_results = list(executor.map(_process_single_page_vlm, pages_for_vlm))
+
+            # Maintain correct sequential page order
+            parallel_results.sort(key=lambda u: u.page_number)
+
+            for understanding in parallel_results:
                 vlm_page_understandings.append(understanding)
                 cost.vlm_calls += 1
                 cost.pages_sent += 1 if understanding.image_sent else 0
@@ -183,7 +183,7 @@ class DocumentUnderstandingService:
                     cost.failed_calls += 1
 
                 print(
-                    f"[DocUnderstanding Diagnostic] Page: {page_num} | "
+                    f"[DocUnderstanding Diagnostic] Page: {understanding.page_number} | "
                     f"Image Present: {understanding.image_sent} | "
                     f"Image Dimensions: {understanding.image_dimensions or 'N/A'} | "
                     f"Image Bytes: {understanding.image_bytes} | "
