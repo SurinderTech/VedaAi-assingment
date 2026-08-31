@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import gc
 from app.core import store
 from app.models.schemas import (
     AssessmentResult, AssessmentStatus, QuestionResult,
@@ -43,6 +44,7 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         return
 
     try:
+        # ── STEP 1: Question Paper OCR ───────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_questions",
             message="📄 Reading question paper (OCR + AI vision)...", progress=0.10))
@@ -55,6 +57,7 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         qp_images = qp_res[3] if len(qp_res) > 3 else None
         page_sizes_dict = {i + 1: [float(w), float(h)] for i, (w, h) in enumerate(qp_sizes)} if qp_sizes else None
 
+        # ── STEP 2: VLM understanding of question paper ──────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_questions",
             message=f"🧠 AI analyzing {qp_pages} page(s) of question paper — this takes ~{qp_pages * 8}s...", progress=0.20))
@@ -68,34 +71,56 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
             qp_images,
         )
 
+        # ── STEP 3: Extract questions ────────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_questions",
             message="🔍 Extracting questions from document structure...", progress=0.40))
-        questions = await extract_questions(qp_blocks, doc_understanding_result=doc_understanding_res, page_sizes=page_sizes_dict)
+        questions = await extract_questions(
+            qp_blocks, doc_understanding_result=doc_understanding_res, page_sizes=page_sizes_dict
+        )
 
+        # ── FREE QP memory before answer-sheet OCR ───────────────────────────
+        # qp_images holds raw PIL Images for every page — can be 50-200MB on
+        # a 512 MB Render instance. Delete explicitly before the 2nd OCR call.
+        del qp_images, qp_res, doc_understanding_res
+        gc.collect()
+        print(f"[Pipeline] QP memory freed. Starting answer-sheet processing...")
 
+        # ── STEP 4: Answer Sheet OCR ─────────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_answers",
-            message="Reading handwritten answers", progress=0.45))
+            message="🖊️ Reading handwritten answer sheet...", progress=0.45))
         as_res = await asyncio.to_thread(
             process_document, files["answer_sheet"], files["answer_sheet_ext"], True
         )
         as_blocks = as_res[0]
         as_pages = as_res[1]
         as_sizes = as_res[2]
+        as_images = as_res[3] if len(as_res) > 3 else None
+
+        # ── STEP 5: Extract answers ──────────────────────────────────────────
+        store.set_status(assessment_id, AssessmentStatus(
+            assessment_id=assessment_id, state="extracting_answers",
+            message="🧠 AI reading handwritten answers...", progress=0.55))
         page_types, metadata_pages = analyze_pages(as_blocks, as_pages)
         answers = await asyncio.to_thread(extract_answers, as_blocks, metadata_pages)
 
+        # Free AS images before mapping/grading
+        del as_images, as_res
+        gc.collect()
+
+        # ── STEP 6: Map answers to questions ─────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="mapping",
-            message="Mapping answers to questions", progress=0.75))
+            message="🔗 Mapping answers to questions...", progress=0.75))
         mapped, unmatched = await map_answers(questions, answers)
 
+        # ── STEP 7: Grade all questions ──────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="grading",
-            message="Generating AI score & feedback", progress=0.90))
+            message="⭐ Generating AI score & feedback...", progress=0.90))
 
-        # Parallelize grading for all questions concurrently with asyncio.gather
+        # Parallelize grading for all questions concurrently
         gradings = await asyncio.gather(*[generate_grading(q, mapped[q.id]) for q in questions])
 
         question_results = [
@@ -124,7 +149,7 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         store.save_result(result)
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="completed",
-            message="Done", progress=1.0))
+            message="✅ Done", progress=1.0))
 
     except Exception as e:  # noqa: BLE001
         print(f"[PipelineError] Assessment {assessment_id} failed: {e}")
