@@ -20,9 +20,8 @@ async def lifespan(app: FastAPI):
         def _warmup_ocr():
             engine = _get_ocr_engine()
             if engine:
-                # Use a realistic size (matches 640px max_dim after downscale)
-                # so ONNX JIT compiles at the actual inference resolution
-                dummy = np.zeros((640, 480, 3), dtype=np.uint8)
+                # Use realistic size matching 480px max_dim (for 768x1024 input → 360x480)
+                dummy = np.zeros((480, 360, 3), dtype=np.uint8)
                 engine(dummy)
                 print("[Startup] OCR engine JIT-compiled and ready.")
 

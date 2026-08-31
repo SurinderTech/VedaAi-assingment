@@ -137,10 +137,10 @@ def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
         return []
 
     # Memory safeguard for 512MB RAM hosts (Render free tier):
-    # Cap at 640px max — reduces ONNX inference peak RAM by ~60% vs 1400px.
-    # Accuracy is not materially affected for printed/handwritten MCQ content.
+    # Cap at 480px max — reduces ONNX inference peak RAM by ~75% vs full 768x1024.
+    # Sufficient accuracy for printed MCQ text and handwritten single-letter answers.
     orig_w, orig_h = img.size
-    max_dim = 640
+    max_dim = 480
     scale = 1.0
     if max(orig_w, orig_h) > max_dim:
         scale = max_dim / float(max(orig_w, orig_h))
