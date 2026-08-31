@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
         def _warmup_ocr():
             engine = _get_ocr_engine()
             if engine:
-                # Use realistic size matching 480px max_dim (for 768x1024 input → 360x480)
-                dummy = np.zeros((480, 360, 3), dtype=np.uint8)
+                # Match max_dim=320: for 768x1024 → scales to 240x320
+                dummy = np.zeros((320, 240, 3), dtype=np.uint8)
                 engine(dummy)
                 print("[Startup] OCR engine JIT-compiled and ready.")
 
