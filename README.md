@@ -8,7 +8,7 @@
 
 **Turn hours of manual answer-sheet searching into an intelligent review workflow.**
 
-[![Live Demo](https://img.shields.io/badge/🚀_Live_Demo-VedaAI-black?style=for-the-badge)](YOUR_DEMO_URL)
+
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-181717?style=for-the-badge&logo=github)](YOUR_GITHUB_URL)
 [![Next.js](https://img.shields.io/badge/Next.js-TypeScript-black?style=for-the-badge&logo=next.js)]()
 [![FastAPI](https://img.shields.io/badge/FastAPI-Python-009688?style=for-the-badge&logo=fastapi)]()
