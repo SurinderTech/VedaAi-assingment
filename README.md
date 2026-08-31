@@ -12,7 +12,7 @@
 
 [![Next.js](https://img.shields.io/badge/Next.js-TypeScript-black?style=for-the-badge&logo=next.js)]()
 [![FastAPI](https://img.shields.io/badge/FastAPI-Python-009688?style=for-the-badge&logo=fastapi)]()
-[![AI](https://img.shields.io/badge/-Vision%20%2B%20LLM-6366F1?style=for-the-badge)]()
+[![AI](https://img.shields.io/badge/-Vision(VLM)%20%2B%20LLM-6366F1?style=for-the-badge)]()
 
 <br />
 
