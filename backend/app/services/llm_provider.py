@@ -189,17 +189,14 @@ async def _call_gemini(
 
 
 OPENROUTER_VISION_MODELS = [
-    # Free vision-capable models verified available on OpenRouter (Aug 2026)
-    "google/gemma-3-27b-it:free",
-    "google/gemma-3-12b-it:free",
-    "google/gemma-3-4b-it:free",
-    "qwen/qwen2.5-vl-3b-instruct:free",
-    "qwen/qwen2.5-vl-7b-instruct:free",
-    "meta-llama/llama-4-scout:free",
-    "meta-llama/llama-4-maverick:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "moonshotai/moonlight-16a-a3b-instruct:free",
-    "nvidia/llama-3.1-nemotron-nano-8b-v1:free",
+    # Vision-capable models (support image input) available free on OpenRouter
+    "google/gemma-3-27b-it:free",       # Gemma 3 — multimodal
+    "google/gemma-3-12b-it:free",       # Gemma 3 — multimodal
+    "google/gemma-3-4b-it:free",        # Gemma 3 — multimodal
+    "qwen/qwen2.5-vl-7b-instruct:free", # Qwen2.5-VL — vision-language
+    "qwen/qwen2.5-vl-3b-instruct:free", # Qwen2.5-VL — vision-language
+    "meta-llama/llama-4-scout:free",    # Llama 4 Scout — multimodal
+    "meta-llama/llama-4-maverick:free", # Llama 4 Maverick — multimodal
 ]
 
 
