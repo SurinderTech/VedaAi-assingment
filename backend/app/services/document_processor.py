@@ -136,9 +136,28 @@ def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
         print("[DocumentProcessor] OCR engine unavailable.")
         return []
 
-    img_np = np.array(img.convert("RGB"))
+    # Memory safeguard for 512MB RAM hosts (Render free tier):
+    # Downscale oversized images before feeding to ONNX OCR, then scale coordinates back
+    orig_w, orig_h = img.size
+    max_dim = 1400
+    scale = 1.0
+    if max(orig_w, orig_h) > max_dim:
+        scale = max_dim / float(max(orig_w, orig_h))
+        new_w = int(round(orig_w * scale))
+        new_h = int(round(orig_h * scale))
+        ocr_img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    else:
+        ocr_img = img
+
+    img_np = np.array(ocr_img.convert("RGB"))
+    inv_scale = 1.0 / scale
+
     try:
         res = engine(img_np)
+        del img_np
+        import gc
+        gc.collect()
+
         results = res[0] if isinstance(res, tuple) else res
         blocks: List[Block] = []
 
@@ -155,8 +174,8 @@ def _ocr_image(img: Image.Image, page_num: int) -> List[Block]:
                 if not text or not str(text).strip():
                     continue
 
-                xs = [pt[0] for pt in box]
-                ys = [pt[1] for pt in box]
+                xs = [pt[0] * inv_scale for pt in box]
+                ys = [pt[1] * inv_scale for pt in box]
                 x_min, y_min = min(xs), min(ys)
                 x_max, y_max = max(xs), max(ys)
 
