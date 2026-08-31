@@ -25,6 +25,11 @@
 </div>
 
 ---
+# What is VedaAI 
+VedaAI is an AI-powered assessment assistant that understands question papers and handwritten answer sheets, maps each answer to the correct question, and highlights the exact answer region—helping teachers review assessments faster and more efficiently.
+
+
+
 
 # 🎯 Why VedaAI?
 
