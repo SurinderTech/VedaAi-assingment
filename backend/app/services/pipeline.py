@@ -12,7 +12,7 @@ from app.services.mapping_engine import map_answers
 from app.services.grading_service import generate_grading
 
 # Hard timeout: if processing takes longer than this, fail gracefully
-PIPELINE_TIMEOUT_SECONDS = 240  # 4 minutes max
+PIPELINE_TIMEOUT_SECONDS = 360  # 6 minutes max
 
 
 async def run_pipeline(assessment_id: str) -> None:

@@ -10,14 +10,23 @@ async def lifespan(app: FastAPI):
     """Pre-warm slow models at server startup so first user request is fast."""
     print("[Startup] Pre-warming OCR engine and VLM provider...")
 
-    # 1. Pre-warm RapidOCR ONNX models (takes 60-120s on first load)
+    # 1. Pre-warm RapidOCR ONNX models AND run a dummy inference
+    # to trigger JIT graph compilation (otherwise first real call is slow)
     try:
         import asyncio
-        from app.services.document_processor import _get_ocr_engine
         import numpy as np
+        from app.services.document_processor import _get_ocr_engine
+
+        def _warmup_ocr():
+            engine = _get_ocr_engine()
+            if engine:
+                # Run a tiny dummy inference to trigger ONNX JIT compilation
+                dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+                engine(dummy)
+                print("[Startup] OCR engine JIT-compiled and ready.")
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _get_ocr_engine)
-        print("[Startup] OCR engine ready.")
+        await loop.run_in_executor(None, _warmup_ocr)
     except Exception as e:
         print(f"[Startup] OCR pre-warm notice: {e}")
 
