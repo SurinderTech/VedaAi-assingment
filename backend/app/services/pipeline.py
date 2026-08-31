@@ -11,8 +11,31 @@ from app.services.answer_extractor import extract_answers
 from app.services.mapping_engine import map_answers
 from app.services.grading_service import generate_grading
 
+# Hard timeout: if processing takes longer than this, fail gracefully
+PIPELINE_TIMEOUT_SECONDS = 240  # 4 minutes max
+
 
 async def run_pipeline(assessment_id: str) -> None:
+    """Wrapper that enforces a hard timeout on the full pipeline."""
+    try:
+        await asyncio.wait_for(
+            _run_pipeline_inner(assessment_id),
+            timeout=PIPELINE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        print(f"[Pipeline] TIMEOUT after {PIPELINE_TIMEOUT_SECONDS}s for assessment {assessment_id}")
+        store.set_status(assessment_id, AssessmentStatus(
+            assessment_id=assessment_id,
+            state="failed",
+            message=(
+                f"⏱️ Processing took too long (>{PIPELINE_TIMEOUT_SECONDS}s). "
+                "Try uploading a smaller document or fewer pages."
+            ),
+            progress=0,
+        ))
+
+
+async def _run_pipeline_inner(assessment_id: str) -> None:
     files = store.get_files(assessment_id)
     if not files:
         store.set_status(assessment_id, AssessmentStatus(
