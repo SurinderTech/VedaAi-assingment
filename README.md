@@ -156,4 +156,10 @@ Structure	Examples
 
 The system is specifically designed to avoid treating every piece of extracted text as a question.
 
+<p align="center">
+      <h1>Results<h1>
+  <img src="" width="48%">
+  <img src="" width="48%">
+</p>
+
 
