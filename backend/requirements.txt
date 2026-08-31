@@ -12,9 +12,8 @@ numpy==1.26.4
 scipy
 scikit-learn==1.5.2
 
-paddleocr
+# CPU-only ONNX OCR — no CUDA/PyTorch/GPU dependencies needed on Render
 rapidocr_onnxruntime
-sentence-transformers
 
 httpx==0.27.2
 python-dotenv==1.0.1
