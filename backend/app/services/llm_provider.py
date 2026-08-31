@@ -23,10 +23,10 @@ TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 # Standard free model fallbacks on OpenRouter
 OPENROUTER_FREE_MODELS = [
     "minimax/minimax-m3:free",
+    "dots-studio/dots-3-note-preview:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
     "liquid/lfm-2.5-2.6b:free",
-    "dots-studio/dots-3-note-preview:free",
     "nvidia/nemotron-3.5-lightning:free",
     "poolside/laguna-s-2.1:free",
     "nousresearch/deephermes-3-llama-3-1-8b:free",
@@ -117,10 +117,18 @@ async def _call_gemini_with_metadata(
                                 if parts_res and "text" in parts_res[0]:
                                     text_out = parts_res[0]["text"]
                                     if text_out and len(text_out.strip()) > 0:
+                                        print(f"[LLM SUCCESS] purpose={purpose} provider=gemini model={model_name}")
                                         return text_out.strip(), model_name, total_retries, finish_reason
 
                     err_snippet = r.text[:300].replace("\n", " ").strip()
                     last_err = f"Status {r.status_code} - {err_snippet}"
+
+                    if r.status_code in (400, 401, 403):
+                        print(
+                            f"[LLM ERROR] provider=gemini model={model_name} status={r.status_code} "
+                            f"error={err_snippet[:150]} endpoint=generativelanguage.googleapis.com stage={purpose}"
+                        )
+                        raise LLMError(f"Gemini API authentication/permission error: {r.status_code} - {err_snippet}")
 
                     if r.status_code == 429:
                         err_lower = err_snippet.lower()
@@ -189,14 +197,15 @@ async def _call_gemini(
 
 
 OPENROUTER_VISION_MODELS = [
-    # Vision-capable models (support image input) available free on OpenRouter
-    "google/gemma-3-27b-it:free",       # Gemma 3 — multimodal
-    "google/gemma-3-12b-it:free",       # Gemma 3 — multimodal
-    "google/gemma-3-4b-it:free",        # Gemma 3 — multimodal
-    "qwen/qwen2.5-vl-7b-instruct:free", # Qwen2.5-VL — vision-language
-    "qwen/qwen2.5-vl-3b-instruct:free", # Qwen2.5-VL — vision-language
-    "meta-llama/llama-4-scout:free",    # Llama 4 Scout — multimodal
-    "meta-llama/llama-4-maverick:free", # Llama 4 Maverick — multimodal
+    # Multimodal / Vision-capable free models on OpenRouter
+    "minimax/minimax-m3:free",
+    "dots-studio/dots-3-note-preview:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "thinkingmachines/inkling:free",
+    "thinkingmachines/inkling-small:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "openrouter/free",
 ]
 
 
@@ -235,14 +244,14 @@ async def _call_openrouter_with_metadata(
     models_to_try = []
 
     if image_present:
-        if settings.OPENROUTER_MODEL and any(v in settings.OPENROUTER_MODEL for v in ["vision", "flash", "vl", "pixtral"]):
-            models_to_try.append(settings.OPENROUTER_MODEL)
+        if settings.OPENROUTER_MODEL and settings.OPENROUTER_MODEL.strip():
+            models_to_try.append(settings.OPENROUTER_MODEL.strip())
         for m in OPENROUTER_VISION_MODELS:
             if m not in models_to_try:
                 models_to_try.append(m)
     else:
-        if settings.OPENROUTER_MODEL:
-            models_to_try.append(settings.OPENROUTER_MODEL)
+        if settings.OPENROUTER_MODEL and settings.OPENROUTER_MODEL.strip():
+            models_to_try.append(settings.OPENROUTER_MODEL.strip())
         for m in OPENROUTER_FREE_MODELS:
             if m not in models_to_try:
                 models_to_try.append(m)
@@ -274,6 +283,7 @@ async def _call_openrouter_with_metadata(
                         if "message" in choices[0]:
                             content = choices[0]["message"].get("content", "")
                             if content and len(content.strip()) > 0:
+                                print(f"[LLM SUCCESS] purpose={purpose} provider=openrouter model={model}")
                                 return content.strip(), model, retries, finish_reason
 
                 err_snippet = r.text[:200].replace("\n", " ").strip()

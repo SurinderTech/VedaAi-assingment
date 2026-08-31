@@ -46,8 +46,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="VedaAI Assessment Extraction API", lifespan=lifespan)
 
 # Allow all Vercel preview deployments + localhost.
-# Render free tier cold-starts can return 502s before FastAPI runs,
-# so wildcard is the only reliable approach without a paid proxy.
+# Wildcard is used because Vercel generates unique preview URLs per commit.
+# allow_credentials must be False when allow_origins=["*"] (CORS spec requirement).
 ALLOWED_ORIGINS = [
     "https://veda-ai-assingment.vercel.app",
     "https://veda-ai-assingment-ldl1hla7z.vercel.app",

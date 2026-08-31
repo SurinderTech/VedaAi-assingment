@@ -1,16 +1,34 @@
 """
-Storage with disk persistence so server reloads do not wipe assessment states.
+In-memory assessment storage with optional disk persistence.
+
+All state (_assessments, _statuses, _files, _snapshots) lives in module-level
+dicts. On Modal (max_containers=1) this is always the same process, so state
+is reliably shared across all API requests within a session.
+
+Disk persistence (store_metadata.json) allows state to survive a server
+restart during local development. On Modal it is a nice-to-have: if the
+container is recycled, the JSON will be gone anyway (ephemeral /tmp).
+
+UPLOAD_DIR must match the directory used in routes.py (tempfile.gettempdir()).
+Both modules default to: <system-temp>/vedaai_uploads
+  - Linux / Modal container : /tmp/vedaai_uploads
+  - Windows local dev       : C:\\Users\\<user>\\AppData\\Local\\Temp\\vedaai_uploads
+Override with the VEDAAI_UPLOAD_DIR environment variable if needed.
 """
 from __future__ import annotations
 import json
 import os
 import hashlib
+import tempfile
 from typing import Dict, Optional, List, Tuple
 from app.models.schemas import AssessmentResult, AssessmentStatus
 
+# Use the system temp directory so this path matches routes.py exactly.
+# Previously this used a relative path from store.py's location which resolved
+# to /vedaai_uploads (filesystem root) inside the Modal container — wrong.
 UPLOAD_DIR = os.environ.get(
     "VEDAAI_UPLOAD_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "vedaai_uploads")
+    os.path.join(tempfile.gettempdir(), "vedaai_uploads")
 )
 UPLOAD_DIR = os.path.abspath(UPLOAD_DIR)
 os.makedirs(UPLOAD_DIR, exist_ok=True)

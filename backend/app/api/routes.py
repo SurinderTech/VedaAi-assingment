@@ -15,7 +15,10 @@ from app.services.assistant_service import process_assistant_message
 
 router = APIRouter(prefix="/api/assessment")
 
-UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "vedaai_uploads")
+UPLOAD_DIR = os.environ.get(
+    "VEDAAI_UPLOAD_DIR",
+    os.path.join(tempfile.gettempdir(), "vedaai_uploads"),
+)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
