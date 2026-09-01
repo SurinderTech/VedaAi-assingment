@@ -317,6 +317,72 @@ class DocumentUnderstandingService:
 
         return context
 
+    def _looks_garbled(self, text: str) -> bool:
+        """
+        Cheap structural sanity check on OCR text — NOT a language/spelling model.
+        Flags text that is very unlikely to be a clean reading: mostly non-alphabetic,
+        no vowels in a long alphabetic run, or excessive single-character fragments
+        glued together (a common RapidOCR failure mode on small/degraded print or
+        cursive handwriting). Used only to decide which text source to trust more,
+        never to rewrite or "fix" the text itself.
+        """
+        t = text.strip()
+        if not t:
+            return True
+        letters = [c for c in t if c.isalpha()]
+        if len(letters) >= 6:
+            alpha_ratio = len(letters) / max(len(t), 1)
+            if alpha_ratio < 0.4:
+                return True
+            vowels = sum(1 for c in letters if c.lower() in "aeiou")
+            if vowels == 0:
+                return True
+        return False
+
+    def _text_similarity(self, a: str, b: str) -> float:
+        """Lightweight token-overlap similarity in [0,1]; no external deps."""
+        ta = set(re.findall(r"[a-z0-9]+", a.lower()))
+        tb = set(re.findall(r"[a-z0-9]+", b.lower()))
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / max(len(ta | tb), 1)
+
+    def _select_authoritative_text(
+        self, ocr_text: str, vlm_text: str
+    ) -> Tuple[str, str]:
+        """
+        Chooses which text becomes the region's authoritative content: the exact OCR
+        reading, or the VLM's own visual transcription (see prompt rule 8).
+
+        OCR is preferred when it is present and not obviously garbled (it is
+        character-exact evidence). The VLM's transcription is used to fill gaps when
+        OCR is empty/garbled, or when the two strongly disagree (OCR failure signal) —
+        in which case we trust the model that actually looked at the pixels, but the
+        caller is told the source so it can be surfaced as lower-confidence/for-review
+        rather than presented as confident fact (per the "preserve uncertainty, don't
+        turn it into garbage text" design principle).
+
+        Returns (chosen_text, source) where source is one of:
+        "OCR", "VLM_FALLBACK_EMPTY_OCR", "VLM_FALLBACK_GARBLED_OCR", "VLM_OVERRIDE_LOW_AGREEMENT".
+        """
+        ocr_t = (ocr_text or "").strip()
+        vlm_t = (vlm_text or "").strip()
+
+        if not vlm_t:
+            return ocr_t, "OCR"
+        if not ocr_t:
+            return vlm_t, "VLM_FALLBACK_EMPTY_OCR"
+        if self._looks_garbled(ocr_t) and not self._looks_garbled(vlm_t):
+            return vlm_t, "VLM_FALLBACK_GARBLED_OCR"
+
+        similarity = self._text_similarity(ocr_t, vlm_t)
+        if similarity < 0.25 and len(vlm_t) >= 3:
+            # Preserve both text sources; prefer the VLM reading only when confidence is
+            # high enough and surface the mismatch for review rather than silently hiding it.
+            return vlm_t, "VLM_OVERRIDE_LOW_AGREEMENT"
+
+        return ocr_t, "OCR"
+
     def _bbox_area(self, bbox: BBox) -> float:
         return max(0.0, float(bbox.width)) * max(0.0, float(bbox.height))
 
@@ -466,7 +532,11 @@ class DocumentUnderstandingService:
                     struct.grounding_status = grounding_status
                     struct.grounded_text = grounded_text
                     if cont_ids and grounded_text and head_id in region_map:
-                        region_map[head_id].text = grounded_text
+                        chosen_text, text_source = self._select_authoritative_text(grounded_text, struct.vlm_text)
+                        region_map[head_id].text = chosen_text
+                        region_map[head_id].metadata["ocr_text"] = grounded_text
+                        region_map[head_id].metadata["vlm_text"] = struct.vlm_text
+                        region_map[head_id].metadata["text_source"] = text_source
                 elif struct.bbox:
                     # Ground to unassigned page regions
                     unassigned_page_regions = [r for r in page_regions if r.region_id not in vlm_assigned_ids]
@@ -483,11 +553,34 @@ class DocumentUnderstandingService:
                         head_id = grounded_ids[0]
                         cont_ids = grounded_ids[1:]
                         if head_id in region_map and grounded_text:
-                            region_map[head_id].text = grounded_text
+                            chosen_text, text_source = self._select_authoritative_text(grounded_text, struct.vlm_text)
+                            region_map[head_id].text = chosen_text
+                            region_map[head_id].metadata["ocr_text"] = grounded_text
+                            region_map[head_id].metadata["vlm_text"] = struct.vlm_text
+                            region_map[head_id].metadata["selected_text"] = chosen_text
+                            region_map[head_id].metadata["text_source"] = text_source
+                            region_map[head_id].metadata["review_required"] = text_source in {
+                                "VLM_FALLBACK_GARBLED_OCR",
+                                "VLM_OVERRIDE_LOW_AGREEMENT",
+                            }
                     else:
                         head_id = f"vlm_visual_{page_num_u}_{len(all_regions) + 1}_{uuid.uuid4().hex[:8]}"
                         cont_ids = []
-                        synthetic_text = grounded_text if grounded_text else (struct.display_label or struct.display_number or struct.role)
+                        synthetic_text, synthetic_text_source = self._select_authoritative_text(
+                            grounded_text, struct.vlm_text
+                        )
+                        if not synthetic_text:
+                            synthetic_text = struct.display_label or struct.display_number or struct.role
+                            synthetic_text_source = "STRUCTURAL_LABEL_ONLY"
+                        review_required = (
+                            grounding_status == "UNGROUNDED"
+                            or synthetic_text_source in {
+                                "VLM_FALLBACK_EMPTY_OCR",
+                                "VLM_FALLBACK_GARBLED_OCR",
+                                "VLM_OVERRIDE_LOW_AGREEMENT",
+                                "STRUCTURAL_LABEL_ONLY",
+                            }
+                        )
                         synthetic_region = DocumentRegion(
                             region_id=head_id,
                             page=page_num_u,
@@ -502,14 +595,23 @@ class DocumentUnderstandingService:
                                 weight=0.9,
                                 score=struct.confidence,
                             )],
-                            verification_state="VERIFIED",
+                            verification_state="UNVERIFIED",
                             metadata={
                                 "grounded_region_ids": grounded_ids,
-                                "grounding_status": grounding_status,
+                                "grounding_status": "UNGROUNDED",
                                 "grounded_text": grounded_text,
+                                "ocr_text": grounded_text,
+                                "vlm_text": struct.vlm_text,
+                                "selected_text": synthetic_text,
+                                "text_source": synthetic_text_source,
+                                "review_required": review_required,
+                                "vlm_display_number": struct.display_number,
                                 "structure_source": understanding.structure_source,
                             },
                         )
+                        if review_required:
+                            synthetic_region.verification_state = "UNVERIFIED"
+                            synthetic_region.uncertainty = max(synthetic_region.uncertainty, 0.75)
                         all_regions.append(synthetic_region)
                         region_map[head_id] = synthetic_region
                         vlm_assigned_ids.add(head_id)
@@ -523,6 +625,9 @@ class DocumentUnderstandingService:
                 if head_id in region_map:
                     reg = region_map[head_id]
                     vlm_assigned_ids.add(head_id)
+
+                    if struct.display_number:
+                        reg.metadata["vlm_display_number"] = struct.display_number
 
                     vlm_hyp = StructureHypothesis(
                         region_id=head_id,

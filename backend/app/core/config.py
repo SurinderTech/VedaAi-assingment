@@ -60,7 +60,9 @@ class Settings:
     SEMANTIC_AMBIGUITY_MARGIN: float = float(os.getenv("SEMANTIC_AMBIGUITY_MARGIN", "0.05"))
 
     # Step 11B Visual Document Verification Settings
-    DOCUMENT_VLM_ENABLED: bool = os.getenv("DOCUMENT_VLM_ENABLED", "false").lower() == "true"
+    # VLM-first product behavior: keep page-level multimodal understanding enabled by default
+    # so the system reasons from the actual page image before any deterministic fallback is used.
+    DOCUMENT_VLM_ENABLED: bool = os.getenv("DOCUMENT_VLM_ENABLED", "true").lower() == "true"
     DOCUMENT_VLM_PROVIDER: str = os.getenv("DOCUMENT_VLM_PROVIDER", "gemini")
     DOCUMENT_VLM_MODEL: str = os.getenv("DOCUMENT_VLM_MODEL", "gemini-2.5-flash")
     DOCUMENT_VLM_TIMEOUT: float = float(os.getenv("DOCUMENT_VLM_TIMEOUT", "30.0"))
@@ -70,6 +72,8 @@ class Settings:
     # Page-level VLM document understanding (primary intelligence mode)
     DOCUMENT_VLM_PAGE_UNDERSTANDING: bool = os.getenv("DOCUMENT_VLM_PAGE_UNDERSTANDING", "true").lower() == "true"
     # Step 11C Intelligent Extraction Settings
+    # Keep semantic graph extraction as the primary question-discovery path and reserve
+    # regex heuristics to explicit fallback/recovery cases only.
     INTELLIGENT_EXTRACTION_ENABLED: bool = os.getenv("INTELLIGENT_EXTRACTION_ENABLED", "true").lower() == "true"
 
 

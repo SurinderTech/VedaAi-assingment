@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from typing import List, Optional, Dict, Set, Tuple
+from typing import List, Optional, Dict, Set, Tuple, Any
 from app.models.schemas import (
     Block, BlockModality, BlockRole, Region, BBox, QuestionAnchor, AnswerRegion,
     PageAnalysis, StructuredAnswerSheet, AnswerCandidate,
@@ -687,13 +687,206 @@ def process_answer_sheet(
     )
 
 
-def extract_answers(blocks: List[Block], metadata_pages: Optional[Set[int]] = None) -> List[AnswerCandidate]:
+def _bbox_overlaps(a: BBox, b: BBox) -> bool:
+    """True if two bboxes share any area."""
+    x1 = max(a.x, b.x)
+    y1 = max(a.y, b.y)
+    x2 = min(a.x + a.width, b.x + b.width)
+    y2 = min(a.y + a.height, b.y + b.height)
+    return x2 > x1 and y2 > y1
+
+
+def _region_overlaps_any(vlm_bbox: BBox, vlm_page: int, existing: List[AnswerRegion]) -> bool:
+    for reg in existing:
+        for r in reg.regions:
+            if r.page == vlm_page and _bbox_overlaps(vlm_bbox, r.bbox):
+                return True
+    return False
+
+
+def _text_similarity(a: str, b: str) -> float:
+    ta = set(re.findall(r"[a-z0-9]+", (a or "").lower()))
+    tb = set(re.findall(r"[a-z0-9]+", (b or "").lower()))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta | tb), 1)
+
+
+def _resolve_vlm_text_conflict(ocr_text: str, vlm_text: str, confidence: float) -> Tuple[str, str, bool]:
+    """Preserve both OCR and VLM text while selecting the authoritative representation explicitly."""
+    ocr_t = (ocr_text or "").strip()
+    vlm_t = (vlm_text or "").strip()
+    if not vlm_t:
+        return ocr_t, "OCR", False
+    if not ocr_t:
+        return vlm_t, "VLM", False
+
+    similarity = _text_similarity(ocr_t, vlm_t)
+    if similarity < 0.25 and confidence >= 0.65:
+        return vlm_t, "VLM_REVIEW_REQUIRED", True
+    if similarity < 0.45 and confidence >= 0.80:
+        return vlm_t, "VLM_REVIEW_REQUIRED", True
+    return ocr_t, "OCR", False
+
+
+def _augment_with_vlm_evidence(
+    structured: StructuredAnswerSheet,
+    doc_understanding_result: Any,
+) -> StructuredAnswerSheet:
+    """
+    Prefer the VLM interpretation when it is semantically grounded, while preserving OCR
+    evidence and reconciliation metadata. Overlaps do not discard the VLM interpretation;
+    they are merged into the existing region so that both the physical and semantic evidence
+    survive for later review and mapping.
+    """
+    if doc_understanding_result is None:
+        return structured
+
+    vlm_regions = [
+        r for r in getattr(doc_understanding_result, "regions", [])
+        if r.region_type in ("ANSWER_REGION", "HANDWRITING") and r.text and r.text.strip()
+    ]
+    if not vlm_regions:
+        return structured
+
+    existing_all = structured.answer_regions + structured.unanchored_regions
+    next_idx = len(existing_all)
+
+    for vreg in vlm_regions:
+        v_bbox = getattr(vreg, "bbox", None)
+        v_page = getattr(vreg, "page", 1)
+        v_text = (vreg.text or "").strip()
+        v_conf = max(0.0, min(1.0, float(getattr(vreg, "confidence", 0.0))))
+        metadata = getattr(vreg, "metadata", {}) or {}
+
+        anchor = (
+            metadata.get("question_number")
+            or metadata.get("vlm_display_number")
+            or metadata.get("num")
+            or metadata.get("answer_to_question_number")
+        )
+        answer_to = metadata.get("answer_to") or metadata.get("question_anchor")
+        grounded_ids = metadata.get("grounded_region_ids") or metadata.get("grounded_ocr_region_ids") or []
+        answer_to_conf = float(metadata.get("answer_to_confidence", 0.0) or 0.0)
+
+        overlap_match = None
+        for reg in existing_all:
+            if reg.pages and v_page not in reg.pages:
+                continue
+            if any(r.page == v_page and _bbox_overlaps(v_bbox, r.bbox) for r in reg.regions):
+                overlap_match = reg
+                break
+
+        if overlap_match is not None:
+            base = overlap_match
+            base.vlm_region_id = getattr(vreg, "region_id", None)
+            base.vlm_confidence = max(float(base.vlm_confidence or 0.0), v_conf)
+            base.grounded_ocr_region_ids = list(dict.fromkeys((base.grounded_ocr_region_ids or []) + [str(rid) for rid in grounded_ids]))
+            base.grounding_status = metadata.get("grounding_status") or base.grounding_status or "GROUNDING_UNKNOWN"
+            base.ocr_text = base.ocr_text or base.text or ""
+            base.vlm_text = v_text
+            base.answer_to = answer_to or base.answer_to
+            base.answer_to_question_number = (
+                metadata.get("answer_to_question_number")
+                or metadata.get("question_number")
+                or metadata.get("vlm_display_number")
+                or base.answer_to_question_number
+            )
+            base.answer_to_confidence = max(base.answer_to_confidence, answer_to_conf)
+            base.provenance = {
+                **(base.provenance or {}),
+                "source": "VLM",
+                "vlm_region_id": getattr(vreg, "region_id", None),
+                "vlm_confidence": v_conf,
+                "grounded_ocr_region_ids": base.grounded_ocr_region_ids,
+                "grounding_status": base.grounding_status,
+                "answer_to": answer_to,
+                "question_number": anchor,
+            }
+            if anchor and not base.question_anchor:
+                base.question_anchor = str(anchor).strip()
+
+            selected_text, text_source, review_required = _resolve_vlm_text_conflict(base.ocr_text, base.vlm_text, base.vlm_confidence)
+            base.selected_text = selected_text
+            base.text_source = text_source
+            base.review_required = review_required
+            base.needs_review = review_required or base.needs_review
+            base.text = selected_text or base.text
+            if not base.question_anchor and base.answer_to_question_number:
+                base.question_anchor = str(base.answer_to_question_number).strip()
+            continue
+
+        anchor_value = str(anchor).strip() if anchor else None
+        synthetic_block = Block(
+            id=getattr(vreg, "region_id", f"vlm_{uuid.uuid4().hex[:8]}"),
+            text=v_text,
+            confidence=max(0.0, min(1.0, float(v_conf))),
+            bbox=v_bbox,
+            page=v_page,
+            source="ocr",
+            modality="unknown",
+            role="student_answer",
+        )
+        selected_text, text_source, review_required = _resolve_vlm_text_conflict("", v_text, v_conf)
+        new_region = AnswerRegion(
+            answer_id=f"vlm_region_{uuid.uuid4().hex[:8]}",
+            question_anchor=anchor_value,
+            pages=[v_page],
+            regions=[Region(page=v_page, bbox=v_bbox)],
+            text=selected_text or v_text,
+            blocks=[synthetic_block],
+            reading_order=next_idx,
+            confidence=min(0.75, max(0.0, float(v_conf))),
+            ocr_text="",
+            vlm_text=v_text,
+            selected_text=selected_text or v_text,
+            text_source=text_source,
+            grounding_status=metadata.get("grounding_status") or "UNGROUNDED",
+            grounded_ocr_region_ids=[str(rid) for rid in grounded_ids],
+            vlm_region_id=getattr(vreg, "region_id", None),
+            vlm_confidence=v_conf,
+            answer_to=answer_to,
+            answer_to_question_number=(metadata.get("answer_to_question_number") or anchor_value),
+            answer_to_confidence=answer_to_conf,
+            provenance={
+                "source": "VLM",
+                "vlm_region_id": getattr(vreg, "region_id", None),
+                "vlm_confidence": v_conf,
+                "grounded_ocr_region_ids": [str(rid) for rid in grounded_ids],
+                "grounding_status": metadata.get("grounding_status") or "UNGROUNDED",
+                "answer_to": answer_to,
+                "question_number": anchor_value,
+            },
+            review_required=review_required,
+            needs_review=review_required,
+        )
+        next_idx += 1
+
+        if new_region.question_anchor:
+            structured.answer_regions.append(new_region)
+        else:
+            structured.unanchored_regions.append(new_region)
+        existing_all.append(new_region)
+
+    return structured
+
+
+def extract_answers(
+    blocks: List[Block],
+    metadata_pages: Optional[Set[int]] = None,
+    doc_understanding_result: Optional[Any] = None,
+) -> List[AnswerCandidate]:
     """
     Backward-compatible entry point for the core processing pipeline.
     Generates AnswerCandidate objects from StructuredAnswerSheet student regions.
+
+    doc_understanding_result (optional): the answer sheet's VLM DocumentUnderstandingResult
+    (see pipeline.py STEP 4B). When provided, it is used to fill in answers the regex/anchor
+    pass alone could not find or read reliably — see _augment_with_vlm_evidence above.
     """
     num_pages = max((b.page for b in blocks), default=1)
     structured = process_answer_sheet(blocks, num_pages)
+    structured = _augment_with_vlm_evidence(structured, doc_understanding_result)
 
     candidates: List[AnswerCandidate] = []
     for idx, r in enumerate(structured.answer_regions):
@@ -701,6 +894,22 @@ def extract_answers(blocks: List[Block], metadata_pages: Optional[Set[int]] = No
             AnswerCandidate(
                 answer_id=r.answer_id,
                 question_number=r.question_anchor,
+                text=r.text,
+                regions=r.regions,
+                order_index=idx,
+            )
+        )
+
+    # Unanchored student work (no question number could be determined by either pass) is
+    # still surfaced as a candidate with question_number=None rather than silently dropped —
+    # the mapping/grading stage already has an "unmatched answer" path for exactly this case,
+    # and dropping it here means a real student answer would disappear from review entirely
+    # (see design principle: preserve evidence, don't hide failures).
+    for idx, r in enumerate(structured.unanchored_regions, start=len(candidates)):
+        candidates.append(
+            AnswerCandidate(
+                answer_id=r.answer_id,
+                question_number=None,
                 text=r.text,
                 regions=r.regions,
                 order_index=idx,

@@ -489,7 +489,7 @@ RULES:
 5. For multi-column documents: respect column boundaries when assigning options to questions. Options always belong to the most recently seen question IN THE SAME COLUMN.
 6. For answer sheets: use ANSWER_REGION for written answer areas, HANDWRITING for handwritten text, SIGNATURE for signatures.
 7. For figures/diagrams: use FIGURE or DIAGRAM and link to their caption with a "caption_of" relationship.
-8. Do NOT repeat long text in the output; the OCR evidence provides the exact text.
+8. TEXT FIELD: For roles QUESTION, SUBQUESTION, OPTION, ANSWER_REGION, and HANDWRITING, include a "text" field containing YOUR OWN direct visual reading of that region's content (transcribe what you actually see in the image). This is used to cross-check the OCR evidence — OCR can misread small print, watermarked/low-quality scans, or handwriting, and your visual reading is often more reliable for those cases. You do not need to include "text" for purely structural roles (HEADER, FOOTER, METADATA, SECTION_HEADER, TABLE, DIAGRAM, FIGURE) where the OCR evidence is sufficient.
 9. An OPTION region belongs to exactly ONE QUESTION. Never assign the same option to multiple questions.
 10. CRITICAL — QUESTION vs INSTRUCTION distinction:
     A real QUESTION is something a student must directly respond to (e.g. "What is photosynthesis?", "Define deep learning.", "Calculate the resistance.").
@@ -498,6 +498,10 @@ RULES:
 11. CRITICAL — SECTION_HEADER:
     Labels like "SECTION-A", "SECTION A (COMPULSORY)", "PART B", "GROUP I" that delimit groups of questions must be labelled SECTION_HEADER, not QUESTION or INSTRUCTION.
     Connect questions inside a section to the section using the "section_member" relationship.
+12. CRITICAL — ANSWER SHEETS (student's answer document):
+    Identify each distinct student answer as its own ANSWER_REGION (typed/printed answer) or HANDWRITING (handwritten answer) structure — including single-cell answers inside a table (e.g. a "Q.No / Answer" table where each answer cell, such as an MCQ letter like "(D)", is its own ANSWER_REGION).
+    For every ANSWER_REGION / HANDWRITING structure, set "num" to the question number that answer belongs to, read directly from whatever labels it (a row number, a printed "Q7" heading, a table row's Q.No cell, etc.) — even if the number is in a different table column/cell than the answer itself. Read the row/label visually; do not rely on text proximity alone.
+    If the answer sheet reproduces the original question text next to the answer, link the ANSWER_REGION/HANDWRITING to that reproduced question text using an "answer_to" relationship (src = answer region id, tgt = question text id).
 
 OCR Evidence (page {page_number}):
 {ocr_evidence}
@@ -511,6 +515,8 @@ Return strictly valid JSON in this compact format:
       "role": "QUESTION" | "OPTION" | "SUBQUESTION" | "SECTION_HEADER" | "INSTRUCTION" | "METADATA" | "HEADER" | "FOOTER" | "TABLE" | "DIAGRAM" | "FIGURE" | "CAPTION" | "ANSWER_REGION" | "HANDWRITING" | "FORM_FIELD" | "PARAGRAPH" | "LIST" | "SIGNATURE" | "UNKNOWN",
       "ids": ["id1"],
       "bbox": [x1, y1, x2, y2],
+      "num": "1" | "1(a)" | null,
+      "text": "your own visual transcription (only for QUESTION/SUBQUESTION/OPTION/ANSWER_REGION/HANDWRITING, see rule 8)",
       "conf": 0.95
     }}
   ],
@@ -684,10 +690,18 @@ Return strictly valid JSON in this compact format:
                 }
                 normalized_role = role_map.get(role, role)
 
+                # NOTE: this whitelist must stay in sync with the role vocabulary the VLM
+                # prompt actually offers it (see _build_page_understanding_prompt rule 2 and
+                # the JSON schema's "role" enum) AND with DocumentRegionType in schemas.py.
+                # A role the prompt is allowed to emit but this set doesn't recognize gets
+                # silently demoted to UNKNOWN below, which is how a correctly-identified
+                # ANSWER_REGION / HANDWRITING structure used to vanish from the graph.
                 valid_roles = {
                     "HEADER", "FOOTER", "METADATA", "INSTRUCTION", "SECTION_HEADER",
                     "QUESTION", "SUBQUESTION", "OPTION", "TABLE", "TABLE_CELL",
-                    "DIAGRAM", "FIGURE", "ANSWER_SPACE", "UNKNOWN",
+                    "DIAGRAM", "FIGURE", "CAPTION",
+                    "ANSWER_SPACE", "ANSWER_REGION", "HANDWRITING",
+                    "FORM_FIELD", "PARAGRAPH", "LIST", "SIGNATURE", "UNKNOWN",
                 }
                 if normalized_role not in valid_roles:
                     normalized_role = "UNKNOWN"
@@ -698,6 +712,7 @@ Return strictly valid JSON in this compact format:
                     role=normalized_role,
                     display_number=item.get("display_number", item.get("num")),
                     display_label=item.get("display_label"),
+                    vlm_text=str(item.get("text", "") or "").strip(),
                     reasoning=str(item.get("reasoning", "")),
                     confidence=float(item.get("confidence", item.get("conf", 0.90))),
                 ))
@@ -723,10 +738,12 @@ Return strictly valid JSON in this compact format:
                 if not src_ids or not tgt_ids:
                     continue
 
+                # Same sync requirement as valid_roles above — must match the "type" enum
+                # the prompt offers (rule 12 / JSON schema) and RelationshipType in schemas.py.
                 valid_rel_types = {
                     "follows", "contains", "belongs_to", "continuation_of",
                     "option_of", "subquestion_of", "section_member",
-                    "associated_visual",
+                    "associated_visual", "answer_to", "caption_of",
                 }
                 rel_type = rel.get("type", rel.get("relationship_type", "belongs_to"))
                 if rel_type not in valid_rel_types:
@@ -846,71 +863,37 @@ Return strictly valid JSON in this compact format:
         image_dimensions: Optional[Any] = None,
     ) -> str:
         """
-        Real semantic completeness scorer — Fix 1.
-
-        Does NOT blindly treat finishReason==STOP as COMPLETE.
-        A VLM can stop generating having only covered part of a page.
-
-        States:
-          COMPLETE  — STOP + good coverage evidence
-          PARTIAL   — MAX_TOKENS (truncated output)
-          AMBIGUOUS — STOP but sparse/questionable coverage
-          FAILED    — 0 structures produced
+        Semantic completeness is determined by meaningful document structure, not OCR coverage.
+        A page is not complete simply because enough OCR blocks were mentioned or enough
+        structures were counted.
         """
-        # MAX_TOKENS always means partial — output was cut off
         if finish_reason in ("MAX_TOKENS", "LENGTH", "RECITATION"):
             return "PARTIAL"
 
-        # No structures produced → failed understanding
         if not structures:
             return "FAILED"
 
-        # STOP + structures: evaluate actual coverage quality
+        meaningful_roles = {"QUESTION", "SUBQUESTION", "OPTION", "ANSWER_REGION", "HANDWRITING", "TABLE", "SECTION_HEADER", "INSTRUCTION"}
+        present_roles = {
+            getattr(s, "role", "UNKNOWN")
+            for s in structures
+            if getattr(s, "role", "UNKNOWN") not in {"HEADER", "FOOTER", "METADATA", "UNKNOWN"}
+        }
+
+        if not present_roles.intersection(meaningful_roles):
+            return "AMBIGUOUS"
+
         if finish_reason in ("STOP", "stop", "", "N/A"):
-            total_ocr = len(ocr_blocks)
-            n_structures = len(structures)
+            # Real semantic completeness means the model recognized answer-sheet meaning,
+            # not that it merely referenced OCR blocks. A page with questions/options/answers
+            # and their relationships is semantically complete even if OCR coverage is sparse.
+            has_answer_semantics = any(r in present_roles for r in ("QUESTION", "OPTION", "SUBQUESTION", "ANSWER_REGION", "HANDWRITING", "TABLE"))
+            if has_answer_semantics:
+                return "COMPLETE"
+            if present_roles.intersection({"SECTION_HEADER", "INSTRUCTION"}):
+                return "COMPLETE" if len(present_roles) >= 2 else "AMBIGUOUS"
+            return "AMBIGUOUS"
 
-            # Check 1: Structure count relative to OCR block count
-            # If VLM only identified 1-2 structures on a page with 30+ OCR blocks,
-            # that is suspicious. A reasonable threshold: at least 10% coverage or
-            # at least 3 structures for a substantial page.
-            if total_ocr > 15 and n_structures < 2:
-                print(
-                    f"[VLM] SemanticCoverage: STOP but only {n_structures} structure(s) "
-                    f"for {total_ocr} OCR blocks → AMBIGUOUS"
-                )
-                return "AMBIGUOUS"
-
-            # Check 2: Count unique OCR block IDs referenced by VLM structures
-            referenced_ids: set = set()
-            for s in structures:
-                for rid in getattr(s, "region_ids", []):
-                    referenced_ids.add(rid)
-                for rid in getattr(s, "grounded_region_ids", []):
-                    referenced_ids.add(rid)
-
-            if total_ocr > 0:
-                coverage_ratio = len(referenced_ids) / total_ocr
-                # A ratio below 10% on a page with >10 blocks suggests sparse VLM scan
-                if total_ocr > 10 and coverage_ratio < 0.08 and n_structures < max(3, total_ocr // 10):
-                    print(
-                        f"[VLM] SemanticCoverage: STOP but coverage_ratio={coverage_ratio:.2f} "
-                        f"({len(referenced_ids)}/{total_ocr} blocks referenced) → AMBIGUOUS"
-                    )
-                    return "AMBIGUOUS"
-
-            # Check 3: Validate that structures have at least some valid bboxes or region_ids
-            valid_structures = [
-                s for s in structures
-                if (getattr(s, "region_ids", []) or getattr(s, "grounded_region_ids", []) or getattr(s, "bbox", None))
-            ]
-            if len(valid_structures) == 0:
-                return "AMBIGUOUS"
-
-            # All checks passed: STOP + reasonable coverage
-            return "COMPLETE"
-
-        # Other finish reasons (SAFETY, UNKNOWN, etc.) → treat as ambiguous
         return "AMBIGUOUS"
 
     # ================================================================

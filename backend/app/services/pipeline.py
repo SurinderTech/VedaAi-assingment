@@ -97,16 +97,38 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         as_pages = as_res[1]
         as_sizes = as_res[2]
         as_images = as_res[3] if len(as_res) > 3 else None
+        as_page_sizes_dict = {i + 1: [float(w), float(h)] for i, (w, h) in enumerate(as_sizes)} if as_sizes else None
+
+        # ── STEP 4B: VLM understanding of the answer sheet ────────────────────
+        # The answer sheet gets the SAME genuine visual-understanding treatment as the
+        # question paper (STEP 2). Without this, answer extraction falls back to pure
+        # OCR-text regex matching, which cannot reliably read handwriting or associate
+        # a table cell's answer with its row's question number — this is the primary
+        # cause of "No answer detected" showing up for every question.
+        store.set_status(assessment_id, AssessmentStatus(
+            assessment_id=assessment_id, state="extracting_answers",
+            message=f"🧠 AI analyzing {as_pages} page(s) of answer sheet — this takes ~{as_pages * 8}s...", progress=0.50))
+
+        from app.services.document_understanding_service import DocumentUnderstandingService
+        as_doc_understanding_res = await asyncio.to_thread(
+            DocumentUnderstandingService().process_document,
+            as_blocks,
+            f"as_doc_{assessment_id}",
+            as_page_sizes_dict,
+            as_images,
+        )
 
         # ── STEP 5: Extract answers ──────────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_answers",
             message="🧠 AI reading handwritten answers...", progress=0.55))
         page_types, metadata_pages = analyze_pages(as_blocks, as_pages)
-        answers = await asyncio.to_thread(extract_answers, as_blocks, metadata_pages)
+        answers = await asyncio.to_thread(
+            extract_answers, as_blocks, metadata_pages, as_doc_understanding_res
+        )
 
         # Free AS images before mapping/grading
-        del as_images, as_res
+        del as_images, as_res, as_doc_understanding_res
         gc.collect()
 
         # ── STEP 6: Map answers to questions ─────────────────────────────────

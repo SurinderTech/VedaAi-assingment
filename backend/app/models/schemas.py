@@ -135,6 +135,20 @@ class AnswerRegion(BaseModel):
     reading_order: int = 0
     is_continuation: bool = False
     confidence: float = 0.9
+    ocr_text: str = ""
+    vlm_text: str = ""
+    selected_text: str = ""
+    text_source: str = "OCR"
+    grounding_status: str = "UNGROUNDED"
+    grounded_ocr_region_ids: List[str] = []
+    vlm_region_id: Optional[str] = None
+    vlm_confidence: float = 0.0
+    answer_to: Optional[str] = None
+    answer_to_question_number: Optional[str] = None
+    answer_to_confidence: float = 0.0
+    provenance: Dict[str, Any] = {}
+    review_required: bool = False
+    needs_review: bool = False
 
 
 class StructuredAnswerSheet(BaseModel):
@@ -636,7 +650,14 @@ DocumentRegionType = Literal[
     "TABLE_CELL",
     "DIAGRAM",
     "FIGURE",
+    "CAPTION",
     "ANSWER_SPACE",
+    "ANSWER_REGION",
+    "HANDWRITING",
+    "FORM_FIELD",
+    "PARAGRAPH",
+    "LIST",
+    "SIGNATURE",
     "UNKNOWN",
 ]
 
@@ -653,6 +674,8 @@ RelationshipType = Literal[
     "subquestion_of",
     "section_member",
     "associated_visual",
+    "answer_to",
+    "caption_of",
 ]
 
 DocumentPurpose = Literal[
@@ -907,6 +930,7 @@ class VLMStructureItem(BaseModel):
     role: DocumentRegionType = "UNKNOWN"
     display_number: Optional[str] = None
     display_label: Optional[str] = None
+    vlm_text: str = ""
     reasoning: str = ""
     confidence: float = 0.5
 
@@ -977,7 +1001,3 @@ ExtractedSection.model_rebuild()
 RejectionRecord.model_rebuild()
 ExtractionAudit.model_rebuild()
 DocumentQuestionExtractionResult.model_rebuild()
-
-
-
-
