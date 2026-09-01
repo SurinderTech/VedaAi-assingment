@@ -450,6 +450,25 @@ async def _verify_ambiguous_candidate_with_llm(cand: RawCandidate) -> Tuple[bool
     return True, cand.text
 
 
+def _has_semantic_question_structure(doc_understanding_result: Optional[Any]) -> bool:
+    """True only when the VLM / semantic graph already produced document structure."""
+    if doc_understanding_result is None:
+        return False
+
+    graph = getattr(doc_understanding_result, "structure_graph", None)
+    if graph and getattr(graph, "nodes", None):
+        return any(getattr(node, "role", None) == "QUESTION" for node in graph.nodes.values())
+
+    vlm_understandings = getattr(doc_understanding_result, "vlm_page_understandings", []) or []
+    if any(getattr(u, "structures", None) for u in vlm_understandings):
+        return True
+
+    if getattr(doc_understanding_result, "regions", None):
+        return any(getattr(r, "region_type", None) == "QUESTION" for r in doc_understanding_result.regions)
+
+    return False
+
+
 async def extract_questions(
     blocks: List[Block],
     high_threshold: Optional[float] = None,
@@ -458,17 +477,15 @@ async def extract_questions(
     page_sizes: Optional[Dict[int, List[float]]] = None,
 ) -> List[Question]:
     """
-    Main Entry Point: Question Paper Extraction Pipeline.
-    
-    Checks settings.INTELLIGENT_EXTRACTION_ENABLED (Step 11C feature flag).
-    When enabled, delegates to IntelligentQuestionExtractionService.
-    If an exception occurs or an empty question set is returned, gracefully falls back
-    to the legacy deterministic extraction path without failing the pipeline.
+    Strict VLM-first extraction order:
+    1. prefer semantic graph / VLM structure when available
+    2. use deterministic extraction only as a true last-resort fallback when no semantic structure exists
     """
     if not blocks:
         return []
 
-    # Check Step 11C Feature Flag
+    semantic_present = _has_semantic_question_structure(doc_understanding_result)
+
     if getattr(settings, "INTELLIGENT_EXTRACTION_ENABLED", True):
         try:
             from app.services.intelligent_question_extraction_service import IntelligentQuestionExtractionService
@@ -481,12 +498,20 @@ async def extract_questions(
             )
             if extraction_res.questions and len(extraction_res.questions) > 0:
                 return extraction_res.questions
-            if doc_understanding_result is not None and getattr(doc_understanding_result, "structure_graph", None):
-                print("[QuestionExtractor] Semantic graph produced no safe questions; preserving uncertainty instead of reparsing OCR.")
+
+            if semantic_present:
+                print("[QuestionExtractor] VLM/semantic question structure is present; blocking regex fallback from overriding it.")
                 return []
-            print("[QuestionExtractor] Step 11C returned zero questions, invoking safe legacy fallback.")
+
+            print("[QuestionExtractor] Semantic graph unavailable; invoking legacy fallback only as explicit last resort.")
         except Exception as e:
+            if semantic_present:
+                print(f"[QuestionExtractor] Semantic extraction failed but a VLM structure exists; preserving semantic uncertainty instead of regex leakage ({e}).")
+                return []
             print(f"[QuestionExtractor] Step 11C exception ({e}), invoking safe legacy fallback.")
+
+    if semantic_present:
+        return []
 
     return await _legacy_extract_questions(blocks, high_threshold, low_threshold)
 

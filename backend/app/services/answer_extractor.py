@@ -734,17 +734,18 @@ def _augment_with_vlm_evidence(
     doc_understanding_result: Any,
 ) -> StructuredAnswerSheet:
     """
-    Prefer the VLM interpretation when it is semantically grounded, while preserving OCR
-    evidence and reconciliation metadata. Overlaps do not discard the VLM interpretation;
-    they are merged into the existing region so that both the physical and semantic evidence
-    survive for later review and mapping.
+    VLM-first precedence:
+    1. ground VLM answer regions to actual page geometry
+    2. keep OCR only as support text
+    3. if the VLM structurally defines a region, it is the authoritative answer candidate
+    4. heuristics do not override a grounded VLM answer
     """
     if doc_understanding_result is None:
         return structured
 
     vlm_regions = [
         r for r in getattr(doc_understanding_result, "regions", [])
-        if r.region_type in ("ANSWER_REGION", "HANDWRITING") and r.text and r.text.strip()
+        if r.region_type in ("ANSWER_REGION", "HANDWRITING") and getattr(r, "text", "") and str(r.text).strip()
     ]
     if not vlm_regions:
         return structured
@@ -755,7 +756,7 @@ def _augment_with_vlm_evidence(
     for vreg in vlm_regions:
         v_bbox = getattr(vreg, "bbox", None)
         v_page = getattr(vreg, "page", 1)
-        v_text = (vreg.text or "").strip()
+        v_text = (getattr(vreg, "text", "") or "").strip()
         v_conf = max(0.0, min(1.0, float(getattr(vreg, "confidence", 0.0))))
         metadata = getattr(vreg, "metadata", {}) or {}
 
@@ -817,16 +818,6 @@ def _augment_with_vlm_evidence(
             continue
 
         anchor_value = str(anchor).strip() if anchor else None
-        synthetic_block = Block(
-            id=getattr(vreg, "region_id", f"vlm_{uuid.uuid4().hex[:8]}"),
-            text=v_text,
-            confidence=max(0.0, min(1.0, float(v_conf))),
-            bbox=v_bbox,
-            page=v_page,
-            source="ocr",
-            modality="unknown",
-            role="student_answer",
-        )
         selected_text, text_source, review_required = _resolve_vlm_text_conflict("", v_text, v_conf)
         new_region = AnswerRegion(
             answer_id=f"vlm_region_{uuid.uuid4().hex[:8]}",
@@ -834,7 +825,16 @@ def _augment_with_vlm_evidence(
             pages=[v_page],
             regions=[Region(page=v_page, bbox=v_bbox)],
             text=selected_text or v_text,
-            blocks=[synthetic_block],
+            blocks=[Block(
+                id=getattr(vreg, "region_id", f"vlm_{uuid.uuid4().hex[:8]}"),
+                text=v_text,
+                confidence=max(0.0, min(1.0, float(v_conf))),
+                bbox=v_bbox,
+                page=v_page,
+                source="ocr",
+                modality="unknown",
+                role="student_answer",
+            )],
             reading_order=next_idx,
             confidence=min(0.75, max(0.0, float(v_conf))),
             ocr_text="",

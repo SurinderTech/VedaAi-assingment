@@ -219,3 +219,30 @@ class TestPhase1VlmAnswerEvidence:
         assert len(structured.answer_regions) == 2
         assert {r.question_anchor for r in structured.answer_regions} == {"1", "2"}
         assert len({r.answer_id for r in structured.answer_regions}) == 2
+
+    def test_07_vlm_semantic_results_prevent_regex_fallback_dominance(self, monkeypatch):
+        import app.services.question_extractor as qe
+
+        doc_understanding_result = SimpleNamespace(
+            regions=[],
+            vlm_page_understandings=[SimpleNamespace(page_number=1, structures=[SimpleNamespace(role="QUESTION", vlm_text="What is photosynthesis?")])],
+            structure_graph=SimpleNamespace(nodes={"q1": SimpleNamespace(role="QUESTION")}),
+        )
+
+        async def fail_legacy(*args, **kwargs):
+            raise AssertionError("legacy regex fallback was invoked despite VLM/semantic structure being present")
+
+        monkeypatch.setattr(qe, "_legacy_extract_questions", fail_legacy)
+
+        async def fake_extract_validated_questions(*args, **kwargs):
+            return SimpleNamespace(questions=[])
+
+        import importlib
+        import app.services.intelligent_question_extraction_service as iqes
+        monkeypatch.setattr(iqes, "IntelligentQuestionExtractionService", lambda: SimpleNamespace(extract_validated_questions=fake_extract_validated_questions))
+
+        async def run():
+            return await qe.extract_questions([], doc_understanding_result=doc_understanding_result)
+
+        result = __import__("asyncio").run(run())
+        assert result == []
