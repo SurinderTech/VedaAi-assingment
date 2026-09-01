@@ -478,13 +478,16 @@ async def extract_questions(
 ) -> List[Question]:
     """
     Strict VLM-first extraction order:
-    1. prefer semantic graph / VLM structure when available
-    2. use deterministic extraction only as a true last-resort fallback when no semantic structure exists
+    1. require semantic graph / VLM structure
+    2. never invoke OCR/regex fallback in production mode
+    3. fail explicitly if VLM does not provide the structure
     """
     if not blocks:
         return []
 
     semantic_present = _has_semantic_question_structure(doc_understanding_result)
+    if getattr(settings, "STRICT_VLM_ONLY_MODE", True) and not semantic_present:
+        raise RuntimeError("OCR/regex fallback is disabled. VLM/LLM semantic structure is required.")
 
     if getattr(settings, "INTELLIGENT_EXTRACTION_ENABLED", True):
         try:
@@ -498,22 +501,14 @@ async def extract_questions(
             )
             if extraction_res.questions and len(extraction_res.questions) > 0:
                 return extraction_res.questions
-
-            if semantic_present:
-                print("[QuestionExtractor] VLM/semantic question structure is present; blocking regex fallback from overriding it.")
-                return []
-
-            print("[QuestionExtractor] Semantic graph unavailable; invoking legacy fallback only as explicit last resort.")
         except Exception as e:
-            if semantic_present:
-                print(f"[QuestionExtractor] Semantic extraction failed but a VLM structure exists; preserving semantic uncertainty instead of regex leakage ({e}).")
-                return []
-            print(f"[QuestionExtractor] Step 11C exception ({e}), invoking safe legacy fallback.")
+            print(f"[QuestionExtractor] Semantic extraction failed: {e}")
+            raise RuntimeError("VLM/LLM semantic extraction failed; OCR/regex fallback is disabled.") from e
 
-    if semantic_present:
-        return []
+    if not semantic_present:
+        raise RuntimeError("OCR/regex fallback is disabled. VLM/LLM semantic structure is required.")
 
-    return await _legacy_extract_questions(blocks, high_threshold, low_threshold)
+    return []
 
 
 async def _legacy_extract_questions(

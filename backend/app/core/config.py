@@ -72,9 +72,10 @@ class Settings:
     # Page-level VLM document understanding (primary intelligence mode)
     DOCUMENT_VLM_PAGE_UNDERSTANDING: bool = os.getenv("DOCUMENT_VLM_PAGE_UNDERSTANDING", "true").lower() == "true"
     # Step 11C Intelligent Extraction Settings
-    # Keep semantic graph extraction as the primary question-discovery path and reserve
-    # regex heuristics to explicit fallback/recovery cases only.
+    # VLM/LLM-only mode: OCR and regex are removed from the live decision path.
+    # Any extraction without a semantic/VLM structure must fail explicitly instead of falling back.
     INTELLIGENT_EXTRACTION_ENABLED: bool = os.getenv("INTELLIGENT_EXTRACTION_ENABLED", "true").lower() == "true"
+    STRICT_VLM_ONLY_MODE: bool = os.getenv("STRICT_VLM_ONLY_MODE", "true").lower() == "true"
 
 
 settings = Settings()

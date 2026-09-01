@@ -2,6 +2,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from app.models.schemas import (
@@ -246,3 +248,13 @@ class TestPhase1VlmAnswerEvidence:
 
         result = __import__("asyncio").run(run())
         assert result == []
+
+    def test_08_no_ocr_or_regex_fallback_when_vlm_is_missing(self):
+        import asyncio
+        import app.services.question_extractor as qe
+
+        async def run():
+            with pytest.raises(RuntimeError, match="OCR/regex fallback is disabled"):
+                await qe.extract_questions([Block(id="b1", text="Q1. What is force?", page=1, bbox=BBox(x=10, y=10, width=200, height=30), confidence=0.9)], doc_understanding_result=None)
+
+        asyncio.run(run())
