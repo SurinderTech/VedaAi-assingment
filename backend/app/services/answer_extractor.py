@@ -24,9 +24,9 @@ from app.services.llm_provider import llm_complete_json
 
 # --- Anchor Regex Patterns ---
 
-# Combined anchor with parenthesis: e.g. "1(a).", "1(a)", "Q1(a)", "Ans 1(a).", "1(j)."
+# Combined anchor with parenthesis: e.g. "1(a).", "1(a)", "(1)(a)", "Q1(a)", "Ans 1(a).", "1(j)."
 DIRECT_PAREN_RE = re.compile(
-    r"^\s*(?:Ans(?:wer)?\.?\s*|Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\s\-_]*\(([a-zA-Z0-9]{1,2})\)\s*[\.\):]?\s*(.*)$",
+    r"^\s*(?:Ans(?:wer)?\.?\s*|Q(?:uestion)?\.?\s*)?[\(\[]?\s*(\d{1,3})\s*[\)\]]?\s*[\.\s\-_]*\(([a-zA-Z0-9]{1,2})\)\s*[\.\):]?\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -36,9 +36,9 @@ DIRECT_DOT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Main anchor: e.g. "Q1.", "Q1", "Q.1", "Q 1", "1.", "1)", "01", "Q7.", "Q7"
+# Main anchor: e.g. "Q1.", "Q1", "Q.1", "Q 1", "1.", "1)", "(1)", "[1]", "01", "Q7.", "Q7"
 MAIN_ANCHOR_RE = re.compile(
-    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\):]?\s*(.*)$",
+    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?[\(\[]?\s*(\d{1,3})\s*[\)\]\.\:\-]?\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -298,7 +298,7 @@ def _detect_anchors_and_references_in_blocks(
                 main_num = m_main.group(1)
                 rest = m_main.group(2).strip()
 
-                is_explicit_q = txt.lower().startswith("q") or txt.lower().startswith("ans")
+                is_explicit_q = txt.lower().startswith("q") or txt.lower().startswith("ans") or txt.strip().startswith("(") or txt.strip().startswith("[")
                 if is_explicit_q or (len(rest) < 60 and not _is_false_positive_number(txt, main_num)):
                     norm_anchor = f"Q{main_num}"
                     current_main_num = main_num
@@ -869,6 +869,146 @@ def _augment_with_vlm_evidence(
         existing_all.append(new_region)
 
     return structured
+
+
+def pil_image_to_b64_as(img: Any) -> str:
+    import io
+    import base64
+    buf = io.BytesIO()
+    if hasattr(img, "mode") and img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+async def extract_answers_vlm(as_images_dict: Dict[int, Any]) -> List[AnswerCandidate]:
+    """
+    Direct 100% VLM Answer Sheet Extractor.
+    Inspects handwritten answer sheet images directly using Gemini VLM, transcribing and extracting all student answers.
+    Returns bounding box coordinates for each answer so the UI can highlight them.
+    """
+    from app.services.llm_provider import llm_complete_multimodal_with_metadata
+    import json
+    import re
+
+    candidates: List[AnswerCandidate] = []
+    order_idx = 0
+
+    prompt = """You are an expert handwritten student answer sheet examiner with computer vision capabilities.
+Inspect this handwritten answer sheet image directly.
+Transcribe and extract ALL handwritten student answers from this page into valid JSON.
+You MUST also provide the pixel bounding box (x, y, width, height) of where each answer block appears on the page.
+
+The coordinate origin is the TOP-LEFT corner of the image.
+- x: pixels from left edge to the LEFT side of the answer block
+- y: pixels from top edge to the TOP side of the answer block
+- width: pixel width of the answer block
+- height: pixel height of the answer block
+
+Return ONLY a JSON object in this exact structure (no markdown, no explanation):
+{
+  "page_width": 1240,
+  "page_height": 1754,
+  "answers": [
+    {
+      "question_number": "1",
+      "answer_text": "The SI unit of force is Newton (N).",
+      "bbox": {"x": 120, "y": 430, "width": 860, "height": 95}
+    },
+    {
+      "question_number": "2",
+      "answer_text": "Oxygen gas is released during photosynthesis.",
+      "bbox": {"x": 120, "y": 590, "width": 860, "height": 80}
+    }
+  ]
+}
+
+Instructions:
+- "question_number": the question number/label written next to or above the answer (e.g. "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "1(a)"). Clean off outer parentheses e.g. "(1)" becomes "1".
+- "answer_text": full, accurate transcription of what the student wrote for that question. Include ALL written content.
+- "bbox": the pixel bounding box of ONLY the answer text block, not the question number label. If you cannot determine the exact bbox, estimate based on the visible text position.
+- "page_width" and "page_height": the full pixel dimensions of the image page.
+- Include EVERY answer you can see on this page.
+- If a question has no visible answer, do NOT include it.
+"""
+
+    for page_num in sorted(as_images_dict.keys()):
+        img = as_images_dict[page_num]
+        b64_img = pil_image_to_b64_as(img)
+
+        # Get actual image dimensions for coordinate normalisation later
+        img_w = img.width if hasattr(img, "width") else 1240
+        img_h = img.height if hasattr(img, "height") else 1754
+
+        try:
+            raw_res, meta = await llm_complete_multimodal_with_metadata(
+                prompt=prompt,
+                image_b64=b64_img,
+                mime_type="image/jpeg",
+                purpose=f"vlm_answer_extraction_p{page_num}",
+            )
+
+            cleaned_json = raw_res.strip()
+            if "```json" in cleaned_json:
+                cleaned_json = cleaned_json.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned_json:
+                cleaned_json = cleaned_json.split("```")[1].split("```")[0].strip()
+
+            m_json = re.search(r"\{.*\}", cleaned_json, re.DOTALL)
+            if m_json:
+                cleaned_json = m_json.group(0)
+
+            data = json.loads(cleaned_json)
+            raw_ans = data.get("answers", []) if isinstance(data, dict) else []
+
+            # Page dimensions reported by VLM (used to validate coords are sensible)
+            vlm_page_w = float(data.get("page_width", img_w)) if isinstance(data, dict) else img_w
+            vlm_page_h = float(data.get("page_height", img_h)) if isinstance(data, dict) else img_h
+            # Use actual image dimensions as ground truth; scale VLM coords if needed
+            scale_x = img_w / vlm_page_w if vlm_page_w > 0 else 1.0
+            scale_y = img_h / vlm_page_h if vlm_page_h > 0 else 1.0
+
+            for a_dict in raw_ans:
+                q_num_raw = str(a_dict.get("question_number", "")).strip()
+                m_digit = re.search(r"(\d{1,3})", q_num_raw)
+                clean_q_num = m_digit.group(1) if m_digit else q_num_raw
+                a_text = str(a_dict.get("answer_text", "")).strip()
+
+                # Parse bounding box returned by VLM
+                bbox_raw = a_dict.get("bbox") or {}
+                raw_x = float(bbox_raw.get("x", 0) or 0) * scale_x
+                raw_y = float(bbox_raw.get("y", 0) or 0) * scale_y
+                raw_w = float(bbox_raw.get("width", img_w * 0.7) or img_w * 0.7) * scale_x
+                raw_h = float(bbox_raw.get("height", 60) or 60) * scale_y
+
+                # Clamp coordinates to image bounds
+                clamped_x = max(0.0, min(raw_x, img_w - 1))
+                clamped_y = max(0.0, min(raw_y, img_h - 1))
+                clamped_w = max(10.0, min(raw_w, img_w - clamped_x))
+                clamped_h = max(10.0, min(raw_h, img_h - clamped_y))
+
+                region = Region(
+                    page=page_num,
+                    bbox=BBox(x=clamped_x, y=clamped_y, width=clamped_w, height=clamped_h),
+                )
+
+                if a_text or clean_q_num:
+                    cand = AnswerCandidate(
+                        answer_id=f"ans_vlm_p{page_num}_{order_idx}",
+                        question_number=f"Q{clean_q_num}" if clean_q_num else None,
+                        text=a_text,
+                        regions=[region],
+                        order_index=order_idx,
+                    )
+                    candidates.append(cand)
+                    order_idx += 1
+                    print(f"[VLMAnswerExtractor] Q{clean_q_num} on page {page_num}: bbox=({clamped_x:.0f},{clamped_y:.0f},{clamped_w:.0f},{clamped_h:.0f})")
+
+        except Exception as e:
+            print(f"[VLMAnswerExtractor] Error parsing VLM answer response on page {page_num}: {e}")
+
+    print(f"[VLMAnswerExtractor] Total candidates with regions: {sum(1 for c in candidates if c.regions)}/{len(candidates)}")
+    return candidates
 
 
 def extract_answers(

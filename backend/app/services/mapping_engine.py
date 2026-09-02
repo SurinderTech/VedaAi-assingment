@@ -32,7 +32,7 @@ from app.services.llm_provider import llm_complete
 
 
 def _normalize_anchor_key(num_str: Optional[str]) -> str:
-    """Normalizes variations like 'Q1(a)', '1(a)', '1a', '1.a', 'Q7', '7.' -> '1(a)' / '7'."""
+    """Normalizes variations like 'Q1(a)', '1(a)', '(1)', '1a', '1.a', 'Q7', '7.' -> '1(a)' / '7'."""
     if not num_str:
         return ""
     s = num_str.strip().lower()
@@ -40,13 +40,13 @@ def _normalize_anchor_key(num_str: Optional[str]) -> str:
     s = re.sub(r"^(?:ans(?:wer)?\.?\s*)?(?:q(?:uestion)?\.?\s*)?", "", s)
     s = re.sub(r"\s*or\s*$", "", s).strip()
 
-    # Subquestion format e.g. 1(a), 1.a, 1a, 1 (a)
-    m_sub = re.match(r"^(\d{1,3})\s*[\.\s\-_]*\(?([a-z1-9])\)?$", s)
+    # Subquestion format e.g. 1(a), (1)(a), 1.a, 1a, 1 (a)
+    m_sub = re.match(r"^[\(\[]?(\d{1,3})[\)\]]?\s*[\.\s\-_]*\(?([a-z1-9])\)?$", s)
     if m_sub:
         norm = f"{m_sub.group(1)}({m_sub.group(2)})"
     else:
-        # Main question format e.g. 7., 7
-        m_main = re.match(r"^(\d{1,3})[\.\s]*$", s)
+        # Main question format e.g. 7., 7, (7), [7]
+        m_main = re.match(r"^[\(\[]?(\d{1,3})[\)\]\.\s]*$", s)
         if m_main:
             norm = m_main.group(1)
         else:
@@ -420,10 +420,71 @@ async def _resolve_ambiguity_with_llm(
                 return float(data.get("confidence", 0.85))
             else:
                 return 0.20
-        return None
     except Exception:
-        # LLM fallback safety: returns None on timeout/error so local decision is preserved
         return None
+
+
+async def map_answers_vlm(
+    questions: List[Question],
+    answers: List[AnswerCandidate],
+) -> Tuple[Dict[str, MappedAnswer], List[UnmatchedAnswer]]:
+    """
+    Direct VLM/LLM Answer Mapper.
+    Maps extracted questions to extracted student answer candidates.
+    Matches clean normalized question anchors ("1" to "1", "2" to "2", ..., "10" to "10").
+    """
+    mapped_dict: Dict[str, MappedAnswer] = {}
+    unmatched_list: List[UnmatchedAnswer] = []
+
+    # Map by normalized question number
+    ans_by_norm: Dict[str, AnswerCandidate] = {}
+    for ans in answers:
+        norm_key = _normalize_anchor_key(ans.question_number)
+        if norm_key and norm_key not in ans_by_norm:
+            ans_by_norm[norm_key] = ans
+
+    used_answer_ids = set()
+
+    for q in questions:
+        q_norm = _normalize_anchor_key(q.number)
+        matched_ans = ans_by_norm.get(q_norm)
+
+        if matched_ans:
+            used_answer_ids.add(matched_ans.answer_id)
+            mapped_dict[q.id] = MappedAnswer(
+                question_id=q.id,
+                answer_id=matched_ans.answer_id,
+                text=matched_ans.text,
+                confidence=0.98,
+                status="matched",
+                regions=matched_ans.regions,
+                provenance="VLM_DIRECT_MATCH",
+            )
+        else:
+            mapped_dict[q.id] = MappedAnswer(
+                question_id=q.id,
+                answer_id=f"empty_{q.id}",
+                text="",
+                confidence=0.0,
+                status="unanswered",
+                regions=[],
+                provenance="VLM_UNANSWERED",
+            )
+
+    # Collect unmatched answers
+    for ans in answers:
+        if ans.answer_id not in used_answer_ids:
+            unmatched_list.append(
+                UnmatchedAnswer(
+                    answer_id=ans.answer_id,
+                    text=ans.text,
+                    regions=ans.regions,
+                    confidence=0.5,
+                )
+            )
+
+    return mapped_dict, unmatched_list
+
 
 
 

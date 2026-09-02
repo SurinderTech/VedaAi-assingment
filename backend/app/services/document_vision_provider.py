@@ -54,7 +54,7 @@ class DocumentVisionProvider:
 
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         self.api_key = api_key if api_key is not None else getattr(settings, "GEMINI_API_KEY", "")
-        self.model_name = model_name or getattr(settings, "DOCUMENT_VLM_MODEL", "gemini-2.5-flash")
+        self.model_name = model_name or getattr(settings, "DOCUMENT_VLM_MODEL", "gemini-3.6-flash")
 
     def is_configured(self) -> bool:
         enabled = getattr(settings, "DOCUMENT_VLM_ENABLED", False)

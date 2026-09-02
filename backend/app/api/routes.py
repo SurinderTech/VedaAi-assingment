@@ -61,6 +61,12 @@ async def list_all():
     return store.list_assessments()
 
 
+@router.post("/clear")
+async def clear_store():
+    store.clear_all()
+    return {"status": "ok", "message": "Store cleared successfully"}
+
+
 @router.post("/assistant", response_model=AssistantResponse)
 async def global_assistant(req: AssistantRequest):
     return await process_assistant_message(None, req.message, req.question_id)

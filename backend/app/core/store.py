@@ -73,6 +73,19 @@ def _load_from_disk() -> None:
         print(f"[Store] Load from disk error: {e}")
 
 
+def clear_all() -> None:
+    """Purges all in-memory and on-disk assessment data."""
+    _assessments.clear()
+    _statuses.clear()
+    _files.clear()
+    _snapshots.clear()
+    if os.path.exists(STORE_FILE):
+        try:
+            os.remove(STORE_FILE)
+        except Exception:
+            pass
+
+
 _load_from_disk()
 
 

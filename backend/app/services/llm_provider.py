@@ -68,10 +68,10 @@ async def _call_gemini_with_metadata(
         raise LLMError(err_msg)
 
     models_to_try = [
-        settings.GEMINI_MODEL or "gemini-2.5-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
+        settings.GEMINI_MODEL or "gemini-3.6-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
         "gemini-flash-lite-latest",
     ]
     seen = set()

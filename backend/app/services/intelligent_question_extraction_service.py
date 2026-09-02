@@ -658,12 +658,16 @@ class IntelligentQuestionExtractionService:
                 ))
                 audit.rejected_count += 1
 
-        # Re-sort by reading order (page, Y) after potential promotions have been appended
-        extracted_questions.sort(key=lambda q: (
-            q.source_regions[0].page if q.source_regions else q.page,
-            q.bbox.y if q.bbox else 0,
-            q.bbox.x if q.bbox else 0,
-        ))
+        # Re-sort by natural question order (page, numeric_q_num, Y, X)
+        def _get_q_sort_key(q: Question):
+            pg = q.source_regions[0].page if q.source_regions else q.page
+            y = q.bbox.y if q.bbox else 0
+            x = q.bbox.x if q.bbox else 0
+            m_num = re.match(r"^\s*(\d{1,3})", str(q.number or ""))
+            num_val = int(m_num.group(1)) if m_num else 999
+            return (pg, num_val, y, x)
+
+        extracted_questions.sort(key=_get_q_sort_key)
         for _oi, _q in enumerate(extracted_questions):
             _q.order_index = _oi
 
@@ -716,12 +720,15 @@ class IntelligentQuestionExtractionService:
             invariant_violations=audit.invariant_violations,
         )
 
-    def _extract_display_number(self, text: str, active_parent_num: str = "1") -> str:
+    def _extract_display_number(self, text: str, active_parent_num: str = "1", fallback_index: Optional[int] = None) -> str:
         """Extracts the display question number from text like 'Q1. Explain...' -> '1' or 'a) Define...' -> '1(a)'."""
-        # Subquestion pattern with main digit: 1(a) or Q1(a)
+        # 0. Clean out any leading hex UUID prefix (e.g., 'bb78 ', '3fa8 ') if followed by real question text
+        clean_t = re.sub(r'^[a-f0-9]{4,8}\s+(?=.*[A-Za-z0-9])', '', text.strip(), flags=re.IGNORECASE)
+
+        # Subquestion pattern with main digit: 1(a) or Q1(a) or (1)(a)
         m_sub = re.match(
-            r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]",
-            text, re.IGNORECASE
+            r"^\s*(?:Q(?:uestion)?\.?\s*)?[\(\[]?(\d{1,3})[\)\]]?\s*[\.\:\-]?\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]",
+            clean_t, re.IGNORECASE
         )
         if m_sub:
             return f"{m_sub.group(1)}({m_sub.group(2).lower()})"
@@ -729,20 +736,28 @@ class IntelligentQuestionExtractionService:
         # Standalone subquestion letter: a) or (a) or a.
         m_let = re.match(
             r"^\s*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]",
-            text, re.IGNORECASE
+            clean_t, re.IGNORECASE
         )
         if m_let:
             return f"{active_parent_num}({m_let.group(1).lower()})"
 
-        # Primary main question number: Q1. or 1. or 1)
+        # Primary main question number: Q1. or 1. or 1) or (1) or [1] or 1:
         m = re.match(
-            r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\):\-]",
-            text, re.IGNORECASE
+            r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?[\(\[]?\s*(\d{1,3})\s*[\)\]\.\:\-]",
+            clean_t, re.IGNORECASE
         )
         if m:
             return m.group(1)
 
-        return str(uuid.uuid4())[:6]
+        # Fallback: search for first isolated integer in header text
+        m_search = re.search(r"^\s*(?:Q(?:uestion)?\.?\s*)?[\(\[]?\s*(\d{1,3})\b", clean_t, re.IGNORECASE)
+        if m_search:
+            return m_search.group(1)
+
+        if fallback_index is not None:
+            return str(fallback_index)
+
+        return active_parent_num
 
     def _collect_continuations(
         self,

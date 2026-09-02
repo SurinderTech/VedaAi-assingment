@@ -7,9 +7,9 @@ from app.models.schemas import (
 )
 from app.services.document_processor import process_document
 from app.services.page_intelligence import analyze_pages
-from app.services.question_extractor import extract_questions
-from app.services.answer_extractor import extract_answers
-from app.services.mapping_engine import map_answers
+from app.services.question_extractor import extract_questions, extract_questions_vlm
+from app.services.answer_extractor import extract_answers, extract_answers_vlm
+from app.services.mapping_engine import map_answers, map_answers_vlm
 from app.services.grading_service import generate_grading
 
 # Hard timeout: if processing takes longer than this, fail gracefully
@@ -44,98 +44,49 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         return
 
     try:
-        # ── STEP 1: Question Paper OCR ───────────────────────────────────────
+        # ── STEP 1: Process Question Paper ───────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_questions",
-            message="📄 Reading question paper (OCR + AI vision)...", progress=0.10))
+            message="📄 Gemini VLM reading question paper images directly...", progress=0.15))
         qp_res = await asyncio.to_thread(
-            process_document, files["question_paper"], files["question_paper_ext"], False
+            process_document, files["question_paper"], files["question_paper_ext"], True
         )
-        qp_blocks = qp_res[0]
-        qp_pages = qp_res[1]
-        qp_sizes = qp_res[2]
-        qp_images = qp_res[3] if len(qp_res) > 3 else None
-        page_sizes_dict = {i + 1: [float(w), float(h)] for i, (w, h) in enumerate(qp_sizes)} if qp_sizes else None
+        qp_blocks, qp_pages, qp_sizes, qp_images = qp_res
 
-        # ── STEP 2: VLM understanding of question paper ──────────────────────
-        store.set_status(assessment_id, AssessmentStatus(
-            assessment_id=assessment_id, state="extracting_questions",
-            message=f"🧠 AI analyzing {qp_pages} page(s) of question paper — this takes ~{qp_pages * 8}s...", progress=0.20))
+        # ── STEP 2: 100% VLM Question Extraction ──────────────────────────────
+        if qp_images:
+            questions = await extract_questions_vlm(qp_images)
+            if not questions:
+                print("[Pipeline] VLM questions extraction returned empty list on 1st attempt, retrying VLM...")
+                questions = await extract_questions_vlm(qp_images)
+        else:
+            questions = await extract_questions(qp_blocks)
 
-        from app.services.document_understanding_service import DocumentUnderstandingService
-        doc_understanding_res = await asyncio.to_thread(
-            DocumentUnderstandingService().process_document,
-            qp_blocks,
-            f"doc_{assessment_id}",
-            page_sizes_dict,
-            qp_images,
-        )
+        print(f"[Pipeline] Extracted {len(questions)} questions via Gemini VLM.")
 
-        # ── STEP 3: Extract questions ────────────────────────────────────────
-        store.set_status(assessment_id, AssessmentStatus(
-            assessment_id=assessment_id, state="extracting_questions",
-            message="🔍 Extracting questions from document structure...", progress=0.40))
-        questions = await extract_questions(
-            qp_blocks, doc_understanding_result=doc_understanding_res, page_sizes=page_sizes_dict
-        )
-
-        # ── FREE QP memory before answer-sheet OCR ───────────────────────────
-        # qp_images holds raw PIL Images for every page — can be 50-200MB on
-        # a 512 MB Render instance. Delete explicitly before the 2nd OCR call.
-        del qp_images, qp_res, doc_understanding_res
-        gc.collect()
-        print(f"[Pipeline] QP memory freed. Starting answer-sheet processing...")
-
-        # ── STEP 4: Answer Sheet OCR ─────────────────────────────────────────
+        # ── STEP 3: Process Answer Sheet ─────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="extracting_answers",
-            message="🖊️ Reading handwritten answer sheet...", progress=0.45))
+            message="🖊️ Gemini VLM reading handwritten student answer sheet images directly...", progress=0.45))
         as_res = await asyncio.to_thread(
             process_document, files["answer_sheet"], files["answer_sheet_ext"], True
         )
-        as_blocks = as_res[0]
-        as_pages = as_res[1]
-        as_sizes = as_res[2]
-        as_images = as_res[3] if len(as_res) > 3 else None
-        as_page_sizes_dict = {i + 1: [float(w), float(h)] for i, (w, h) in enumerate(as_sizes)} if as_sizes else None
+        as_blocks, as_pages, as_sizes, as_images = as_res
 
-        # ── STEP 4B: VLM understanding of the answer sheet ────────────────────
-        # The answer sheet gets the SAME genuine visual-understanding treatment as the
-        # question paper (STEP 2). Without this, answer extraction falls back to pure
-        # OCR-text regex matching, which cannot reliably read handwriting or associate
-        # a table cell's answer with its row's question number — this is the primary
-        # cause of "No answer detected" showing up for every question.
-        store.set_status(assessment_id, AssessmentStatus(
-            assessment_id=assessment_id, state="extracting_answers",
-            message=f"🧠 AI analyzing {as_pages} page(s) of answer sheet — this takes ~{as_pages * 8}s...", progress=0.50))
+        # ── STEP 4: 100% VLM Answer Extraction ───────────────────────────────
+        if as_images:
+            answers = await extract_answers_vlm(as_images)
+        else:
+            page_types, metadata_pages = analyze_pages(as_blocks, as_pages)
+            answers = extract_answers(as_blocks, metadata_pages)
 
-        from app.services.document_understanding_service import DocumentUnderstandingService
-        as_doc_understanding_res = await asyncio.to_thread(
-            DocumentUnderstandingService().process_document,
-            as_blocks,
-            f"as_doc_{assessment_id}",
-            as_page_sizes_dict,
-            as_images,
-        )
+        print(f"[Pipeline] Extracted {len(answers)} student answer candidates via Gemini VLM.")
 
-        # ── STEP 5: Extract answers ──────────────────────────────────────────
-        store.set_status(assessment_id, AssessmentStatus(
-            assessment_id=assessment_id, state="extracting_answers",
-            message="🧠 AI reading handwritten answers...", progress=0.55))
-        page_types, metadata_pages = analyze_pages(as_blocks, as_pages)
-        answers = await asyncio.to_thread(
-            extract_answers, as_blocks, metadata_pages, as_doc_understanding_res
-        )
-
-        # Free AS images before mapping/grading
-        del as_images, as_res, as_doc_understanding_res
-        gc.collect()
-
-        # ── STEP 6: Map answers to questions ─────────────────────────────────
+        # ── STEP 5: VLM/LLM Mapping ──────────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(
             assessment_id=assessment_id, state="mapping",
-            message="🔗 Mapping answers to questions...", progress=0.75))
-        mapped, unmatched = await map_answers(questions, answers)
+            message="🔗 VLM/LLM mapping student answers to questions...", progress=0.75))
+        mapped, unmatched = await map_answers_vlm(questions, answers)
 
         # ── STEP 7: Grade all questions ──────────────────────────────────────
         store.set_status(assessment_id, AssessmentStatus(

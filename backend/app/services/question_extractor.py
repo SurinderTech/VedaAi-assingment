@@ -22,15 +22,15 @@ from app.services.llm_provider import llm_complete_json
 
 # --- Regex Patterns for Question Numbering Syntax ---
 
-# Combined main + subquestion: e.g. 1(a), 1. (a), Q1(a), 11(a), 11-a, Q.1(a)
+# Combined main + subquestion: e.g. 1(a), (1)(a), 1. (a), Q1(a), 11(a), 11-a, Q.1(a)
 COMBINED_Q_RE = re.compile(
-    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\:\-\s]*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)$",
+    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?[\(\[]?\s*(\d{1,3})\s*[\)\]]?\s*[\.\:\-\s]*[\(\[]?\s*([a-z]{1,2})\s*[\)\]\.\:]\s*(.*)$",
     re.IGNORECASE
 )
 
-# Main question marker: e.g. 1., 1), Q1, Q1., Q.1, Q 1, Question 1:, Q 1.
+# Main question marker: e.g. 1., 1), (1), [1], Q1, Q1., Q.1, Q 1, Question 1:, Q 1.
 MAIN_Q_RE = re.compile(
-    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?(\d{1,3})\s*[\.\):\-]\s*(.*)$",
+    r"^\s*(?:Q(?:uestion)?\.?\s*|Ans(?:wer)?\.?\s*)?[\(\[]?\s*(\d{1,3})\s*[\)\]\.\:\-]\s*(.*)$",
     re.IGNORECASE
 )
 
@@ -467,6 +467,116 @@ def _has_semantic_question_structure(doc_understanding_result: Optional[Any]) ->
         return any(getattr(r, "region_type", None) == "QUESTION" for r in doc_understanding_result.regions)
 
     return False
+
+
+def pil_image_to_b64(img: Any) -> str:
+    import io
+    import base64
+    buf = io.BytesIO()
+    if hasattr(img, "mode") and img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question]:
+    """
+    Direct 100% VLM Question Paper Extractor.
+    Inspects Question Paper page images directly using Gemini VLM, extracting structured questions.
+    """
+    from app.services.llm_provider import llm_complete_multimodal_with_metadata
+    import json
+    import re
+
+    all_questions: List[Question] = []
+    order_idx = 0
+
+    prompt = """You are an expert exam paper analyzer and examiner assistant.
+Inspect this question paper image directly. Extract ALL questions from this page cleanly into a JSON object.
+
+Return ONLY a JSON object in this exact structure:
+{
+  "questions": [
+    {
+      "number": "1",
+      "text": "What is the SI unit of force?",
+      "max_marks": 2.0,
+      "question_type": "SHORT_ANSWER",
+      "options": []
+    }
+  ]
+}
+
+Instructions:
+- "number": clean display question number as seen on the paper, e.g. "1", "2", "3(a)", "4", "5", "6", "7", "8", "9", "10". Do NOT use internal UUIDs or hex values.
+- "text": full, accurate question prompt text transcribed directly from the image.
+- "max_marks": marks allocated to the question (numeric, default 2.0).
+- "question_type": "MCQ", "SHORT_ANSWER", "LONG_ANSWER", or "NUMERICAL".
+- "options": list of option strings if question is MCQ, otherwise empty list [].
+"""
+
+    for page_num in sorted(qp_images_dict.keys()):
+        img = qp_images_dict[page_num]
+        b64_img = pil_image_to_b64(img)
+
+        try:
+            raw_res, meta = await llm_complete_multimodal_with_metadata(
+                prompt=prompt,
+                image_b64=b64_img,
+                mime_type="image/jpeg",
+                purpose=f"vlm_question_extraction_p{page_num}",
+            )
+            
+            cleaned_json = raw_res.strip()
+            if "```json" in cleaned_json:
+                cleaned_json = cleaned_json.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned_json:
+                cleaned_json = cleaned_json.split("```")[1].split("```")[0].strip()
+            
+            m_json = re.search(r"\{.*\}", cleaned_json, re.DOTALL)
+            if m_json:
+                cleaned_json = m_json.group(0)
+
+            data = json.loads(cleaned_json)
+            raw_qs = data.get("questions", []) if isinstance(data, dict) else []
+
+            for q_dict in raw_qs:
+                raw_num = str(q_dict.get("number", order_idx + 1)).strip()
+                m_digit = re.search(r"(\d{1,3})", raw_num)
+                clean_num = m_digit.group(1) if m_digit else str(order_idx + 1)
+                
+                q_text = str(q_dict.get("text", "")).strip()
+                m_marks = float(q_dict.get("max_marks", 2.0) or 2.0)
+                q_type = str(q_dict.get("question_type", "SHORT_ANSWER")).upper()
+                opts = q_dict.get("options", []) or []
+
+                if q_text:
+                    q_obj = Question(
+                        id=f"Q{clean_num}",
+                        number=clean_num,
+                        text=q_text,
+                        page=page_num,
+                        order_index=order_idx,
+                        question_type=q_type, # type: ignore
+                        options=opts,
+                    )
+                    all_questions.append(q_obj)
+                    order_idx += 1
+
+        except Exception as e:
+            print(f"[VLMQuestionExtractor] Error parsing VLM response on page {page_num}: {e}")
+
+    # Natural numeric sorting
+    def _sort_key(q: Question):
+        m = re.match(r"^\s*(\d{1,3})", q.number)
+        val = int(m.group(1)) if m else 999
+        return (q.page, val, q.order_index)
+
+    all_questions.sort(key=_sort_key)
+    for idx, q in enumerate(all_questions):
+        q.order_index = idx
+
+    return all_questions
 
 
 async def extract_questions(
