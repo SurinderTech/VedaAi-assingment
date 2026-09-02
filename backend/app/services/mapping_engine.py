@@ -40,8 +40,8 @@ def _normalize_anchor_key(num_str: Optional[str]) -> str:
     s = re.sub(r"^(?:ans(?:wer)?\.?\s*)?(?:q(?:uestion)?\.?\s*)?", "", s)
     s = re.sub(r"\s*or\s*$", "", s).strip()
 
-    # Subquestion format e.g. 1(a), (1)(a), 1.a, 1a, 1 (a)
-    m_sub = re.match(r"^[\(\[]?(\d{1,3})[\)\]]?\s*[\.\s\-_]*\(?([a-z1-9])\)?$", s)
+    # Subquestion format e.g. 1(a), (1)(a), 1.a, 1a, 1 (a), 5(i), 5(ii), 5(iv)
+    m_sub = re.match(r"^[\(\[]?(\d{1,3})[\)\]]?\s*[\.\s\-_]*\(?([a-z]{1,2}|[ivxlcdm]{1,4})\)?$", s)
     if m_sub:
         norm = f"{m_sub.group(1)}({m_sub.group(2)})"
     else:
@@ -431,35 +431,47 @@ async def map_answers_vlm(
     """
     Direct VLM/LLM Answer Mapper.
     Maps extracted questions to extracted student answer candidates.
-    Matches clean normalized question anchors ("1" to "1", "2" to "2", ..., "10" to "10").
+    Supports:
+    - Clean normalized question anchors ("1" to "1", "5(a)" to "5(a)", "5(i)" to "5(i)")
+    - Multiple answer segments / continuations belonging to the same question
+    - Preserves exact physical coordinates (bounding boxes) for highlighting
+    - Explicitly detects and flags unanswered questions
     """
     mapped_dict: Dict[str, MappedAnswer] = {}
     unmatched_list: List[UnmatchedAnswer] = []
 
-    # Map by normalized question number
-    ans_by_norm: Dict[str, AnswerCandidate] = {}
+    # Group all answer candidates by normalized question number
+    ans_by_norm: Dict[str, List[AnswerCandidate]] = {}
     for ans in answers:
         norm_key = _normalize_anchor_key(ans.question_number)
-        if norm_key and norm_key not in ans_by_norm:
-            ans_by_norm[norm_key] = ans
+        if norm_key:
+            ans_by_norm.setdefault(norm_key, []).append(ans)
 
-    used_answer_ids = set()
+    used_answer_ids: Set[str] = set()
 
     for q in questions:
         q_norm = _normalize_anchor_key(q.number)
-        matched_ans = ans_by_norm.get(q_norm)
+        matched_candidates = ans_by_norm.get(q_norm, [])
 
-        if matched_ans:
-            used_answer_ids.add(matched_ans.answer_id)
+        if matched_candidates:
+            for c in matched_candidates:
+                used_answer_ids.add(c.answer_id)
+
+            combined_text = "\n".join(c.text for c in matched_candidates if c.text)
+            combined_regions = []
+            for c in matched_candidates:
+                combined_regions.extend(c.regions)
+
             mapped_dict[q.id] = MappedAnswer(
                 question_id=q.id,
-                answer_id=matched_ans.answer_id,
-                text=matched_ans.text,
+                answer_id=matched_candidates[0].answer_id,
+                text=combined_text,
                 confidence=0.98,
                 status="matched",
-                regions=matched_ans.regions,
+                regions=combined_regions,
                 provenance="VLM_DIRECT_MATCH",
             )
+            print(f"[VLMAnswerMapper] Mapped Q{q.number} -> '{combined_text[:40]}' ({len(combined_regions)} regions)")
         else:
             mapped_dict[q.id] = MappedAnswer(
                 question_id=q.id,
@@ -470,8 +482,9 @@ async def map_answers_vlm(
                 regions=[],
                 provenance="VLM_UNANSWERED",
             )
+            print(f"[VLMAnswerMapper] Q{q.number} marked as UNANSWERED")
 
-    # Collect unmatched answers
+    # Collect unmatched answers (e.g. extra student answers not in question paper)
     for ans in answers:
         if ans.answer_id not in used_answer_ids:
             unmatched_list.append(

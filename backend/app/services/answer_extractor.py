@@ -881,11 +881,59 @@ def pil_image_to_b64_as(img: Any) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+_UUID_AS_RE = re.compile(r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _clean_answer_question_ref(s: str) -> str:
+    """
+    Cleans and normalizes a question number reference from an answer sheet.
+    Preserves subquestion numbers:
+      "1(a)" -> "1(a)"
+      "Ans 1(a)." -> "1(a)"
+      "Q.1" -> "1"
+      "1." -> "1"
+      "(1)" -> "1"
+      "5(b)" -> "5(b)"
+    Rejects UUIDs, empty strings, and false positives.
+    """
+    if not s or not s.strip():
+        return ""
+    t = s.strip()
+    if _UUID_AS_RE.match(t):
+        return ""
+    # Strip leading "Ans", "Answer", "Q", "Question"
+    t = re.sub(r"^(?:Ans(?:wer)?|Q(?:uestion)?)\.?\s*", "", t, flags=re.IGNORECASE).strip()
+    # Strip trailing periods, colons, dashes
+    t = t.rstrip(".:-").strip()
+    # Check format like (1) -> 1
+    m_paren_single = re.match(r"^[\(\[](\d{1,3})[\)\]]$", t)
+    if m_paren_single:
+        return m_paren_single.group(1)
+    # Check format like 1(a), (1)(a), 1.a, 1-a
+    m_sub = re.match(r"^[\(\[]?(\d{1,3})[\)\]]?\s*[\.\:\-\s]*[\(\[]?([a-zA-Z]{1,2}|[ivxIVX]{1,4})[\)\]]?$", t)
+    if m_sub:
+        return f"{m_sub.group(1)}({m_sub.group(2).lower()})"
+    # Check pure number e.g. "1", "12"
+    m_num = re.match(r"^(\d{1,3})$", t)
+    if m_num:
+        return m_num.group(1)
+    # Return cleaned string if reasonable length and begins with digit
+    if len(t) <= 12 and re.match(r"^\d{1,3}", t):
+        return t
+    return ""
+
+
 async def extract_answers_vlm(as_images_dict: Dict[int, Any]) -> List[AnswerCandidate]:
     """
     Direct 100% VLM Answer Sheet Extractor.
-    Inspects handwritten answer sheet images directly using Gemini VLM, transcribing and extracting all student answers.
-    Returns bounding box coordinates for each answer so the UI can highlight them.
+    Inspects student answer sheet images directly using Gemini VLM, transcribing and extracting all student answers.
+    Handles:
+    - Handwritten answers (faithful visual transcription)
+    - Printed / digital text
+    - MCQ selections (e.g. "(D)", "B", circled option, ticked box, or answer table rows)
+    - Subquestion answers (e.g. "5(a)", "5(b)") without collapsing to "5"
+    - Table-based answers (e.g. Q.No | Answer)
+    - Returns bounding box coordinates for each answer so the UI can highlight them.
     """
     from app.services.llm_provider import llm_complete_multimodal_with_metadata
     import json
@@ -894,16 +942,9 @@ async def extract_answers_vlm(as_images_dict: Dict[int, Any]) -> List[AnswerCand
     candidates: List[AnswerCandidate] = []
     order_idx = 0
 
-    prompt = """You are an expert handwritten student answer sheet examiner with computer vision capabilities.
-Inspect this handwritten answer sheet image directly.
-Transcribe and extract ALL handwritten student answers from this page into valid JSON.
-You MUST also provide the pixel bounding box (x, y, width, height) of where each answer block appears on the page.
-
-The coordinate origin is the TOP-LEFT corner of the image.
-- x: pixels from left edge to the LEFT side of the answer block
-- y: pixels from top edge to the TOP side of the answer block
-- width: pixel width of the answer block
-- height: pixel height of the answer block
+    prompt = """You are an expert exam evaluator with human-like vision and visual document understanding.
+Inspect this student ANSWER SHEET image directly.
+Identify and extract EVERY student answer written or selected on this page into valid JSON.
 
 Return ONLY a JSON object in this exact structure (no markdown, no explanation):
 {
@@ -912,33 +953,41 @@ Return ONLY a JSON object in this exact structure (no markdown, no explanation):
   "answers": [
     {
       "question_number": "1",
-      "answer_text": "The SI unit of force is Newton (N).",
-      "bbox": {"x": 120, "y": 430, "width": 860, "height": 95}
+      "answer_text": "(D) Combustion",
+      "bbox": {"x": 120, "y": 430, "width": 860, "height": 75}
     },
     {
-      "question_number": "2",
-      "answer_text": "Oxygen gas is released during photosynthesis.",
-      "bbox": {"x": 120, "y": 590, "width": 860, "height": 80}
+      "question_number": "5(a)",
+      "answer_text": "Photosynthesis is the process by which green plants convert sunlight into chemical energy.",
+      "bbox": {"x": 120, "y": 550, "width": 860, "height": 120}
     }
   ]
 }
 
-Instructions:
-- "question_number": the question number/label written next to or above the answer (e.g. "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "1(a)"). Clean off outer parentheses e.g. "(1)" becomes "1".
-- "answer_text": full, accurate transcription of what the student wrote for that question. Include ALL written content.
-- "bbox": the pixel bounding box of ONLY the answer text block, not the question number label. If you cannot determine the exact bbox, estimate based on the visible text position.
-- "page_width" and "page_height": the full pixel dimensions of the image page.
-- Include EVERY answer you can see on this page.
-- If a question has no visible answer, do NOT include it.
+CRITICAL RULES:
+1. "question_number": The question number this answer responds to.
+   - For regular questions: "1", "2", "3", etc.
+   - For subquestions: PRESERVE subquestion parts like "1(a)", "1(b)", "5(i)", "5(ii)". DO NOT strip "(a)" or "(b)".
+   - Clean outer prefix/punctuation: e.g. "Ans 1." -> "1", "Q.2" -> "2", "Ans 5(a)" -> "5(a)".
+2. "answer_text": Full, faithful transcription of what the student wrote or selected.
+   - For MCQs: extract the selected option letter and text, e.g. "(D) Combustion", "B", or "C".
+     Even if the student circled a letter, ticked an option, or wrote "(C)" in a table cell, transcribe it.
+   - For handwriting: read what the human hand actually wrote. Do not invent words.
+3. "bbox": Pixel bounding box of the answer content: {"x": left, "y": top, "width": width, "height": height}.
+   - The origin (0,0) is TOP-LEFT of the image.
+   - BBox should encompass the answer text/selection region so teachers can see the evidence.
+4. "page_width" and "page_height": Pixel dimensions of this image.
+5. Extract ALL answers visible on this page. If a question is not answered on this page, do NOT include it.
+6. Do NOT extract exam headers, metadata ("Name", "Roll No"), or page numbers as answers.
 """
 
     for page_num in sorted(as_images_dict.keys()):
         img = as_images_dict[page_num]
         b64_img = pil_image_to_b64_as(img)
 
-        # Get actual image dimensions for coordinate normalisation later
-        img_w = img.width if hasattr(img, "width") else 1240
-        img_h = img.height if hasattr(img, "height") else 1754
+        # Get actual image dimensions for coordinate normalization
+        img_w = getattr(img, "width", 1240) if hasattr(img, "width") else 1240
+        img_h = getattr(img, "height", 1754) if hasattr(img, "height") else 1754
 
         try:
             raw_res, meta = await llm_complete_multimodal_with_metadata(
@@ -961,24 +1010,32 @@ Instructions:
             data = json.loads(cleaned_json)
             raw_ans = data.get("answers", []) if isinstance(data, dict) else []
 
-            # Page dimensions reported by VLM (used to validate coords are sensible)
+            # Page dimensions reported by VLM
             vlm_page_w = float(data.get("page_width", img_w)) if isinstance(data, dict) else img_w
             vlm_page_h = float(data.get("page_height", img_h)) if isinstance(data, dict) else img_h
-            # Use actual image dimensions as ground truth; scale VLM coords if needed
             scale_x = img_w / vlm_page_w if vlm_page_w > 0 else 1.0
             scale_y = img_h / vlm_page_h if vlm_page_h > 0 else 1.0
 
             for a_dict in raw_ans:
                 q_num_raw = str(a_dict.get("question_number", "")).strip()
-                m_digit = re.search(r"(\d{1,3})", q_num_raw)
-                clean_q_num = m_digit.group(1) if m_digit else q_num_raw
+                # ----------------------------------------------------------------
+                # CRITICAL FIX: DO NOT strip subquestion letters.
+                # Old code: m_digit = re.search(r"(\d{1,3})", q_num_raw)
+                #           clean_q_num = m_digit.group(1)  <- DESTROYED "1(a)" -> "1"
+                # New code: Use _clean_answer_question_ref to preserve subquestion letters!
+                # ----------------------------------------------------------------
+                clean_q_num = _clean_answer_question_ref(q_num_raw)
+                if not clean_q_num and q_num_raw:
+                    # Defensive fallback: keep raw alphanumeric if reasonable
+                    clean_q_num = re.sub(r"[^\w\(\)\.]", "", q_num_raw)
+
                 a_text = str(a_dict.get("answer_text", "")).strip()
 
                 # Parse bounding box returned by VLM
                 bbox_raw = a_dict.get("bbox") or {}
                 raw_x = float(bbox_raw.get("x", 0) or 0) * scale_x
                 raw_y = float(bbox_raw.get("y", 0) or 0) * scale_y
-                raw_w = float(bbox_raw.get("width", img_w * 0.7) or img_w * 0.7) * scale_x
+                raw_w = float(bbox_raw.get("width", img_w * 0.7) or (img_w * 0.7)) * scale_x
                 raw_h = float(bbox_raw.get("height", 60) or 60) * scale_y
 
                 # Clamp coordinates to image bounds
@@ -1002,7 +1059,7 @@ Instructions:
                     )
                     candidates.append(cand)
                     order_idx += 1
-                    print(f"[VLMAnswerExtractor] Q{clean_q_num} on page {page_num}: bbox=({clamped_x:.0f},{clamped_y:.0f},{clamped_w:.0f},{clamped_h:.0f})")
+                    print(f"[VLMAnswerExtractor] Q{clean_q_num} on page {page_num}: text='{a_text[:45]}' bbox=({clamped_x:.0f},{clamped_y:.0f},{clamped_w:.0f},{clamped_h:.0f})")
 
         except Exception as e:
             print(f"[VLMAnswerExtractor] Error parsing VLM answer response on page {page_num}: {e}")

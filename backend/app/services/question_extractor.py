@@ -479,10 +479,39 @@ def pil_image_to_b64(img: Any) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$", re.IGNORECASE)
+_VALID_QNUM_RE = re.compile(r"^\d{1,3}(?:[\(\[]?[a-z]{1,2}[\)\]]?|[\-\.][ivxlIVXL]{1,4})?$", re.IGNORECASE)
+
+
+def _is_valid_question_number(s: str) -> bool:
+    """
+    Returns True if s looks like a real question number from a question paper.
+    Accepts: "1", "12", "3(a)", "5(i)", "10(ii)", "2b", "Q3"
+    Rejects: UUID hex strings, empty strings, purely alphabetic strings.
+    """
+    if not s or not s.strip():
+        return False
+    t = s.strip()
+    # Reject UUID-like strings the VLM sometimes hallucinates
+    if _UUID_RE.match(t):
+        return False
+    # Strip leading Q/q prefix before checking
+    if t.lower().startswith("q"):
+        t = t[1:].strip().lstrip(".")
+    return bool(_VALID_QNUM_RE.match(t))
+
+
 async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question]:
     """
     Direct 100% VLM Question Paper Extractor.
     Inspects Question Paper page images directly using Gemini VLM, extracting structured questions.
+
+    Key fixes vs old implementation:
+    - DOES NOT strip subquestion letters ("3(a)" preserved as "3(a)", not collapsed to "3")
+    - Captures bbox coordinates for each question
+    - Captures parent_question_number to build hierarchy
+    - Captures marks where visible
+    - Strengthened prompt: explicitly excludes metadata, titles, instructions, section headers
     """
     from app.services.llm_provider import llm_complete_multimodal_with_metadata
     import json
@@ -491,10 +520,10 @@ async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question
     all_questions: List[Question] = []
     order_idx = 0
 
-    prompt = """You are an expert exam paper analyzer and examiner assistant.
-Inspect this question paper image directly. Extract ALL questions from this page cleanly into a JSON object.
+    prompt = """You are an expert exam paper analyzer. You are looking at a QUESTION PAPER image.
+Your task: extract every ASSESSABLE QUESTION that a student must answer.
 
-Return ONLY a JSON object in this exact structure:
+Return ONLY valid JSON in this exact structure (no markdown, no explanation):
 {
   "questions": [
     {
@@ -502,22 +531,68 @@ Return ONLY a JSON object in this exact structure:
       "text": "What is the SI unit of force?",
       "max_marks": 2.0,
       "question_type": "SHORT_ANSWER",
-      "options": []
+      "options": [],
+      "bbox": {"x": 120, "y": 430, "width": 860, "height": 45},
+      "parent_question_number": null
+    },
+    {
+      "number": "5(a)",
+      "text": "Define photosynthesis.",
+      "max_marks": 2.0,
+      "question_type": "SHORT_ANSWER",
+      "options": [],
+      "bbox": {"x": 120, "y": 650, "width": 860, "height": 45},
+      "parent_question_number": "5"
+    },
+    {
+      "number": "8",
+      "text": "Which planet is known as the Red Planet?",
+      "max_marks": 1.0,
+      "question_type": "MCQ",
+      "options": ["A. Earth", "B. Mars", "C. Jupiter", "D. Venus"],
+      "bbox": {"x": 120, "y": 900, "width": 860, "height": 90},
+      "parent_question_number": null
     }
   ]
 }
 
-Instructions:
-- "number": clean display question number as seen on the paper, e.g. "1", "2", "3(a)", "4", "5", "6", "7", "8", "9", "10". Do NOT use internal UUIDs or hex values.
-- "text": full, accurate question prompt text transcribed directly from the image.
-- "max_marks": marks allocated to the question (numeric, default 2.0).
-- "question_type": "MCQ", "SHORT_ANSWER", "LONG_ANSWER", or "NUMERICAL".
-- "options": list of option strings if question is MCQ, otherwise empty list [].
+FIELD RULES:
+- "number": Copy the EXACT question number as printed. PRESERVE subpart letters.
+  CORRECT: "1", "2", "3(a)", "3(b)", "5(i)", "5(ii)", "Q4", "10"
+  WRONG: Do NOT simplify "3(a)" → "3". Do NOT use UUIDs or hex IDs.
+- "text": The full question text that the student reads and responds to.
+- "max_marks": Numeric marks for this question/subpart. Look for (2), [5 Marks], etc. Use 0 if not visible.
+- "question_type": "MCQ" | "SHORT_ANSWER" | "LONG_ANSWER" | "NUMERICAL"
+- "options": For MCQ, list each option string including its label ("A. Earth", "B. Mars", ...). Empty [] for non-MCQ.
+- "bbox": Pixel bounding box of the question text in this image.
+  {"x": pixels_from_left, "y": pixels_from_top, "width": pixel_width, "height": pixel_height}
+  Estimate based on where you visually see the text. Top-left origin.
+- "parent_question_number": For subquestions, write the parent number (e.g. "5" for "5(a)"). null for top-level.
+
+WHAT TO INCLUDE:
+- Numbered questions the student must answer
+- MCQ questions with their options
+- Subquestions and subparts — each as a SEPARATE entry, with parent_question_number set
+- Multi-line questions (combine all lines into one "text" field)
+
+WHAT TO EXCLUDE (these are NOT questions — do NOT include them):
+- Document title: "SCIENCE QUESTION PAPER", "FINAL EXAMINATION"
+- Metadata: class, school, date, time, maximum marks, subject code
+- Student fields: "Name: _____", "Roll No: _____"
+- Instructions: "Attempt any four", "All questions are compulsory", "Read carefully"
+- Section headers: "SECTION A", "PART B", "GROUP I"
+- Page numbers, watermarks, footers
+- Parent-header-only items like "5. Answer the following:" that have NO answerable content themselves
+  (their subquestions like 5(a), 5(b) etc. should be included with parent_question_number="5")
 """
 
     for page_num in sorted(qp_images_dict.keys()):
         img = qp_images_dict[page_num]
         b64_img = pil_image_to_b64(img)
+
+        # Track actual image dimensions for bbox validation
+        img_w = getattr(img, "width", 1240) if hasattr(img, "width") else 1240
+        img_h = getattr(img, "height", 1754) if hasattr(img, "height") else 1754
 
         try:
             raw_res, meta = await llm_complete_multimodal_with_metadata(
@@ -526,13 +601,13 @@ Instructions:
                 mime_type="image/jpeg",
                 purpose=f"vlm_question_extraction_p{page_num}",
             )
-            
+
             cleaned_json = raw_res.strip()
             if "```json" in cleaned_json:
                 cleaned_json = cleaned_json.split("```json")[1].split("```")[0].strip()
             elif "```" in cleaned_json:
                 cleaned_json = cleaned_json.split("```")[1].split("```")[0].strip()
-            
+
             m_json = re.search(r"\{.*\}", cleaned_json, re.DOTALL)
             if m_json:
                 cleaned_json = m_json.group(0)
@@ -541,41 +616,110 @@ Instructions:
             raw_qs = data.get("questions", []) if isinstance(data, dict) else []
 
             for q_dict in raw_qs:
-                raw_num = str(q_dict.get("number", order_idx + 1)).strip()
-                m_digit = re.search(r"(\d{1,3})", raw_num)
-                clean_num = m_digit.group(1) if m_digit else str(order_idx + 1)
-                
+                # ----------------------------------------------------------------
+                # CRITICAL FIX: DO NOT strip subquestion letters.
+                # Old code: m_digit = re.search(r"(\d{1,3})", raw_num)
+                #           clean_num = m_digit.group(1)  ← DESTROYED "3(a)" → "3"
+                # New code: Preserve the full number the VLM returns.
+                # ----------------------------------------------------------------
+                raw_num = str(q_dict.get("number", "")).strip()
+                if not _is_valid_question_number(raw_num):
+                    # Fallback: try to extract number+subpart together
+                    m_fallback = re.search(
+                        r"(\d{1,3}(?:[\(\[][a-z]{1,3}[\)\]])?)",
+                        raw_num, re.IGNORECASE
+                    )
+                    raw_num = m_fallback.group(1) if m_fallback else str(order_idx + 1)
+
+                # Strip leading Q/q prefix if present ("Q3(a)" → "3(a)")
+                clean_num = raw_num.strip()
+                if clean_num.lower().startswith("q"):
+                    clean_num = clean_num[1:].strip().lstrip(".")
+
                 q_text = str(q_dict.get("text", "")).strip()
-                m_marks = float(q_dict.get("max_marks", 2.0) or 2.0)
-                q_type = str(q_dict.get("question_type", "SHORT_ANSWER")).upper()
+                try:
+                    m_marks = float(q_dict.get("max_marks", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    m_marks = 0.0
+
+                q_type_raw = str(q_dict.get("question_type", "SHORT_ANSWER")).upper().strip()
+                # Normalize to known types
+                q_type = q_type_raw if q_type_raw in (
+                    "MCQ", "SHORT_ANSWER", "LONG_ANSWER", "NUMERICAL", "SUBQUESTION", "UNKNOWN"
+                ) else "SHORT_ANSWER"
+
                 opts = q_dict.get("options", []) or []
+                if not isinstance(opts, list):
+                    opts = [str(opts)]
+                opts = [str(o).strip() for o in opts if str(o).strip()]
+
+                # Extract bbox from VLM response (preserve coordinates for highlighting)
+                bbox_raw = q_dict.get("bbox") or {}
+                q_bbox: Optional[BBox] = None
+                if isinstance(bbox_raw, dict):
+                    try:
+                        bx = float(bbox_raw.get("x", 0) or 0)
+                        by = float(bbox_raw.get("y", 0) or 0)
+                        bw = float(bbox_raw.get("width", 0) or 0)
+                        bh = float(bbox_raw.get("height", 0) or 0)
+                        if bw > 0 and bh > 0:
+                            # Clamp to image bounds
+                            bx = max(0.0, min(bx, img_w - 1))
+                            by = max(0.0, min(by, img_h - 1))
+                            bw = max(1.0, min(bw, img_w - bx))
+                            bh = max(1.0, min(bh, img_h - by))
+                            q_bbox = BBox(x=bx, y=by, width=bw, height=bh)
+                    except (TypeError, ValueError):
+                        q_bbox = None
+
+                # Capture parent question number for subquestion hierarchy
+                parent_q_num_raw = q_dict.get("parent_question_number") or None
+                parent_q_id: Optional[str] = None
+                if parent_q_num_raw and str(parent_q_num_raw).strip():
+                    pn = str(parent_q_num_raw).strip()
+                    if pn.lower().startswith("q"):
+                        pn = pn[1:].strip().lstrip(".")
+                    if pn and _is_valid_question_number(pn):
+                        parent_q_id = f"Q{pn}"
 
                 if q_text:
+                    q_id = f"Q{clean_num}"
                     q_obj = Question(
-                        id=f"Q{clean_num}",
+                        id=q_id,
                         number=clean_num,
                         text=q_text,
                         page=page_num,
+                        bbox=q_bbox,
                         order_index=order_idx,
-                        question_type=q_type, # type: ignore
+                        question_type=q_type,  # type: ignore
                         options=opts,
+                        parent_question_id=parent_q_id,
+                        extraction_confidence=1.0 if meta.get("vlm_result") == "SUCCESS" else 0.5,
                     )
                     all_questions.append(q_obj)
                     order_idx += 1
+                    print(
+                        f"[VLMQuestionExtractor] Q{clean_num}"
+                        f" (parent={parent_q_id}, type={q_type}, marks={m_marks})"
+                        f" page={page_num}: '{q_text[:55]}'"
+                    )
 
         except Exception as e:
             print(f"[VLMQuestionExtractor] Error parsing VLM response on page {page_num}: {e}")
 
-    # Natural numeric sorting
+    # Natural sort: page → leading integer → subpart letter → original order
     def _sort_key(q: Question):
         m = re.match(r"^\s*(\d{1,3})", q.number)
         val = int(m.group(1)) if m else 999
-        return (q.page, val, q.order_index)
+        sub_m = re.search(r"[\(\[]([a-z]{1,2}|i{1,3}v?|vi{0,3})[\)\]]", q.number, re.IGNORECASE)
+        sub_val = ord(sub_m.group(1).lower()[0]) if sub_m else -1
+        return (q.page, val, sub_val, q.order_index)
 
     all_questions.sort(key=_sort_key)
     for idx, q in enumerate(all_questions):
         q.order_index = idx
 
+    print(f"[VLMQuestionExtractor] Total extracted: {len(all_questions)} questions across {len(qp_images_dict)} page(s)")
     return all_questions
 
 

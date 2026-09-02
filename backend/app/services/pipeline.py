@@ -62,6 +62,13 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         else:
             questions = await extract_questions(qp_blocks)
 
+        if not questions:
+            raise RuntimeError(
+                "VLM Question Extraction failed: 0 questions extracted from the question paper. "
+                "This indicates a VLM provider error (authentication, quota, timeout) or unreadable document. "
+                "The pipeline will not masquerade VLM failure as '0 questions found'."
+            )
+
         print(f"[Pipeline] Extracted {len(questions)} questions via Gemini VLM.")
 
         # ── STEP 3: Process Answer Sheet ─────────────────────────────────────
