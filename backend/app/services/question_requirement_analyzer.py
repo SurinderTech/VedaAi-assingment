@@ -14,9 +14,13 @@ from app.models.schemas import Question, QuestionRequirementSpec, QuestionType
 
 def resolve_marks_from_context(question: Question) -> Tuple[float, str]:
     """
-    Dynamically determines expected max marks from explicit question text, section instructions,
+    Dynamically determines expected max marks from explicit VLM extraction, question text,
     or structural context without hardcoding specific question numbers.
     """
+    # 0. Prioritize marks visually extracted by the VLM
+    if getattr(question, "max_marks", None) is not None and float(question.max_marks) > 0:
+        return float(question.max_marks), "vlm_direct"
+
     text = question.text or ""
     sec = question.section or ""
     

@@ -11,13 +11,26 @@ import {
   AssessmentInsights,
 } from "@/types/assessment";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export function getApiUrl(): string {
+  if (typeof window !== "undefined") {
+    if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+      return "http://localhost:8000";
+    }
+  }
+  const envUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (envUrl && envUrl.trim() && !envUrl.includes("modal.run")) {
+    return envUrl.trim().replace(/\/+$/, "");
+  }
+  return "http://localhost:8000";
+}
+
+const API_URL = "http://localhost:8000";
 
 export async function uploadAssessment(questionPaper: File, answerSheet: File): Promise<string> {
   const form = new FormData();
   form.append("question_paper", questionPaper);
   form.append("answer_sheet", answerSheet);
-  const res = await fetch(`${API_URL}/api/assessment/upload`, { method: "POST", body: form });
+  const res = await fetch(`${getApiUrl()}/api/assessment/upload`, { method: "POST", body: form });
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
   const data = await res.json();
   return data.assessment_id as string;

@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import Sidebar from "@/components/Sidebar";
 import Header from "@/components/Header";
-import { uploadAssessment, startProcessing } from "@/lib/api";
+import { uploadAssessment, startProcessing, getApiUrl } from "@/lib/api";
 
 function UploadCard({
   label,
@@ -116,6 +116,7 @@ export default function UploadPage() {
     setSubmitting(true);
     setError(null);
     try {
+      console.log("[VedaAI] Uploading assessment to:", getApiUrl());
       const id = await uploadAssessment(questionPaper, answerSheet);
       await startProcessing(id);
       router.push(`/assessment/${id}/processing`);

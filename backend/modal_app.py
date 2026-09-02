@@ -34,11 +34,8 @@ image = (
     # Maximises in-memory cache hits and eliminates cold-start latency.
     # Combined with max_containers=1 this means exactly one warm container
     # handles all traffic at all times.
-    min_containers=1,
-    # scaledown_window: how long (seconds) a container can remain idle before
-    # Modal considers scaling it down. min_containers=1 overrides scale-to-zero,
-    # but this acts as belt-and-suspenders for unusual Modal infrastructure events.
-    scaledown_window=600,
+    min_containers=0,
+    scaledown_window=300,
     # Single container guarantees all requests share the same Python process
     # and the same in-memory _assessments / _statuses / _files dicts.
     max_containers=1,

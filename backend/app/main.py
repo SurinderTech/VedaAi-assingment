@@ -7,34 +7,16 @@ from app.api.routes import router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-warm slow models at server startup so first user request is fast."""
-    print("[Startup] Pre-warming OCR engine and VLM provider...")
+    """Pre-warm multimodal VLM providers at server startup so first user request is fast."""
+    print("[Startup] Initializing VedaAI VLM Document Intelligence...")
 
-    # 1. Pre-warm RapidOCR ONNX models AND run a dummy inference
-    # to trigger JIT graph compilation (otherwise first real call is slow)
+    # Pre-warm VLM provider (validates Gemini & OpenRouter credentials and connectivity)
     try:
-        import asyncio
-        import numpy as np
-        from app.services.document_processor import _get_ocr_engine
-
-        def _warmup_ocr():
-            engine = _get_ocr_engine()
-            if engine:
-                # Match max_dim=320: for 768x1024 → scales to 240x320
-                dummy = np.zeros((320, 240, 3), dtype=np.uint8)
-                engine(dummy)
-                print("[Startup] OCR engine JIT-compiled and ready.")
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _warmup_ocr)
-    except Exception as e:
-        print(f"[Startup] OCR pre-warm notice: {e}")
-
-    # 2. Pre-warm VLM provider (loads Gemini client, checks API key)
-    try:
-        from app.services.llm_provider import is_gemini_configured
+        from app.services.llm_provider import is_gemini_configured, is_openrouter_configured
         if is_gemini_configured():
             print("[Startup] Gemini VLM provider configured and ready.")
+        if is_openrouter_configured():
+            print("[Startup] OpenRouter fallback provider configured and ready.")
     except Exception as e:
         print(f"[Startup] VLM pre-warm notice: {e}")
 
@@ -68,4 +50,4 @@ app.include_router(router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ocr": "ready", "vlm": "ready"}
+    return {"status": "ok", "mode": "pure_vlm", "vlm": "ready"}

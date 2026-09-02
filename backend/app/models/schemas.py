@@ -54,6 +54,8 @@ QuestionType = Literal[
     "MCQ",
     "SUBQUESTION",
     "NUMERICAL",
+    "DIAGRAM",
+    "TABLE",
     "UNKNOWN",
 ]
 
@@ -87,7 +89,7 @@ class Question(BaseModel):
     extracted_options: List[ExtractedOption] = []
     extraction_confidence: float = 1.0
     verification_state: str = "UNVERIFIED"
-    evidence_refs: List[str] = []
+    max_marks: Optional[float] = 2.0
     # Nested subquestions (e.g. Q3(i), Q3(ii)) — stored here, NOT in flat question list
     subquestions: Optional[List["Question"]] = None
 

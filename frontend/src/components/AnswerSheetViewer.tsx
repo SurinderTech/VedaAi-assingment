@@ -32,6 +32,7 @@ export default function AnswerSheetViewer({
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [renderedSize, setRenderedSize] = useState<{ w: number; h: number } | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
   const [zoom, setZoom] = useState<number>(1);
 
   // Jump to the first region's page whenever the selected question changes.
@@ -41,9 +42,11 @@ export default function AnswerSheetViewer({
     }
   }, [regions, onPageChange]);
 
-  const original = pageSizes[activePage - 1];
-  const scaleX = original && renderedSize ? renderedSize.w / original[0] : 1;
-  const scaleY = original && renderedSize ? renderedSize.h / original[1] : 1;
+  const original = pageSizes && pageSizes[activePage - 1] ? pageSizes[activePage - 1] : null;
+  const origW = (original && original[0]) || naturalSize?.w || 1;
+  const origH = (original && original[1]) || naturalSize?.h || 1;
+  const scaleX = renderedSize ? renderedSize.w / origW : 1;
+  const scaleY = renderedSize ? renderedSize.h / origH : 1;
   const regionsOnPage = regions.filter((r) => r.page === activePage);
 
   // Compute unified outer merged bounding box covering the entire answer text
@@ -199,7 +202,10 @@ export default function AnswerSheetViewer({
               <Page
                 pageNumber={activePage}
                 width={currentWidth}
-                onRenderSuccess={(page) => setRenderedSize({ w: page.width, h: page.height })}
+                onRenderSuccess={(page) => {
+                  setNaturalSize({ w: page.originalWidth, h: page.originalHeight });
+                  setRenderedSize({ w: page.width, h: page.height });
+                }}
               />
             </Document>
           ) : (
@@ -210,7 +216,8 @@ export default function AnswerSheetViewer({
               style={{ width: currentWidth }}
               onLoad={(e) => {
                 const img = e.currentTarget;
-                setRenderedSize({ w: img.clientWidth, h: img.clientWidth * (img.naturalHeight / img.naturalWidth) });
+                setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
+                setRenderedSize({ w: img.clientWidth, h: img.clientHeight });
               }}
             />
           )}
