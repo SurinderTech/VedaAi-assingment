@@ -12,19 +12,21 @@ import {
 } from "@/types/assessment";
 
 export function getApiUrl(): string {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (envUrl && envUrl.trim() && !envUrl.includes("modal.run")) {
+    return envUrl.trim().replace(/\/+$/, "");
+  }
   if (typeof window !== "undefined") {
     if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
       return "http://localhost:8000";
     }
   }
-  const envUrl = process.env.NEXT_PUBLIC_API_URL;
-  if (envUrl && envUrl.trim() && !envUrl.includes("modal.run")) {
-    return envUrl.trim().replace(/\/+$/, "");
-  }
-  return "http://localhost:8000";
+  return envUrl?.trim() || "http://localhost:8000";
 }
 
-const API_URL = "http://localhost:8000";
+// Ensure API_URL evaluates dynamically via getApiUrl()
+const API_URL_GETTER = () => getApiUrl();
+
 
 export async function uploadAssessment(questionPaper: File, answerSheet: File): Promise<string> {
   const form = new FormData();
@@ -37,36 +39,36 @@ export async function uploadAssessment(questionPaper: File, answerSheet: File): 
 }
 
 export async function startProcessing(assessmentId: string): Promise<void> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/process`, { method: "POST" });
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/process`, { method: "POST" });
   if (!res.ok) throw new Error(`Failed to start processing: ${res.status}`);
 }
 
 export async function getStatus(assessmentId: string): Promise<AssessmentStatus> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/status`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/status`);
   if (!res.ok) throw new Error(`Status fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function getResult(assessmentId: string): Promise<AssessmentResult> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/result`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/result`);
   if (!res.ok) throw new Error(`Result fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function getStructuredResult(assessmentId: string): Promise<StructuredAssessmentResult> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/results`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/results`);
   if (!res.ok) throw new Error(`Structured result fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function getReviewQueue(assessmentId: string): Promise<StructuredQuestionResult[]> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/review-queue`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/review-queue`);
   if (!res.ok) throw new Error(`Review queue fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function getQuestionDetail(assessmentId: string, questionId: string): Promise<StructuredQuestionResult> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/questions/${questionId}`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/questions/${questionId}`);
   if (!res.ok) throw new Error(`Question detail fetch failed: ${res.status}`);
   return res.json();
 }
@@ -84,7 +86,7 @@ export async function overrideQuestionMarks(
   questionId: string,
   payload: OverridePayload
 ): Promise<StructuredAssessmentResult> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/questions/${questionId}/override`, {
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/questions/${questionId}/override`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -105,7 +107,7 @@ export async function finalizeAssessment(
   assessmentId: string,
   payload?: FinalizePayload
 ): Promise<StructuredAssessmentResult> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/finalize`, {
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/finalize`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {}),
@@ -115,26 +117,26 @@ export async function finalizeAssessment(
 }
 
 export async function getAuditTrail(assessmentId: string): Promise<AuditEvent[]> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/audit-trail`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/audit-trail`);
   if (!res.ok) throw new Error(`Audit trail fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function getRevisionSnapshot(assessmentId: string, revisionIndex: number): Promise<any> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/snapshots/${revisionIndex}`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/snapshots/${revisionIndex}`);
   if (!res.ok) throw new Error(`Snapshot fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function getRevisions(assessmentId: string): Promise<AssessmentRevision[]> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/revisions`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/revisions`);
   if (!res.ok) throw new Error(`Revisions fetch failed: ${res.status}`);
   return res.json();
 }
 
 export async function listAssessments(): Promise<any[]> {
   try {
-    const res = await fetch(`${API_URL}/api/assessment/list`);
+    const res = await fetch(`${getApiUrl()}/api/assessment/list`);
     if (!res.ok) return [];
     return res.json();
   } catch {
@@ -155,8 +157,8 @@ export async function askAssistant(
   questionId?: string
 ): Promise<AssistantResponse> {
   const endpoint = assessmentId
-    ? `${API_URL}/api/assessment/${assessmentId}/assistant`
-    : `${API_URL}/api/assessment/assistant`;
+    ? `${getApiUrl()}/api/assessment/${assessmentId}/assistant`
+    : `${getApiUrl()}/api/assessment/assistant`;
 
   const res = await fetch(endpoint, {
     method: "POST",
@@ -171,11 +173,11 @@ export async function askAssistant(
 }
 
 export function fileUrl(assessmentId: string, role: "question_paper" | "answer_sheet"): string {
-  return `${API_URL}/api/assessment/${assessmentId}/file/${role}`;
+  return `${getApiUrl()}/api/assessment/${assessmentId}/file/${role}`;
 }
 
 export async function getStudentResult(assessmentId: string): Promise<StudentPerformanceSummary> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/student-result`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/student-result`);
   if (!res.ok) throw new Error(`Student result fetch failed: ${res.status}`);
   return res.json();
 }
@@ -185,8 +187,8 @@ export async function getStudentReport(
   revisionIndex?: number
 ): Promise<StudentAssessmentReport> {
   const url = revisionIndex
-    ? `${API_URL}/api/assessment/${assessmentId}/report?revision_index=${revisionIndex}`
-    : `${API_URL}/api/assessment/${assessmentId}/report`;
+    ? `${getApiUrl()}/api/assessment/${assessmentId}/report?revision_index=${revisionIndex}`
+    : `${getApiUrl()}/api/assessment/${assessmentId}/report`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Student report fetch failed: ${res.status}`);
   return res.json();
@@ -196,19 +198,19 @@ export async function getQuestionPerformance(
   assessmentId: string,
   questionId: string
 ): Promise<QuestionPerformanceSummary> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/questions/${questionId}/performance`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/questions/${questionId}/performance`);
   if (!res.ok) throw new Error(`Question performance fetch failed: ${res.status}`);
   return res.json();
 }
 
 export function exportStudentReportUrl(assessmentId: string, revisionIndex?: number): string {
   return revisionIndex
-    ? `${API_URL}/api/assessment/${assessmentId}/report/export?revision_index=${revisionIndex}`
-    : `${API_URL}/api/assessment/${assessmentId}/report/export`;
+    ? `${getApiUrl()}/api/assessment/${assessmentId}/report/export?revision_index=${revisionIndex}`
+    : `${getApiUrl()}/api/assessment/${assessmentId}/report/export`;
 }
 
 export async function getAssessmentInsights(assessmentId: string): Promise<AssessmentInsights> {
-  const res = await fetch(`${API_URL}/api/assessment/${assessmentId}/insights`);
+  const res = await fetch(`${getApiUrl()}/api/assessment/${assessmentId}/insights`);
   if (!res.ok) throw new Error(`Assessment insights fetch failed: ${res.status}`);
   return res.json();
 }
