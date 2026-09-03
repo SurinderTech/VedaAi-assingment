@@ -14,6 +14,7 @@ import re
 from typing import List, Dict, Any
 from app.models.schemas import Question, MappedAnswer, Rubric, CriterionEvidence, CriterionStatus
 from app.services.embedding_service import similarity_matrix
+from app.services.mcq_evaluator import evaluate_mcq_evidence
 
 
 def detect_contradiction_severity(criterion_desc: str, student_text: str) -> str:
@@ -54,6 +55,11 @@ def extract_criterion_evidence(
     results: List[CriterionEvidence] = []
     text = (mapped_answer.text or "").strip()
     
+    # 0. Deterministic MCQ Evaluation (when question is an MCQ)
+    mcq_evidence = evaluate_mcq_evidence(question, mapped_answer, rubric)
+    if mcq_evidence is not None:
+        return mcq_evidence
+    
     if mapped_answer.status == "unanswered" or not text and not mapped_answer.regions:
         for c in rubric.criteria:
             results.append(
@@ -70,8 +76,9 @@ def extract_criterion_evidence(
             )
         return results
 
-    # Compute TF-IDF similarities between criteria descriptions (enriched with question domain terms) and student answer
-    c_texts = [f"{c.description} {question.text or ''}" for c in rubric.criteria]
+    # Compute similarities between criteria descriptions (enriched with question domain terms and ground truth) and student answer
+    target_context = f"{question.text or ''} {question.correct_answer or ''} {' '.join(question.key_points or [])}".strip()
+    c_texts = [f"{c.description} {target_context}" for c in rubric.criteria]
     if text:
         sim_matrix = similarity_matrix(c_texts, [text])
     else:
@@ -120,6 +127,47 @@ def extract_criterion_evidence(
                 )
                 continue
 
+        # Conceptual words and word match check
+        is_short = len(text.split()) <= 4
+        stop_desc = {"provides", "explains", "correct", "option", "uses", "technical", "terminology", "related", "defines", "core", "concept"}
+        words_in_desc = [w.lower() for w in re.findall(r"\b[a-zA-Z]{3,}\b", c.description) if w.lower() not in stop_desc]
+        word_match = sum(1 for w in words_in_desc if w in text.lower()) >= min(1, len(words_in_desc)) if words_in_desc else False
+
+        # 3. Ground Truth Direct Match Override (for factual, one-word, and short answers)
+        corr_ans = (question.correct_answer or "").strip()
+        text_lower = text.lower().strip()
+        if corr_ans and len(corr_ans) >= 2:
+            corr_lower = corr_ans.lower()
+            direct_match = (corr_lower in text_lower) or (text_lower in corr_lower and len(text_lower) >= 3)
+            kp_match = any(kp.lower() in text_lower for kp in question.key_points if len(kp) >= 3) if question.key_points else False
+            if direct_match or kp_match:
+                results.append(
+                    CriterionEvidence(
+                        criterion_id=c.id,
+                        description=c.description,
+                        status="present",
+                        evidence_text=text[:150],
+                        confidence=0.96,
+                        max_marks=c.max_marks,
+                        notes=f"Ground truth match detected ({corr_ans[:60]})",
+                    )
+                )
+                continue
+            elif (rubric.answer_type in ("one_word", "mcq") or len(corr_ans.split()) <= 2) and not word_match:
+                # Factual one-word mismatch with resolved ground truth: mark missing deterministically
+                results.append(
+                    CriterionEvidence(
+                        criterion_id=c.id,
+                        description=c.description,
+                        status="missing",
+                        evidence_text=text[:150],
+                        confidence=0.95,
+                        max_marks=c.max_marks,
+                        notes=f"Expected factual answer '{corr_ans}', but student provided '{text[:60]}'",
+                    )
+                )
+                continue
+
         # 3. Contradiction Check
         contra_severity = detect_contradiction_severity(c.description, text) if text else "none"
         if contra_severity != "none":
@@ -137,23 +185,19 @@ def extract_criterion_evidence(
             continue
 
         # 4. Conceptual & Short Answer Matching Check
-        is_short = len(text.split()) <= 4
-        stop_desc = {"provides", "explains", "correct", "option", "uses", "technical", "terminology", "related", "defines", "core", "concept"}
-        words_in_desc = [w.lower() for w in re.findall(r"\b[a-zA-Z]{3,}\b", c.description) if w.lower() not in stop_desc]
-        word_match = sum(1 for w in words_in_desc if w in text.lower()) >= min(1, len(words_in_desc)) if words_in_desc else False
 
-        if (is_short and word_match) or sim >= 0.30 or (is_short and len(text) >= 1) or (word_match and len(text.split()) >= 8):
+        if (is_short and word_match) or sim >= 0.30 or (word_match and len(text.split()) >= 8):
             status = "present"
             conf = min(0.95, max(0.75, sim + 0.35 if not is_short else 0.90))
             notes = "Full conceptual support detected"
-        elif sim >= 0.20:
+        elif sim >= 0.20 or word_match:
             status = "partially_present"
             conf = 0.70
             notes = "Partial evidence support detected"
         elif len(text) < 5 and not word_match:
-            status = "uncertain"
-            conf = 0.50
-            notes = "Ambiguous text with insufficient evidence for criterion"
+            status = "missing"
+            conf = 0.90
+            notes = "Student response does not match required concept"
         else:
             status = "missing"
             conf = 0.85

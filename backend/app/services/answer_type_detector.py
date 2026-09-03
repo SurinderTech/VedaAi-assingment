@@ -23,8 +23,13 @@ def detect_answer_content_type(mapped_answer: MappedAnswer, raw_text: Optional[s
             return "visual_only"
         return "unknown"
         
-    # MCQ option selection e.g. "A", "(B)", "Option C", "d"
-    if re.match(r"^\s*\(?[A-Da-d]\)?\s*$", text) or re.match(r"^\s*(?:option|ans(?:wer)?)\s*[:\.\-]?\s*\(?[A-Da-d]\)?\s*$", text, re.IGNORECASE):
+    # MCQ option selection e.g. "A", "(B)", "Option C", "Q21. (A) A convex...", "(A) is less than one"
+    if (
+        re.match(r"^\s*\(?[A-Da-d]\)?\s*$", text)
+        or re.match(r"^\s*(?:option|ans(?:wer)?)\s*[:\.\-]?\s*\(?[A-Da-d]\)?\s*$", text, re.IGNORECASE)
+        or re.match(r"^\s*(?:(?:Q|q)?\d+[\.\)\-]?\s*)?\(?[A-Da-d]\)(?:[\.\:\-\)]|\s+)", text)
+        or re.match(r"^\s*(?:(?:Q|q)?\d+[\.\)\-]?\s*)[A-Da-d][\.\:\-\)]\s+", text)
+    ):
         return "mcq_selection"
         
     # Standalone number e.g. "0", "-5", "3.14159", "42"

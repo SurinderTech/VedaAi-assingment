@@ -89,7 +89,11 @@ class Question(BaseModel):
     extracted_options: List[ExtractedOption] = []
     extraction_confidence: float = 1.0
     verification_state: str = "UNVERIFIED"
-    max_marks: Optional[float] = 2.0
+    max_marks: Optional[float] = None
+    correct_option: Optional[str] = None
+    correct_answer: Optional[str] = None
+    explanation: Optional[str] = None
+    key_points: List[str] = []
     # Nested subquestions (e.g. Q3(i), Q3(ii)) — stored here, NOT in flat question list
     subquestions: Optional[List["Question"]] = None
 
@@ -360,6 +364,8 @@ class QuestionResult(BaseModel):
     grading: Optional[Grading] = None
     section: Optional[str] = None
     options: List[str] = []
+    correct_option: Optional[str] = None
+    correct_answer: Optional[str] = None
 
 
 class UnmatchedAnswer(BaseModel):
@@ -478,6 +484,8 @@ class StructuredQuestionResult(BaseModel):
     source_region_ids: List[str] = []  # Provenance: region IDs from document graph
     extraction_confidence: float = 1.0
     extracted_options: List[Dict[str, Any]] = []  # Structured options with label/text/confidence
+    correct_option: Optional[str] = None
+    correct_answer: Optional[str] = None
 
 
 class StructuredAssessmentResult(BaseModel):

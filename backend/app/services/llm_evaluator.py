@@ -41,8 +41,10 @@ def determine_routing_decision(
     if mapped_answer.status == "unanswered" or not text and not mapped_answer.regions:
         return "LOCAL_CLEAR_WITH_HIGH_CONFIDENCE", "unanswered"
         
-    # 2. MCQ or Short Standalone Number -> LOCAL_CLEAR
+    # 2. MCQ or Short Standalone Number -> LOCAL_CLEAR if confident
     if content_type in ("mcq_selection", "number") or req_spec.expected_answer_type in ("mcq", "one_word"):
+        if any(ev.status == "uncertain" for ev in local_evidence):
+            return "LLM_RECOMMENDED", "mcq_option_uncertain"
         return "LOCAL_CLEAR_WITH_HIGH_CONFIDENCE", "clear_short_factual_or_mcq"
         
     # 3. Diagram requirement requiring visual understanding -> LLM_REQUIRED
@@ -91,6 +93,8 @@ async def evaluate_evidence_with_llm(
     # Minimal targeted context payload
     payload = {
         "question": question.text,
+        "options": question.options if question.options else [],
+        "correct_option": getattr(question, "correct_option", None),
         "max_marks": total_marks,
         "requirements": {
             "answer_type": req_spec.expected_answer_type,
@@ -105,6 +109,7 @@ async def evaluate_evidence_with_llm(
     prompt = (
         "You are an expert exam evaluator resolving evidence for a student response.\n"
         f"Context Payload:\n{json.dumps(payload, indent=2)}\n\n"
+        "If this is a multiple choice question (MCQ), determine the correct option choice and evaluate if the student chose it.\n"
         "Evaluate each criterion in the rubric. Determine if student evidence is:\n"
         "- 'present': full supporting evidence found\n"
         "- 'partially_present': partial evidence or incomplete explanation\n"

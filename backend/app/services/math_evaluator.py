@@ -32,6 +32,27 @@ def evaluate_mathematical_answer(question: Question, mapped_answer: MappedAnswer
             "notes": "No answer text provided for mathematical evaluation",
         }
 
+    # 0. Compare against Ground Truth target if resolved
+    corr_ans = question.correct_answer or ""
+    if corr_ans:
+        target_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", corr_ans) if x not in ("", ".", "-")]
+        student_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", a_text) if x not in ("", ".", "-")]
+        if target_nums and student_nums:
+            # Check if any student number matches any target number (within 2% relative tolerance)
+            for t in target_nums:
+                for s in student_nums:
+                    tol = max(0.01, abs(t) * 0.02)
+                    if abs(s - t) <= tol:
+                        return {
+                            "math_score": 1.0,
+                            "is_valid": True,
+                            "intermediate_steps_correct": True,
+                            "final_answer_correct": True,
+                            "first_error_step": None,
+                            "confidence": 0.98,
+                            "notes": f"Correct numeric value '{s}' matched target '{t}'",
+                        }
+
     # 1. Standalone number check e.g. "What is ReLU(-5)?" -> "0"
     m_q_val = re.search(r"(-?\d+(?:\.\d+)?)\s*\)?\s*\??$", q_text)
     m_a_num = re.search(r"(-?\d+(?:\.\d+)?)", a_text)

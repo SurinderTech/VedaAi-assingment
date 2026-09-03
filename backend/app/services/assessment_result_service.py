@@ -145,6 +145,8 @@ def build_structured_assessment_result(
             source_region_ids=getattr(q_res, "source_region_ids", []) or [],
             extraction_confidence=getattr(q_res, "extraction_confidence", 1.0),
             extracted_options=structured_opts,
+            correct_option=getattr(q_res, "correct_option", None),
+            correct_answer=getattr(q_res, "correct_answer", None),
         )
         
         fb_dict = generate_question_evidence_feedback(struct_q_pre)

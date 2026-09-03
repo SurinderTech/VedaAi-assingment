@@ -80,6 +80,7 @@ Return ONLY a valid JSON object in this exact structure (no markdown, no convers
       "max_marks": 1.0,
       "question_type": "MCQ",
       "options": ["A. Nucleus", "B. Mitochondria", "C. Ribosome", "D. Golgi apparatus"],
+      "correct_option": "B",
       "box_2d": [400, 60, 480, 840],
       "parent_question_number": null
     }
@@ -106,6 +107,7 @@ CRITICAL RULES FOR HUMAN-LIKE UNDERSTANDING:
 3. FIRST-CLASS MCQ SUPPORT:
    - When a question presents multiple choice options (A, B, C, D or (a), (b), (c), (d)), set "question_type": "MCQ".
    - Populate "options" with the option strings, preserving their labels (e.g. ["A. Earth", "B. Mars", "C. Jupiter", "D. Venus"]).
+   - If evident, identify the single correct option letter ("A", "B", "C", or "D") in "correct_option".
    - Options arranged horizontally, in columns, or in tables must be structurally attached to the question.
 
 4. SUPPORT ALL QUESTION TYPES:
@@ -218,6 +220,9 @@ async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question
                     if clean_parent and clean_parent != "0":
                         parent_q_id = f"Q{clean_parent}"
 
+                raw_corr_opt = str(q_dict.get("correct_option", "") or q_dict.get("answer", "")).strip().upper()
+                corr_opt = raw_corr_opt if raw_corr_opt in ("A", "B", "C", "D") else None
+
                 q_obj = Question(
                     id=f"Q{clean_num}",
                     number=clean_num,
@@ -229,6 +234,7 @@ async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question
                     options=clean_opts,
                     parent_question_id=parent_q_id,
                     max_marks=m_marks,
+                    correct_option=corr_opt,
                     extraction_confidence=1.0 if meta.get("vlm_result") == "SUCCESS" else 0.8,
                 )
                 all_questions.append(q_obj)

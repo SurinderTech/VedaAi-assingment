@@ -72,9 +72,9 @@ def analyze_question_requirements(question: Question) -> QuestionRequirementSpec
     
     if len(options) >= 2 or re.search(r"\([A-D]\)", txt) or re.search(r"^\s*\(?[A-D]\)?\s*[\.\-]", txt):
         answer_type = "mcq"
-    elif re.search(r"^\s*(name|state|what is the output of|which|who|where|unit of)\b", txt_lower) and len(txt.split()) <= 12 and not has_math:
+    elif re.search(r"\b(unit of|si unit|name|state|what is the output of|which|who|where|formula of|symbol of|value of)\b", txt_lower) and len(txt.split()) <= 15:
         answer_type = "one_word"
-    elif re.search(r"\b(define|meaning of|what is|what do you understand by)\b", txt_lower) and len(txt.split()) <= 15:
+    elif re.search(r"\b(define|meaning of|what do you understand by)\b", txt_lower) or (re.search(r"\bwhat is\b", txt_lower) and len(txt.split()) <= 15 and not re.search(r"\b(unit|formula|symbol|name|value)\b", txt_lower)):
         answer_type = "definition"
     elif has_code or "algorithm" in txt_lower:
         answer_type = "code" if has_code else "algorithm"

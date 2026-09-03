@@ -86,6 +86,14 @@ async def generate_grading(
     visual_eval = evaluate_visual_answer(question, mapped_answer) if (req_spec.has_diagram_requirement or content_type in ("diagram", "visual_only")) else {}
     code_eval = evaluate_code_answer(question, mapped_answer) if (req_spec.has_code_requirement or content_type == "code") else {}
 
+    # Ensure ground truth answer key is resolved if not already set by pipeline
+    if not getattr(question, "correct_answer", None) and not getattr(question, "correct_option", None) and settings.GRADING_LLM_ENABLED:
+        from app.services.answer_key_service import resolve_universal_answer_key
+        try:
+            await resolve_universal_answer_key([question])
+        except Exception:
+            pass
+
     # 5. Local Evidence Extraction
     local_evidence = extract_criterion_evidence(question, mapped_answer, rubric, math_eval, visual_eval, code_eval)
     

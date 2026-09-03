@@ -20,19 +20,29 @@ def generate_deterministic_rubric(question: Question, spec: QuestionRequirementS
     criteria: List[RubricCriterion] = []
     
     if q_type == "mcq":
-        criteria.append(RubricCriterion(id="c1", description="Selects the correct option choice", max_marks=total_marks))
+        opt_desc = f"Selects correct option ({question.correct_option}): {question.correct_answer}" if question.correct_option else "Selects the correct option choice"
+        criteria.append(RubricCriterion(id="c1", description=opt_desc, max_marks=total_marks))
     elif q_type == "one_word":
-        criteria.append(RubricCriterion(id="c1", description="Provides accurate factual name or value", max_marks=total_marks))
+        ans_desc = f"Provides accurate factual name or value: {question.correct_answer}" if question.correct_answer else "Provides accurate factual name or value"
+        criteria.append(RubricCriterion(id="c1", description=ans_desc, max_marks=total_marks))
     elif q_type == "definition":
         concepts_str = ", ".join(spec.required_concepts[:2]) if spec.required_concepts else "target concept"
-        criteria.append(RubricCriterion(id="c1", description=f"Defines the core concept of {concepts_str} correctly", max_marks=round(total_marks * 0.7, 2)))
+        def_desc = f"Defines the core concept: {question.correct_answer}" if question.correct_answer else f"Defines the core concept of {concepts_str} correctly"
+        criteria.append(RubricCriterion(id="c1", description=def_desc, max_marks=round(total_marks * 0.7, 2)))
         criteria.append(RubricCriterion(id="c2", description=f"Uses technical terminology related to {concepts_str}", max_marks=round(total_marks * 0.3, 2)))
     elif spec.has_numerical_requirement:
+        num_desc = f"Correct final numerical value and units: {question.correct_answer}" if question.correct_answer else "Correct final numerical value and units"
         criteria.append(RubricCriterion(id="c1", description="Correct formula and step-by-step calculation method", max_marks=round(total_marks * 0.6, 2)))
-        criteria.append(RubricCriterion(id="c2", description="Correct final numerical value and units", max_marks=round(total_marks * 0.4, 2)))
+        criteria.append(RubricCriterion(id="c2", description=num_desc, max_marks=round(total_marks * 0.4, 2)))
     elif spec.has_diagram_requirement:
         criteria.append(RubricCriterion(id="c1", description="Required diagram structure, components, and labels", max_marks=round(total_marks * 0.5, 2)))
         criteria.append(RubricCriterion(id="c2", description="Accurate text explanation of the diagram", max_marks=round(total_marks * 0.5, 2)))
+    elif question.key_points and len(question.key_points) >= 2:
+        # Use ground truth key points for conceptual questions
+        num_kp = len(question.key_points)
+        per_mark = round(total_marks / num_kp, 2)
+        for i, kp in enumerate(question.key_points):
+            criteria.append(RubricCriterion(id=f"c{i+1}", description=f"Addresses key point: {kp}", max_marks=per_mark))
     else:
         # Generic multi-concept split
         descs = spec.evaluation_criteria_descriptions or ["States core concept", "Explains supporting mechanism"]

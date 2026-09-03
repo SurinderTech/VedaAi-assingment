@@ -125,6 +125,10 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         )
         mapped, unmatched = await map_answers_vlm(questions, answers)
 
+        # ── STEP 5.5: Universal Ground Truth Answer Key Resolution ───────────
+        from app.services.answer_key_service import resolve_universal_answer_key
+        await resolve_universal_answer_key(questions)
+
         # ── STEP 6: AI Grading & Feedback ────────────────────────────────────
         store.set_status(
             assessment_id,
@@ -149,6 +153,8 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
                 grading=g,
                 section=q.section,
                 options=q.options,
+                correct_option=q.correct_option,
+                correct_answer=q.correct_answer,
             )
             for q, g in zip(questions, gradings)
         ]
