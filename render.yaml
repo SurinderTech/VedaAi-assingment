@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: vedaai-backend
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-flash-lite-latest
+      - key: PRIMARY_LLM_PROVIDER
+        value: gemini
+      - key: DOCUMENT_VLM_ENABLED
+        value: "true"
+      - key: DOCUMENT_VLM_PAGE_UNDERSTANDING
+        value: "true"
+      - key: EMBEDDING_ENGINE_ENABLED
+        value: "false"
