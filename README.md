@@ -2,7 +2,7 @@
 
 <div align="center">
 
-# 🧠 VedaAI
+#  VedaAI
 
 ### AI-Powered Assessment Understanding & Answer Mapping
 
