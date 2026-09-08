@@ -84,7 +84,7 @@ flowchart TD
     A["👨‍🏫 Teacher"] --> B["📄 Upload Question Paper"]
     A --> C["📝 Upload Student Answer Sheet"]
 
-    B --> D["🧠 Question Paper Understanding"]
+    B --> D[" Question Paper Understanding"]
     C --> E["🧠 Answer Sheet Understanding"]
 
     D --> D1["Understand Document Structure"]
