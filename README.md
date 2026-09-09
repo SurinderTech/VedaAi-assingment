@@ -31,7 +31,7 @@ VedaAI is an AI-powered assessment assistant that understands question papers an
 
 
 
-# 🎯 Why VedaAI?
+#  Why VedaAI?
 
 Evaluating handwritten answer sheets is often a **manual search problem**.
 
