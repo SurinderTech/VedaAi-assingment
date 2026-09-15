@@ -50,17 +50,47 @@ VedaAI replaces manual page hunting with **AI-Assisted Assessment Navigation** b
 
 ---
 
-## 📸 Production UI Showcase
+## 📸 Production UI & Reality Showcase
 
-### 1. Interactive Teacher Review Workspace
+The following real screenshots demonstrate VedaAI running in a live production environment.
 
-The core workspace features a split-canvas UI: left-hand structured question navigation, central high-resolution PDF/image canvas with live visual bounding box overlays, and right-hand AI evaluation details with single-click score overriding.
+### 1. Document Upload Dashboard
+Intuitive drag-and-drop ingestion interface for both Question Papers and Student Answer Sheets.
 
-![VedaAI Interactive Teacher Review Workspace](docs/assets/workspace_qa_mapping.png)
+![VedaAI Document Upload Interface](docs/assets/upload_dashboard_real.png)
 
-### 2. Geometry Grounding & Bounding Box Alignment
+---
 
-VedaAI's dual-pipeline maps Vision Language Model (VLM) spatial predictions directly to OCR text bounding boxes, ensuring exact alignment across rendered 200 DPI pages.
+### 2. Real-Time VLM Document Processing
+Asynchronous processing engine providing live progress telemetry while the Vision Language Model visually parses handwriting and document structures.
+
+![VedaAI Processing Telemetry](docs/assets/processing_status_real.png)
+
+---
+
+### 3. Subquestion Hierarchy & Visual Bounding Box Grounding
+Automatic identification of nested subquestions `1(a)` through `1(j)` with exact green bounding box overlays placed over student handwriting.
+
+![Subquestion Hierarchy & Bounding Box Overlay](docs/assets/subquestion_mapping_real.png)
+
+---
+
+### 4. Interactive Teacher Workspace & AI Scoring Feedback
+Accordion navigation revealing per-question rubric criteria, strengths breakdown, extracted student text snippet, and 1-click teacher score modification.
+
+![Teacher Workspace & AI Rubric Feedback](docs/assets/ai_feedback_accordion_real.png)
+
+---
+
+### 5. Multi-Page Continuous Answer Spanning
+Visual indicator badge (`Q7 continued from Page 5`) tracking long student essay responses spanning across page boundaries.
+
+![Multi-Page Answer Spanning Indicator](docs/assets/multipage_spanning_real.png)
+
+---
+
+### 6. Grounding Engine Verification
+Precision geometry alignment mapping VLM spatial predictions directly to OCR text bounding boxes across 200 DPI pages.
 
 ![VLM Visual Bounding Box Grounding](docs/assets/vlm_bbox_grounding.png)
 
