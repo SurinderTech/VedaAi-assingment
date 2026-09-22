@@ -100,7 +100,7 @@ async def _call_gemini_with_metadata(
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=90.0) as client:
                     r = await client.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}",
                         json=body,
@@ -271,7 +271,7 @@ async def _call_openrouter_with_metadata(
                 "messages": [{"role": "user", "content": content_payload}],
                 "max_tokens": max_tokens_val,
             }
-            async with httpx.AsyncClient(timeout=45.0) as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(url, json=body, headers=headers)
                 if r.status_code == 200:
                     data = r.json()
@@ -321,7 +321,7 @@ _PROVIDERS = {
 }
 
 _ORDER = ["gemini", "openrouter"]
-_llm_sem = asyncio.Semaphore(4)
+_llm_sem = asyncio.Semaphore(10)  # Raised from 4 to support parallel page-level VLM calls
 
 
 async def llm_complete(prompt: str, allow_fallback: bool = True, purpose: str = "general") -> str:

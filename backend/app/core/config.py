@@ -17,8 +17,13 @@ class Settings:
 
     PRIMARY_LLM_PROVIDER: str = os.getenv("PRIMARY_LLM_PROVIDER", "gemini")
 
-    MAX_UPLOAD_MB: int = int(os.getenv("MAX_UPLOAD_MB", "25"))
-    ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
+    MAX_UPLOAD_MB: int = int(os.getenv("MAX_UPLOAD_MB", "50"))
+    ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx"}
+
+    # Long document support
+    MAX_PDF_PAGES: int = int(os.getenv("MAX_PDF_PAGES", "40"))  # Pages beyond this are merged/skipped
+    PDF_RENDER_DPI: int = int(os.getenv("PDF_RENDER_DPI", "120"))  # Lower = faster, still VLM-readable
+    VLM_IMAGE_MAX_SIDE: int = int(os.getenv("VLM_IMAGE_MAX_SIDE", "1600"))  # Downsample oversized scans
 
     # Mapping thresholds
     HIGH_CONFIDENCE: float = 0.85

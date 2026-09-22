@@ -28,7 +28,7 @@ from app.services.mapping_engine import map_answers_vlm
 from app.services.grading_service import generate_grading
 from app.services.assessment_result_service import build_structured_assessment_result
 
-PIPELINE_TIMEOUT_SECONDS = 360  # 6 minutes max
+PIPELINE_TIMEOUT_SECONDS = 1200  # 20 minutes — supports large multi-page documents
 
 
 async def run_pipeline(assessment_id: str) -> None:
@@ -45,7 +45,7 @@ async def run_pipeline(assessment_id: str) -> None:
             AssessmentStatus(
                 assessment_id=assessment_id,
                 state="failed",
-                message=f"⏱️ Processing timed out (>{PIPELINE_TIMEOUT_SECONDS}s). Please try uploading smaller files.",
+                message=f"⏱️ Processing timed out (>{PIPELINE_TIMEOUT_SECONDS//60} min). Document may be too large or VLM providers are slow. Try splitting into smaller files.",
                 progress=0,
             ),
         )
@@ -79,6 +79,15 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         qp_pages, qp_sizes, qp_images = await asyncio.to_thread(
             render_document_images, files["question_paper"], files["question_paper_ext"]
         )
+        store.set_status(
+            assessment_id,
+            AssessmentStatus(
+                assessment_id=assessment_id,
+                state="extracting_questions",
+                message=f"📄 VLM inspecting {qp_pages}-page Question Paper — running {qp_pages} parallel analyses...",
+                progress=0.20,
+            ),
+        )
 
         # ── STEP 2: Pure VLM Question Paper Extraction ───────────────────────
         questions: List[Question] = await extract_questions_vlm(qp_images)
@@ -107,6 +116,15 @@ async def _run_pipeline_inner(assessment_id: str) -> None:
         )
         as_pages, as_sizes, as_images = await asyncio.to_thread(
             render_document_images, files["answer_sheet"], files["answer_sheet_ext"]
+        )
+        store.set_status(
+            assessment_id,
+            AssessmentStatus(
+                assessment_id=assessment_id,
+                state="extracting_answers",
+                message=f"🖊️ VLM reading {as_pages}-page Answer Sheet — running {as_pages} parallel analyses...",
+                progress=0.50,
+            ),
         )
 
         # ── STEP 4: Pure VLM Answer Sheet Extraction ─────────────────────────

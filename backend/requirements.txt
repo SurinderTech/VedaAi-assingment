@@ -8,6 +8,10 @@ pdf2image==1.17.0
 Pillow==10.4.0
 pypdfium2
 
+# DOCX support
+python-docx
+docx2pdf
+
 numpy==1.26.4
 scipy
 scikit-learn==1.5.2

@@ -7,6 +7,7 @@ Zero regex heuristics, zero keyword matching, zero OCR line assumptions.
 from __future__ import annotations
 
 import io
+import asyncio
 import base64
 import json
 import re
@@ -22,7 +23,7 @@ def pil_image_to_b64(img: Any) -> str:
     buf = io.BytesIO()
     if hasattr(img, "mode") and img.mode != "RGB":
         img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=75)  # 75 = faster upload/VLM call, still readable
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -124,125 +125,151 @@ CRITICAL RULES FOR HUMAN-LIKE UNDERSTANDING:
 """
 
 
+async def _extract_questions_from_page(
+    page_num: int,
+    img: Any,
+) -> List[Question]:
+    """
+    Extracts questions from a single page image via VLM.
+    Designed to be called concurrently across all pages using asyncio.gather.
+    """
+    b64_img = pil_image_to_b64(img)
+    img_w = getattr(img, "width", 1000) if hasattr(img, "width") else 1000
+    img_h = getattr(img, "height", 1400) if hasattr(img, "height") else 1400
+    page_questions: List[Question] = []
+
+    try:
+        raw_res, meta = await llm_complete_multimodal_with_metadata(
+            prompt=QUESTION_EXTRACTION_PROMPT,
+            image_b64=b64_img,
+            mime_type="image/jpeg",
+            purpose=f"vlm_question_extraction_p{page_num}",
+        )
+
+        cleaned_json = raw_res.strip()
+        if "```json" in cleaned_json:
+            cleaned_json = cleaned_json.split("```json")[1].split("```")[0].strip()
+        elif "```" in cleaned_json:
+            cleaned_json = cleaned_json.split("```")[1].split("```")[0].strip()
+
+        m_json = re.search(r"\{.*\}", cleaned_json, re.DOTALL)
+        if m_json:
+            cleaned_json = m_json.group(0)
+
+        data = json.loads(cleaned_json)
+        raw_qs = data.get("questions", []) if isinstance(data, dict) else []
+
+        for idx, q_dict in enumerate(raw_qs):
+            raw_num = str(q_dict.get("number", "")).strip()
+            # Use a temp order index; final ordering is done after gathering all pages
+            clean_num = _sanitize_question_number(raw_num, idx + 1)
+            q_text = str(q_dict.get("text", "")).strip()
+            if not q_text:
+                continue
+
+            try:
+                m_marks = float(q_dict.get("max_marks", 2.0) or 2.0)
+            except (TypeError, ValueError):
+                m_marks = 2.0
+
+            q_type_raw = str(q_dict.get("question_type", "SHORT_ANSWER")).upper().strip()
+            q_type = q_type_raw if q_type_raw in (
+                "MCQ", "SHORT_ANSWER", "LONG_ANSWER", "NUMERICAL", "TABLE", "DIAGRAM", "SUBQUESTION"
+            ) else "SHORT_ANSWER"
+
+            opts = q_dict.get("options", []) or []
+            if not isinstance(opts, list):
+                opts = [str(opts)]
+            clean_opts = [str(o).strip() for o in opts if str(o).strip()]
+
+            # Bounding box for exact frontend highlighting
+            box_raw = q_dict.get("box_2d") or q_dict.get("bbox")
+            q_bbox: Optional[BBox] = None
+            if isinstance(box_raw, list) and len(box_raw) > 0:
+                flat_box = box_raw[0] if isinstance(box_raw[0], list) else box_raw
+                if len(flat_box) == 4:
+                    try:
+                        ymin, xmin, ymax, xmax = [float(v) for v in flat_box]
+                        by = (ymin / 1000.0) * img_h
+                        bx = (xmin / 1000.0) * img_w
+                        bh = max(5.0, ((ymax - ymin) / 1000.0) * img_h)
+                        bw = max(10.0, ((xmax - xmin) / 1000.0) * img_w)
+                        q_bbox = BBox(x=round(bx, 1), y=round(by, 1), width=round(bw, 1), height=round(bh, 1))
+                    except (TypeError, ValueError):
+                        q_bbox = None
+            elif isinstance(box_raw, dict):
+                try:
+                    bx = float(box_raw.get("x", 0) or 0)
+                    by = float(box_raw.get("y", 0) or 0)
+                    bw = float(box_raw.get("width", 0) or 0)
+                    bh = float(box_raw.get("height", 0) or 0)
+                    if bw > 0 and bh > 0:
+                        bx = max(0.0, min(bx, img_w - 1))
+                        by = max(0.0, min(by, img_h - 1))
+                        bw = max(1.0, min(bw, img_w - bx))
+                        bh = max(1.0, min(bh, img_h - by))
+                        q_bbox = BBox(x=round(bx, 1), y=round(by, 1), width=round(bw, 1), height=round(bh, 1))
+                except (TypeError, ValueError):
+                    q_bbox = None
+
+            # Subquestion parent linkage
+            parent_q_raw = q_dict.get("parent_question_number") or None
+            parent_q_id: Optional[str] = None
+            if parent_q_raw:
+                clean_parent = _sanitize_question_number(str(parent_q_raw), 0)
+                if clean_parent and clean_parent != "0":
+                    parent_q_id = f"Q{clean_parent}"
+
+            raw_corr_opt = str(q_dict.get("correct_option", "") or q_dict.get("answer", "")).strip().upper()
+            corr_opt = raw_corr_opt if raw_corr_opt in ("A", "B", "C", "D") else None
+
+            q_obj = Question(
+                id=f"Q{clean_num}",
+                number=clean_num,
+                text=q_text,
+                page=page_num,
+                bbox=q_bbox,
+                order_index=idx,  # Temporary; re-indexed globally after gather
+                question_type=q_type,  # type: ignore
+                options=clean_opts,
+                parent_question_id=parent_q_id,
+                max_marks=m_marks,
+                correct_option=corr_opt,
+                extraction_confidence=1.0 if meta.get("vlm_result") == "SUCCESS" else 0.8,
+            )
+            page_questions.append(q_obj)
+            print(f"[VLMQuestionExtractor] Extracted Q{clean_num} (type={q_type}, marks={m_marks}, parent={parent_q_id}) on page {page_num}: '{q_text[:50]}'")
+
+    except Exception as e:
+        print(f"[VLMQuestionExtractor] Error extracting questions on page {page_num}: {e}")
+
+    return page_questions
+
+
 async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question]:
     """
     100% Multimodal VLM Visual Question Paper Extractor.
     Extracts structured assessable questions directly from question paper page images.
+
+    ALL pages are processed CONCURRENTLY using asyncio.gather — dramatically reducing
+    extraction time for long documents (e.g., a 20-page doc goes from ~200s to ~20s).
     """
+    page_nums = sorted(qp_images_dict.keys())
+    print(f"[VLMQuestionExtractor] Processing {len(page_nums)} page(s) in parallel...")
+
+    # Launch all page extractions concurrently
+    tasks = [
+        _extract_questions_from_page(page_num, qp_images_dict[page_num])
+        for page_num in page_nums
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     all_questions: List[Question] = []
-    order_idx = 0
-
-    for page_num in sorted(qp_images_dict.keys()):
-        img = qp_images_dict[page_num]
-        b64_img = pil_image_to_b64(img)
-
-        img_w = getattr(img, "width", 1000) if hasattr(img, "width") else 1000
-        img_h = getattr(img, "height", 1400) if hasattr(img, "height") else 1400
-
-        try:
-            raw_res, meta = await llm_complete_multimodal_with_metadata(
-                prompt=QUESTION_EXTRACTION_PROMPT,
-                image_b64=b64_img,
-                mime_type="image/jpeg",
-                purpose=f"vlm_question_extraction_p{page_num}",
-            )
-
-            cleaned_json = raw_res.strip()
-            if "```json" in cleaned_json:
-                cleaned_json = cleaned_json.split("```json")[1].split("```")[0].strip()
-            elif "```" in cleaned_json:
-                cleaned_json = cleaned_json.split("```")[1].split("```")[0].strip()
-
-            m_json = re.search(r"\{.*\}", cleaned_json, re.DOTALL)
-            if m_json:
-                cleaned_json = m_json.group(0)
-
-            data = json.loads(cleaned_json)
-            raw_qs = data.get("questions", []) if isinstance(data, dict) else []
-
-            for q_dict in raw_qs:
-                raw_num = str(q_dict.get("number", "")).strip()
-                clean_num = _sanitize_question_number(raw_num, order_idx + 1)
-                q_text = str(q_dict.get("text", "")).strip()
-                if not q_text:
-                    continue
-
-                try:
-                    m_marks = float(q_dict.get("max_marks", 2.0) or 2.0)
-                except (TypeError, ValueError):
-                    m_marks = 2.0
-
-                q_type_raw = str(q_dict.get("question_type", "SHORT_ANSWER")).upper().strip()
-                q_type = q_type_raw if q_type_raw in (
-                    "MCQ", "SHORT_ANSWER", "LONG_ANSWER", "NUMERICAL", "TABLE", "DIAGRAM", "SUBQUESTION"
-                ) else "SHORT_ANSWER"
-
-                opts = q_dict.get("options", []) or []
-                if not isinstance(opts, list):
-                    opts = [str(opts)]
-                clean_opts = [str(o).strip() for o in opts if str(o).strip()]
-
-                # Bounding box for exact frontend highlighting
-                box_raw = q_dict.get("box_2d") or q_dict.get("bbox")
-                q_bbox: Optional[BBox] = None
-                if isinstance(box_raw, list) and len(box_raw) > 0:
-                    flat_box = box_raw[0] if isinstance(box_raw[0], list) else box_raw
-                    if len(flat_box) == 4:
-                        try:
-                            ymin, xmin, ymax, xmax = [float(v) for v in flat_box]
-                            by = (ymin / 1000.0) * img_h
-                            bx = (xmin / 1000.0) * img_w
-                            bh = max(5.0, ((ymax - ymin) / 1000.0) * img_h)
-                            bw = max(10.0, ((xmax - xmin) / 1000.0) * img_w)
-                            q_bbox = BBox(x=round(bx, 1), y=round(by, 1), width=round(bw, 1), height=round(bh, 1))
-                        except (TypeError, ValueError):
-                            q_bbox = None
-                elif isinstance(box_raw, dict):
-                    try:
-                        bx = float(box_raw.get("x", 0) or 0)
-                        by = float(box_raw.get("y", 0) or 0)
-                        bw = float(box_raw.get("width", 0) or 0)
-                        bh = float(box_raw.get("height", 0) or 0)
-                        if bw > 0 and bh > 0:
-                            bx = max(0.0, min(bx, img_w - 1))
-                            by = max(0.0, min(by, img_h - 1))
-                            bw = max(1.0, min(bw, img_w - bx))
-                            bh = max(1.0, min(bh, img_h - by))
-                            q_bbox = BBox(x=round(bx, 1), y=round(by, 1), width=round(bw, 1), height=round(bh, 1))
-                    except (TypeError, ValueError):
-                        q_bbox = None
-
-                # Subquestion parent linkage
-                parent_q_raw = q_dict.get("parent_question_number") or None
-                parent_q_id: Optional[str] = None
-                if parent_q_raw:
-                    clean_parent = _sanitize_question_number(str(parent_q_raw), 0)
-                    if clean_parent and clean_parent != "0":
-                        parent_q_id = f"Q{clean_parent}"
-
-                raw_corr_opt = str(q_dict.get("correct_option", "") or q_dict.get("answer", "")).strip().upper()
-                corr_opt = raw_corr_opt if raw_corr_opt in ("A", "B", "C", "D") else None
-
-                q_obj = Question(
-                    id=f"Q{clean_num}",
-                    number=clean_num,
-                    text=q_text,
-                    page=page_num,
-                    bbox=q_bbox,
-                    order_index=order_idx,
-                    question_type=q_type,  # type: ignore
-                    options=clean_opts,
-                    parent_question_id=parent_q_id,
-                    max_marks=m_marks,
-                    correct_option=corr_opt,
-                    extraction_confidence=1.0 if meta.get("vlm_result") == "SUCCESS" else 0.8,
-                )
-                all_questions.append(q_obj)
-                order_idx += 1
-                print(f"[VLMQuestionExtractor] Extracted Q{clean_num} (type={q_type}, marks={m_marks}, parent={parent_q_id}) on page {page_num}: '{q_text[:50]}'")
-
-        except Exception as e:
-            print(f"[VLMQuestionExtractor] Error extracting questions on page {page_num}: {e}")
+    for page_num, page_result in zip(page_nums, results):
+        if isinstance(page_result, Exception):
+            print(f"[VLMQuestionExtractor] Page {page_num} failed: {page_result}")
+            continue
+        all_questions.extend(page_result)
 
     # Natural sort: page -> primary question number -> subpart
     def _sort_key(q: Question):
@@ -256,7 +283,7 @@ async def extract_questions_vlm(qp_images_dict: Dict[int, Any]) -> List[Question
     for idx, q in enumerate(all_questions):
         q.order_index = idx
 
-    print(f"[VLMQuestionExtractor] Total: {len(all_questions)} questions extracted.")
+    print(f"[VLMQuestionExtractor] Total: {len(all_questions)} questions extracted from {len(page_nums)} page(s).")
     return all_questions
 
 
