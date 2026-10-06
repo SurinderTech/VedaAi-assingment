@@ -1,4 +1,4 @@
-# 🧠 VedaAI — AI-Powered Assessment Understanding & Handwritten Answer Mapping
+#  VedaAI — AI-Powered Assessment Understanding & Handwritten Answer Mapping
 
 <div align="center">
 
