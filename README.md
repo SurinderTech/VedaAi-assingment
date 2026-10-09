@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![VedaAI Demo](assets/)
+![VedaAI Demo](docs/assets/8d25cfc9-7fb3-42ce-b86e-f9659155bb89.gif)
 
 ### Production-Grade Multimodal Assessment Evaluation & Human-in-the-Loop Review Platform
 
@@ -46,7 +46,7 @@ This process suffers from high error rates and cognitive fatigue when handling:
 
 ### The VedaAI Solution Thesis
 
-VedaAI replaces manual page hunting with **AI-Assisted Assessment Navigation** backed by **Zero-Hallucination Visual Grounding**. Instead of trusting an opaque LLM score, VedaAI provides **Human-in-the-Loop (HITL) Traceable Assessment**: it extracts the visual geometry, bounds the student's handwritten evidence, automates initial rubric-based grading, and presents examiners with an interactive workspace where every mark is verifiable against raw document evidence.
+VedaAI replaces manual page hunting with **AI-Assisted Assessment Navigation** backed by **Zero-Hallucination Visual Grounding**. Instead of trusting an opaque LLM score, VedaAI provides **Human-in-the-Loop Review** with precise provenance, bounding-box evidence, and teacher override controls.
 
 ---
 
@@ -174,7 +174,7 @@ Where:
 * **Vertical Alignment ($S_{\text{vert\_align}}$)**: $\min\left(0.35, \frac{\text{Overlap}_y(B, R)}{\max(H_B, H_R)} \times 1.25\right)$
 * **Horizontal Alignment ($S_{\text{horiz\_align}}$)**: $\min\left(0.25, \frac{\text{Overlap}_x(B, R)}{\max(W_B, W_R)} \times 1.00\right)$
 
-Regions meeting $\text{Score}(B, R) \ge 0.15$ are selected, concatenated strictly by visual reading order $(page, y, x)$, and assigned explicit grounding statuses: `GROUNDED`, `PARTIALLY_GROUNDED`, or `UNGROUNDED`.
+Regions meeting $\text{Score}(B, R) \ge 0.15$ are selected, concatenated strictly by visual reading order $(page, y, x)$, and assigned explicit grounding statuses: `GROUNDED`, `PARTIALLY_GROUNDED`, or `UNMATCHED`.
 
 ---
 
@@ -182,7 +182,7 @@ Regions meeting $\text{Score}(B, R) \ge 0.15$ are selected, concatenated strictl
 
 | Feature Area | Technical Capability | Production Benefit |
 | :--- | :--- | :--- |
-| **Hierarchical Structure Parsing** | Identifies Sections, MCQs (`(A)-(D)`), Questions, Subquestions (`11(a)`, `11(b)`), and Instructions | Prevents non-question text (cover notes, exam timing) from corrupting the evaluation schema |
+| **Hierarchical Structure Parsing** | Identifies Sections, MCQs (`(A)-(D)`), Questions, Subquestions (`11(a)`, `11(b)`), and Instructions | Prevents non-question text (cover notes, exam timing) from polluting answer mapping |
 | **Multi-Page Answer Spanning** | Links answers that start on Page 1 and continue onto Page 2 | Full continuity tracking for long essay answers without truncated evaluations |
 | **Multi-Engine Evaluation** | Dedicated evaluators for MCQ, Math/Equations, Code, and Descriptive Rubrics | Optimized accuracy per question type (deterministic for MCQs, semantic for essays) |
 | **Human-in-the-Loop Review** | Integrated Teacher Review Workspace with score overrides and feedback input | Educators retain final authority with 1-click score modification and custom comments |
