@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![VedaAI Architecture Hero](docs/assets/hero_banner.png)
+![VedaAI Demo](assets/)
 
 ### Production-Grade Multimodal Assessment Evaluation & Human-in-the-Loop Review Platform
 
